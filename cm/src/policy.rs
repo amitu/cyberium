@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::proto::{Nivedana, Verdict};
+use crate::proto::Nivedana;
 
 pub const FILE: &str = "policy.md";
 
@@ -36,11 +36,14 @@ after it is prose, weighed against the reason the caller gave.
 requesters:
   - everyone
 standing_limit: 10
+reservation_seconds: 600
 ```
 
 ## Standing budgets
 
-Anyone may ask for up to the standing limit without justification.
+Anyone may ask for up to the standing limit without justification. A grant is taken
+back after `reservation_seconds` if nobody releases it — the backstop for a caller
+that dies mid-run. Set it above your longest suite, or long runs will be cut off.
 
 ## Circumstantial override
 
@@ -49,6 +52,22 @@ allow up to 5x the standing limit for one hour, then re-evaluate.
 
 For everything else, apply the standing budget.
 "#;
+
+/// What policy permits. Not a verdict: a verdict also depends on what is free.
+#[derive(Debug, Clone)]
+pub enum Ruling {
+    Allow {
+        count: u32,
+        rationale: Option<String>,
+    },
+    Counter {
+        count: u32,
+        rationale: String,
+    },
+    Deny {
+        rationale: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -63,6 +82,9 @@ struct Grants {
     requesters: Vec<String>,
     /// How many machines are given without argument.
     standing_limit: u32,
+    /// How long a grant survives unreleased. An org rule, not a constant: it has to
+    /// sit above the longest suite anyone runs here.
+    reservation_seconds: u64,
 }
 
 impl Default for Grants {
@@ -70,6 +92,7 @@ impl Default for Grants {
         Self {
             requesters: vec!["everyone".into()],
             standing_limit: 10,
+            reservation_seconds: 600,
         }
     }
 }
@@ -90,24 +113,31 @@ impl Policy {
         Ok(Self { path, text, grants })
     }
 
-    /// Decide. Deterministic for now; the prose half awaits the model call.
-    pub fn weigh(&self, asker: &str, nivedana: &Nivedana) -> Verdict {
+    /// How many machines policy permits, if any.
+    ///
+    /// Policy decides *entitlement*; it never picks machines. What is actually
+    /// free, and which of them can do the work, is the fleet's business — keeping
+    /// those apart is what lets policy stay a text file.
+    pub fn weigh(&self, asker: &str, nivedana: &Nivedana) -> Ruling {
         if !self.may_ask(asker) {
             // The deterministic gate: refused without spending a token.
-            return Verdict::Deny {
+            return Ruling::Deny {
                 rationale: format!("{asker} is not in the requesters list"),
             };
         }
 
         let wanted = nivedana.count.unwrap_or(1);
         if wanted <= self.grants.standing_limit {
-            return Verdict::Grant {
-                workers: (0..wanted).map(|n| format!("cm-w-{n}")).collect(),
-                rationale: Some(format!("within the standing limit of {}", self.grants.standing_limit)),
+            return Ruling::Allow {
+                count: wanted,
+                rationale: Some(format!(
+                    "within the standing limit of {}",
+                    self.grants.standing_limit
+                )),
             };
         }
 
-        Verdict::Counter {
+        Ruling::Counter {
             count: self.grants.standing_limit,
             rationale: format!(
                 "the standing limit is {}; weighing the reason against the prose \
@@ -115,6 +145,11 @@ impl Policy {
                 self.grants.standing_limit
             ),
         }
+    }
+
+    /// How long a grant survives unreleased.
+    pub fn reservation_secs(&self) -> u64 {
+        self.grants.reservation_seconds
     }
 
     fn may_ask(&self, asker: &str) -> bool {
@@ -166,6 +201,11 @@ fn parse_grants(text: &str) -> Result<Grants> {
                         .parse()
                         .with_context(|| format!("standing_limit: {value:?} is not a number"))?;
                 }
+                "reservation_seconds" => {
+                    grants.reservation_seconds = value.parse().with_context(|| {
+                        format!("reservation_seconds: {value:?} is not a number")
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -201,8 +241,7 @@ mod tests {
         Nivedana {
             why: "because".into(),
             count,
-            class: None,
-            role: None,
+            ..Default::default()
         }
     }
 
@@ -210,7 +249,7 @@ mod tests {
     fn the_starter_policy_parses() {
         let p = policy(STARTER);
         assert!(p.may_ask("anyone-at-all"));
-        assert!(matches!(p.weigh("dana", &plea(Some(3))), Verdict::Grant { .. }));
+        assert!(matches!(p.weigh("dana", &plea(Some(3))), Ruling::Allow { .. }));
     }
 
     #[test]
@@ -220,14 +259,14 @@ mod tests {
         assert!(!p.may_ask("lee"));
 
         let denied = p.weigh("lee", &plea(Some(1)));
-        assert!(matches!(denied, Verdict::Deny { .. }), "{denied:?}");
+        assert!(matches!(denied, Ruling::Deny { .. }), "{denied:?}");
     }
 
     #[test]
     fn over_the_limit_is_countered_not_denied() {
         let p = policy("```yaml\nrequesters:\n  - everyone\nstanding_limit: 4\n```");
         match p.weigh("dana", &plea(Some(50))) {
-            Verdict::Counter { count, .. } => assert_eq!(count, 4),
+            Ruling::Counter { count, .. } => assert_eq!(count, 4),
             other => panic!("expected a counter, got {other:?}"),
         }
     }
@@ -236,7 +275,15 @@ mod tests {
     fn a_missing_grants_block_still_works() {
         let p = policy("# policy.md\n\nJust prose, no fenced block.\n");
         assert!(p.may_ask("dana"));
-        assert!(matches!(p.weigh("dana", &plea(Some(1))), Verdict::Grant { .. }));
+        assert!(matches!(p.weigh("dana", &plea(Some(1))), Ruling::Allow { .. }));
+    }
+
+    #[test]
+    fn the_org_sets_how_long_a_grant_lasts() {
+        let p = policy("```yaml\nstanding_limit: 4\nreservation_seconds: 7200\n```");
+        assert_eq!(p.reservation_secs(), 7200);
+        // And an org that says nothing gets the default rather than no timeout.
+        assert_eq!(policy("no block here").reservation_secs(), 600);
     }
 
     #[test]
@@ -249,8 +296,8 @@ mod tests {
     fn no_count_asks_for_one() {
         let p = policy(STARTER);
         match p.weigh("dana", &plea(None)) {
-            Verdict::Grant { workers, .. } => assert_eq!(workers.len(), 1),
-            other => panic!("expected a grant, got {other:?}"),
+            Ruling::Allow { count, .. } => assert_eq!(count, 1),
+            other => panic!("expected an allow, got {other:?}"),
         }
     }
 }

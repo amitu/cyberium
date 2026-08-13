@@ -2823,7 +2823,7 @@ dependencies = [
 [[package]]
 name = "sirji"
 version = "0.0.0"
-source = "git+https://github.com/amitu/sirji#6a707df72a6a412248da7a3f2552fd3693e3e80d"
+source = "git+https://github.com/amitu/sirji#3a0091015ceb241cf03d6667204839f964b9bf20"
 dependencies = [
  "anyhow",
  "data-encoding",
