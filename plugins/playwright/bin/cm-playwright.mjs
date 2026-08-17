@@ -11,7 +11,9 @@
 // Configured entirely by environment, because `npm test` has nowhere to put flags
 // and a CI job has nowhere else to put configuration.
 //
-//   CM_CONTROLLER   name@org of the controller. Unset ⇒ run locally, as normal.
+//   CM_CONTROLLER   name@org of the controller. Required — without a fleet this
+//                   command has nothing to do, and quietly running here instead
+//                   would be indistinguishable from having distributed the run.
 //   CM_SHARDS       how many machines to ask for (default 4)
 //   CM_NEED         capabilities, comma separated: linux,node20
 //   CM_ENV          environment for the shards: GRPC_SERVER=off,APP_ENV=staging
@@ -172,18 +174,6 @@ function run(command, args) {
 }
 
 /**
- * No controller configured means no fleet, so run the suite the ordinary way.
- *
- * This is the property that makes the plugin safe to commit: `npm test` keeps
- * working on a laptop with no cm, in a CI job that has not been given a fleet yet,
- * and for the contributor who has never heard of any of this.
- */
-async function locally() {
-  const [command, ...rest] = (process.env.CM_RUNNER ?? "npx playwright test").split(/\s+/);
-  return run(command, [...rest, ...playwrightArgs]);
-}
-
-/**
  * Gather the per-shard directories cm wrote into one directory, which is the shape
  * `merge-reports` wants. The shard number is already in each filename.
  */
@@ -285,8 +275,30 @@ async function onTheFleet(controller) {
 }
 
 const controller = process.env.CM_CONTROLLER;
+
+// No controller is a mistake, not a mode.
+//
+// Falling back to a local run was the first design, and it is the wrong one: a run
+// that quietly did not distribute looks exactly like one that did. Same output, same
+// exit code, nothing to notice — so a CI job that lost its configuration goes on
+// passing while every machine in the fleet sits idle, and nobody finds out until
+// somebody wonders why the suite takes twenty minutes again.
+//
+// Running locally is not being taken away. It is spelled `playwright test`, which is
+// clearer than this command pretending to be it.
+if (!controller) {
+  console.error(
+    "cm-playwright: CM_CONTROLLER is not set, so there is no fleet to run on.\n" +
+      "  Set it (e.g. CM_CONTROLLER=cm-c@acme) to distribute this suite,\n" +
+      "  or run `npx playwright test` to run it here.",
+  );
+  // Distinct from 1: this is nobody's suite failing, it is this command being
+  // invoked without what it needs, and CI should be able to tell those apart.
+  process.exit(2);
+}
+
 try {
-  process.exit(controller ? await onTheFleet(controller) : await locally());
+  process.exit(await onTheFleet(controller));
 } catch (e) {
   if (e?.code === "ENOENT") {
     console.error(

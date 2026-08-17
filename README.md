@@ -67,12 +67,13 @@ The point of a fleet is the suite you already have, run the way people already r
 it. Installing `@cyberium/playwright` changes one line of `package.json`:
 
 ```jsonc
-{ "scripts": { "test": "cm-playwright" } }
+{ "scripts": { "test": "cm-playwright", "test:here": "playwright test" } }
 ```
 
-and nothing else. No fixture, no reporter, no import, no spec file touched. With no
-controller configured it is exactly `playwright test`; point it at one and the same
-`npm test` fans out:
+and nothing else. No fixture, no reporter, no import, no spec file touched. `npm test`
+now fans out across the fleet; `npm run test:here` is the old command under its own
+name, because a tool that silently ran locally when it could not find a fleet would be
+indistinguishable from one that had distributed the run:
 
 ```sh
 $ CM_CONTROLLER=cm-c@acme CM_SHARDS=3 CM_NEED=node20 npm test

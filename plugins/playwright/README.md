@@ -22,7 +22,7 @@ configuration, so everything is an environment variable:
 
 | Variable | Meaning |
 |---|---|
-| `CM_CONTROLLER` | `name@org` of the controller. **Unset ⇒ runs locally, as normal.** |
+| `CM_CONTROLLER` | `name@org` of the controller. **Required** — see below. |
 | `CM_SHARDS` | how many machines to ask for (default 4) |
 | `CM_NEED` | capabilities, comma separated: `linux,node20` |
 | `CM_ENV` | environment for the shards: `GRPC_SERVER=off,APP_ENV=staging` |
@@ -42,9 +42,26 @@ Playwright's own arguments pass through untouched:
 npm test -- --project qa --grep @smoke
 ```
 
-**With `CM_CONTROLLER` unset, `npm test` is exactly `playwright test`.** That is what
-makes this safe to commit: the laptop with no cm, the CI job that has not been given
-a fleet yet, and the contributor who has never heard of any of this all keep working.
+**Without `CM_CONTROLLER` this exits 2 and tells you why.** It does not quietly run
+the suite here instead — a run that did not distribute looks exactly like one that
+did: same output, same exit code, nothing to notice. A CI job that lost its
+configuration would go on passing while the whole fleet sat idle, and nobody would
+find out until somebody wondered why the suite takes twenty minutes again.
+
+Exit 2 rather than 1, so CI can tell "this command was invoked without what it needs"
+from "the suite failed".
+
+Running locally is not taken away; it is spelled `playwright test`, which is clearer
+than this command pretending to be it. A repo can keep both:
+
+```jsonc
+{
+  "scripts": {
+    "test": "cm-playwright",
+    "test:here": "playwright test"
+  }
+}
+```
 
 ## The machines fetch the code themselves
 

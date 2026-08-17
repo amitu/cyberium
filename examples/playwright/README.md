@@ -7,28 +7,25 @@ distributed — because it does not. That is the point.
 The only trace of cm anywhere is one line of `package.json`:
 
 ```jsonc
-{ "scripts": { "test": "cm-playwright" } }
+{ "scripts": { "test": "cm-playwright", "test:here": "playwright test" } }
 ```
 
-## Run it
+## Run it here
 
 ```sh
 npm install
-npm test
+npm run test:here
 ```
 
 ```
   13 passed (5.3s)
 ```
 
-Thirteen tests, one after another, on this machine. No `CM_CONTROLLER` is set, so
-`npm test` is exactly `playwright test` — which is what makes the plugin safe to
-commit before anyone has a fleet.
+Thirteen tests, one after another, on this machine — plain Playwright, no cm involved.
 
 ## Run it on a fleet
 
-Bring some machines up (`scripts/fleet.sh` in the repo root does this locally), then
-run **the same command**:
+Bring some machines up (`scripts/fleet.sh` in the repo root does this locally), then:
 
 ```sh
 CM_CONTROLLER=cm-c@acme CM_SHARDS=3 CM_NEED=node20 npm test
@@ -52,6 +49,10 @@ Each machine fetched this repo itself — none of them had it — into a checkou
 own, which was deleted when the reservation ended. Since it fetches a **commit**,
 the thing being tested is whatever you last pushed, not what is on your disk; the
 plugin warns you when those differ.
+
+Run `npm test` with no `CM_CONTROLLER` and it stops with exit 2 rather than quietly
+running here: a run that did not distribute is indistinguishable from one that did,
+so it says so instead of leaving you to wonder.
 
 ## Watch it go red
 
