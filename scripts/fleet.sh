@@ -71,7 +71,13 @@ POLICY
 say "start controller and workers"
 CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM controller >cm-c.log 2>&1 &
 sleep 2
-CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM worker --slots 1 --can linux >cm-w-1.log 2>&1 &
+# cm-w-1 runs the operator's hygiene scripts around every tenancy. They are the
+# machine owner's, not the caller's: nothing a caller sends can skip them, and a
+# `--post` that failed takes the machine out of the fleet rather than lending out a
+# box that may still hold the last tenant's work.
+CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM worker --slots 1 --can linux \
+  --pre 'echo "[hygiene] scrubbing before the next tenant"' \
+  --post 'echo "[hygiene] taking back what was left"' >cm-w-1.log 2>&1 &
 CM_HOME=$LAB/cm-w-2 SIRJI_HOME=$LAB/cm-w-2 $CM worker --slots 1 --can linux >cm-w-2.log 2>&1 &
 CM_HOME=$LAB/cm-w-3 SIRJI_HOME=$LAB/cm-w-3 $CM worker --slots 2 --can linux --can gpu >cm-w-3.log 2>&1 &
 for _ in $(seq 30); do
@@ -132,6 +138,9 @@ echo "  ... waiting for the timeout ..."
 sleep 16
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
   "wants the same gpu, after the timeout" --count 1 --need gpu --run 'echo ran' 2>&1 | sed 's/^/  /'
+
+say "the operator's hygiene scripts, around every tenancy on cm-w-1"
+grep hygiene cm-w-1.log | sed 's/^/  /' || echo "  (none ran)"
 
 say "worker logs"
 for w in cm-w-1 cm-w-2 cm-w-3; do

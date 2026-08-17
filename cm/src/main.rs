@@ -45,6 +45,11 @@ cm — cost-aware allocation of test machines
 
   cm worker [--controller <name>] [--slots N] [--can <cap>]...
         offer this machine to the controller
+        --pre <cmd>   make the machine fit before each tenancy
+        --post <cmd>  take back what the last tenant left
+        Both belong to whoever runs the machine: a caller cannot supply them,
+        skip them, or see their output. A --post that fails takes the machine
+        out of the fleet rather than lending out a dirty one.
 
   cm test <name@org> \"<why>\" [--count N] [--need <cap>]... [--run <cmd>]
         ask for machines, use them, and give them back
@@ -574,17 +579,71 @@ async fn serve_worker(
 // a worker
 // ---------------------------------------------------------------------------
 
-/// Reservations this machine has been told about: which caller, within what limits.
-type Assigned = Arc<Mutex<std::collections::BTreeMap<String, (String, Limits)>>>;
+/// Reservations this machine has been told about.
+type Assigned = Arc<Mutex<std::collections::BTreeMap<String, Held>>>;
+
+/// One tenancy of this machine.
+#[derive(Debug, Clone)]
+struct Held {
+    caller: String,
+    limits: Limits,
+    state: State,
+}
+
+/// Whether this machine is fit to be used yet.
+///
+/// A machine is not ready the instant it is assigned: the operator's `--pre` script
+/// runs first. Without this the caller — who is told about the grant at the same
+/// moment the machine is — would dial straight into a box mid-cleanup.
+#[derive(Debug, Clone)]
+enum State {
+    Preparing,
+    Ready,
+    /// Preparation failed. The machine stays assigned and refuses work: handing it
+    /// over anyway is how one tenant's leftovers end up in another tenant's run.
+    Unusable(String),
+}
+
+/// What the operator wants run around each tenancy.
+///
+/// These belong to whoever runs the machine, not to whoever borrows it. A caller
+/// cannot supply them, skip them, or see their output — the whole point is what
+/// happens *between* tenants, and one tenant should learn nothing about the last.
+#[derive(Debug, Clone, Default)]
+struct Hygiene {
+    /// Before the machine is usable: make it fit for whoever is next.
+    pre: Option<String>,
+    /// After the reservation ends, released or expired: take back what was left.
+    post: Option<String>,
+}
+
+/// How long an operator's script may take before the machine is written off.
+///
+/// Generous, because cleanup can mean deleting a lot. Bounded, because a hygiene
+/// script that hangs forever is a machine that never comes back to the fleet — and
+/// silently, since nobody is waiting on it.
+const HYGIENE_SECS: u64 = 600;
+
+/// How long a caller waits for `--pre` before giving up on this machine.
+const PREPARE_PATIENCE_SECS: u64 = HYGIENE_SECS;
 
 async fn worker(args: &[&str]) -> Result<()> {
     let mut controller_name = "cm-c".to_string();
     let mut slots = 1u32;
     let mut capabilities: Vec<String> = Vec::new();
+    let mut hygiene = Hygiene::default();
 
     let mut i = 0;
     while i < args.len() {
         match args[i] {
+            "--pre" => {
+                hygiene.pre = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            "--post" => {
+                hygiene.post = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
             "--controller" => {
                 controller_name = args.get(i + 1).unwrap_or(&"cm-c").to_string();
                 i += 2;
@@ -601,6 +660,18 @@ async fn worker(args: &[&str]) -> Result<()> {
             }
             other => bail!("unrecognised argument: {other}"),
         }
+    }
+
+    // Hygiene is machine-wide, and a machine hosting two tenants at once has no
+    // "between tenants" to be scrubbed in: cleaning up after one would delete the
+    // other's work mid-run. Refuse the combination rather than do something plausible
+    // and wrong — an operator who wants both wants two workers.
+    if slots > 1 && (hygiene.pre.is_some() || hygiene.post.is_some()) {
+        bail!(
+            "--pre/--post clean the whole machine, so they cannot be used with \
+             --slots {slots}: there is no moment between tenants to clean in. \
+             Run one worker per concurrent tenancy instead."
+        );
     }
 
     let home = home()?;
@@ -643,6 +714,7 @@ async fn worker(args: &[&str]) -> Result<()> {
                     &capabilities,
                     &hints,
                     &assigned,
+                    &hygiene,
                 )
                 .await
                 {
@@ -673,6 +745,7 @@ async fn worker(args: &[&str]) -> Result<()> {
 /// The controller is a **sibling** — another device of the same sirji. We hold no
 /// `network.toml` and cannot look it up ourselves, and hardcoding its address would
 /// go stale the next time it restarts on a new port.
+#[allow(clippy::too_many_arguments)]
 async fn offer(
     config: &Config,
     home: &std::path::Path,
@@ -681,6 +754,7 @@ async fn offer(
     capabilities: &[String],
     hints: &[String],
     assigned: &Assigned,
+    hygiene: &Hygiene,
 ) -> Result<()> {
     let secret = keys(home).secret(&id52::decode(&config.key)?)?;
     let endpoint = sirji::endpoint::bind_dialer(secret).await?;
@@ -716,6 +790,10 @@ async fn offer(
     .await?;
     println!("offered to `{controller_name}`");
 
+    // Set when a tenancy ended and the operator has a cleanup script: we leave the
+    // fleet first, then scrub, then come back.
+    let mut cleanup_after: Option<String> = None;
+
     // Orders arrive here for as long as we are registered. `send` stays in scope
     // deliberately: dropping it closes the stream, which the controller would read
     // as us having left.
@@ -723,11 +801,41 @@ async fn offer(
         match order {
             Aadesh::Assigned { reservation, caller, limits } => {
                 println!("assigned to {caller} as {reservation}");
-                assigned.lock().await.insert(reservation, (caller, limits));
+                assigned.lock().await.insert(
+                    reservation.clone(),
+                    Held { caller, limits, state: State::Preparing },
+                );
+
+                // Prepare in the background: the controller is waiting on this
+                // stream for nothing else, and blocking it would stall every other
+                // order — including the Freed that ends somebody else's tenancy.
+                tokio::spawn({
+                    let (assigned, hygiene) = (assigned.clone(), hygiene.clone());
+                    let root = config.root.clone();
+                    async move {
+                        let state = match hygiene.pre {
+                            None => State::Ready,
+                            Some(script) => {
+                                println!("preparing for {reservation}: {script}");
+                                match hygiene_run(&script, &root).await {
+                                    Ok(()) => State::Ready,
+                                    Err(e) => {
+                                        eprintln!("cannot prepare for {reservation}: {e:#}");
+                                        State::Unusable(format!("{e:#}"))
+                                    }
+                                }
+                            }
+                        };
+                        if let Some(held) = assigned.lock().await.get_mut(&reservation) {
+                            held.state = state;
+                        }
+                    }
+                });
             }
             Aadesh::Freed { reservation } => {
                 println!("released from {reservation}");
                 assigned.lock().await.remove(&reservation);
+
                 // The workspace dies with the reservation that paid for it. Tying
                 // it to the lifecycle that already exists means there is no second
                 // policy about when checkouts get cleaned up — and no machine that
@@ -738,11 +846,40 @@ async fn offer(
                 {
                     eprintln!("could not remove {}: {e}", dir.display());
                 }
+
+                if hygiene.post.is_some() {
+                    // Stop offering *before* cleaning, by leaving this loop and
+                    // letting the registration close. A machine mid-scrub is not
+                    // available, and while it was still registered the controller
+                    // could — and did — hand it to somebody new while the last
+                    // tenant's cleanup was still running, which defeats the entire
+                    // point of having a cleanup step.
+                    cleanup_after = Some(reservation);
+                    break;
+                }
             }
         }
     }
+
+    // Closed first, deliberately: the connection *is* the availability, so dropping
+    // it is how this machine says "not me" for as long as the scrubbing takes.
     drop(send);
     endpoint.close().await;
+
+    if let Some(reservation) = cleanup_after {
+        let script = hygiene.post.as_deref().expect("only set when there is one");
+        println!("left the fleet; cleaning up after {reservation}: {script}");
+        if let Err(e) = hygiene_run(script, &config.root).await {
+            // A machine whose cleanup failed may still hold the last tenant's
+            // source, credentials or state. Being short a machine is much cheaper
+            // than lending that one out, so stay gone and exit non-zero — what
+            // happens next is for whatever supervises this to decide.
+            eprintln!("CLEANUP FAILED after {reservation}: {e:#}");
+            eprintln!("staying out of the fleet rather than serving a dirty machine");
+            std::process::exit(1);
+        }
+        println!("clean; offering again");
+    }
     Ok(())
 }
 
@@ -768,25 +905,21 @@ async fn do_work(incoming: sirji::Incoming, assigned: Assigned, me: String) -> R
         return Ok(());
     };
 
-    // Two checks, both necessary. The reservation must be one the controller told
-    // us about, and the caller must be who it was assigned to. No ticket is
-    // consulted: the controller already decided, and re-deciding at the edge is
-    // exactly how a worker ends up needing a policy file of its own.
-    let holder = assigned.lock().await.get(&reservation).cloned();
-    let (refusal, limits) = match holder {
-        None => (Some(format!("we hold no reservation {reservation}")), Limits::default()),
-        Some((expected, _)) if expected != caller => {
-            (Some(format!("{reservation} is not yours")), Limits::default())
+    // Three checks. The reservation must be one the controller told us about, the
+    // caller must be who it was assigned to, and this machine must actually be fit
+    // to use — the operator's `--pre` may still be running. No ticket is consulted:
+    // the controller already decided, and re-deciding at the edge is exactly how a
+    // worker ends up needing a policy file of its own.
+    let limits = match may_run(&assigned, &reservation, &caller, &mut send, index).await? {
+        Ok(limits) => limits,
+        Err(reason) => {
+            println!("refused {caller}: {reason}");
+            write_line(&mut send, &Outcome::No { reason }).await?;
+            send.finish()?;
+            conn.closed().await;
+            return Ok(());
         }
-        Some((_, limits)) => (None, limits),
     };
-    if let Some(reason) = refusal {
-        println!("refused {caller}: {reason}");
-        write_line(&mut send, &Outcome::No { reason }).await?;
-        send.finish()?;
-        conn.closed().await;
-        return Ok(());
-    }
 
     println!("shard {}/{total} for {reservation}: {command}", index + 1);
     let outcome = run_shard(
@@ -801,6 +934,105 @@ async fn do_work(incoming: sirji::Incoming, assigned: Assigned, me: String) -> R
     send.finish()?;
     conn.closed().await;
     Ok(())
+}
+
+/// Decide whether this caller may run here, waiting out `--pre` if it is still going.
+///
+/// Waiting rather than refusing, because the controller tells the machine and the
+/// caller about a grant at the same moment: a caller that dialled promptly would
+/// otherwise be turned away for being on time. The wait is visible — a caller
+/// staring at silence deserves to know it is the machine being scrubbed and not
+/// their suite hanging.
+async fn may_run(
+    assigned: &Assigned,
+    reservation: &str,
+    caller: &str,
+    send: &mut sirji::SendStream,
+    index: u32,
+) -> Result<std::result::Result<Limits, String>> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(PREPARE_PATIENCE_SECS);
+    let mut said = false;
+
+    loop {
+        let verdict = {
+            let held = assigned.lock().await;
+            consider(held.get(reservation), reservation, caller)
+        };
+        match verdict {
+            Admission::Run(limits) => return Ok(Ok(limits)),
+            Admission::Refuse(why) => return Ok(Err(why)),
+            Admission::Wait => {
+                if !said {
+                    log(send, index, "waiting for the machine to be prepared".into(), false)
+                        .await?;
+                    said = true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(Err(format!(
+                        "this machine was still being prepared after {PREPARE_PATIENCE_SECS}s"
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// What to do about this caller, given what the machine knows right now.
+#[derive(Debug)]
+enum Admission {
+    Run(Limits),
+    Wait,
+    Refuse(String),
+}
+
+/// The decision itself, kept apart from the waiting so it can be reasoned about —
+/// and tested — without a clock or a connection.
+fn consider(held: Option<&Held>, reservation: &str, caller: &str) -> Admission {
+    let Some(held) = held else {
+        return Admission::Refuse(format!("we hold no reservation {reservation}"));
+    };
+    if held.caller != caller {
+        return Admission::Refuse(format!("{reservation} is not yours"));
+    }
+    match &held.state {
+        State::Ready => Admission::Run(held.limits),
+        State::Preparing => Admission::Wait,
+        State::Unusable(why) => {
+            Admission::Refuse(format!("this machine could not be prepared: {why}"))
+        }
+    }
+}
+
+/// Run one of the operator's hygiene scripts.
+///
+/// Its output goes to this machine's own log and nowhere else. A caller must not see
+/// it: cleanup output is about the *previous* tenant, and the whole reason these
+/// scripts exist is that one tenant should learn nothing about the last.
+async fn hygiene_run(script: &str, root: &std::path::Path) -> Result<()> {
+    let deadline = std::time::Duration::from_secs(HYGIENE_SECS);
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .current_dir(root)
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("starting {script:?}"))?;
+
+    match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(status) => {
+            let status = status?;
+            if !status.success() {
+                bail!("{script:?} failed: {status}");
+            }
+            Ok(())
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("{script:?} was still running after {HYGIENE_SECS}s")
+        }
+    }
 }
 
 /// Where a reservation's working trees live: `$CM_HOME/work/<reservation>/shard-N`.
@@ -1593,6 +1825,46 @@ mod tests {
         assert_ne!(written[0], written[1]);
         assert_eq!(std::fs::read(&written[1]).unwrap(), b"shard 1");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn held(state: State) -> Held {
+        Held { caller: "them".into(), limits: Limits::default(), state }
+    }
+
+    #[test]
+    fn a_machine_that_could_not_be_prepared_refuses_work() {
+        // The point of the whole mechanism: rather than lend out a box whose
+        // cleanup failed, say why and refuse.
+        let verdict = consider(Some(&held(State::Unusable("disk full".into()))), "r1", "them");
+        let Admission::Refuse(why) = verdict else {
+            panic!("expected a refusal, got {verdict:?}");
+        };
+        assert!(why.contains("could not be prepared"), "{why}");
+        assert!(why.contains("disk full"), "{why}");
+    }
+
+    #[test]
+    fn work_waits_while_the_machine_is_being_prepared() {
+        // Not a refusal: the controller tells the machine and the caller about a
+        // grant at the same moment, so a caller that dialled promptly would
+        // otherwise be turned away for being on time.
+        let verdict = consider(Some(&held(State::Preparing)), "r1", "them");
+        assert!(matches!(verdict, Admission::Wait), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_prepared_machine_serves_the_right_caller_only() {
+        assert!(matches!(
+            consider(Some(&held(State::Ready)), "r1", "them"),
+            Admission::Run(_)
+        ));
+        let verdict = consider(Some(&held(State::Ready)), "r1", "somebody-else");
+        let Admission::Refuse(why) = verdict else {
+            panic!("expected a refusal, got {verdict:?}");
+        };
+        assert!(why.contains("not yours"), "{why}");
+        // And a reservation we never heard of is refused whoever asks.
+        assert!(matches!(consider(None, "r9", "them"), Admission::Refuse(_)));
     }
 
     #[test]

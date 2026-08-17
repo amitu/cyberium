@@ -130,6 +130,51 @@ Every capability asked for must be present. Extra ones never disqualify: asking
 for `linux` must not exclude the machine that is also a `gpu`, or the fleet
 fragments for no reason.
 
+## Machine hygiene
+
+A machine is lent to one caller after another, so somebody has to be responsible for
+what is left between them:
+
+```sh
+cm worker --slots 1 --can linux \
+  --pre  'scripts/scrub.sh' \
+  --post 'scripts/scrub.sh && docker system prune -f'
+```
+
+These belong to **whoever runs the machine**, not to whoever borrows it. A caller
+cannot supply them, skip them, or read their output — that output is about the
+previous tenant, and the point of the scripts is that one tenant learns nothing about
+the last.
+
+`--pre` runs when the machine is assigned, before any work is accepted. A caller that
+dials during it waits, and is told it is waiting: the controller tells the machine
+and the caller about a grant at the same moment, so refusing would punish a caller
+for being prompt.
+
+`--post` runs when the reservation ends — released *or* expired, so a caller that
+walked away cannot skip it. The worker **leaves the fleet first and cleans up
+afterwards**: a machine mid-scrub is not available, and while it stayed registered
+the controller could — and in testing did — hand it to somebody new while the last
+tenant's cleanup was still running, which defeats the entire point. Dropping the
+registration is the existing vocabulary for this, since the connection *is* the
+availability. When the scrub finishes the machine offers itself again.
+
+**If cleanup fails the worker stays out and exits non-zero.** A machine whose cleanup
+failed may still hold the last tenant's source, credentials or state; being short a
+machine is much cheaper than lending that one out. What happens next is for whatever
+supervises the process to decide.
+
+Hygiene is machine-wide, so it cannot be combined with `--slots > 1`: a machine
+hosting two tenants at once has no moment *between* tenants to clean in, and cleaning
+up after one would delete the other's work mid-run. cm refuses that combination
+rather than do something plausible and wrong — an operator who wants both wants one
+worker per concurrent tenancy.
+
+Neither script is a substitute for the workspace lifecycle: checkouts are already
+deleted when the reservation ends. These are for everything cm cannot know about —
+containers, caches, browser profiles, stray processes, whatever your machines
+accumulate.
+
 ## Reservations
 
 A grant is a reservation, released the moment the work finishes. A duration hint
