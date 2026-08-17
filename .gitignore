@@ -6,7 +6,8 @@ keys/
 
 # Node, for the plugin and the example
 node_modules/
-package-lock.json
+# package-lock.json is deliberately NOT ignored: a machine that clones this repo
+# runs `npm ci`, which refuses to work without one.
 
 # What a distributed run leaves behind
 blob-report/
