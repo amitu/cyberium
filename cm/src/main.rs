@@ -357,12 +357,14 @@ async fn reap(control: Arc<Control>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let expired = control.fleet.lock().await.expire();
-        for (reservation, freed) in expired {
+        for gone in expired {
             println!(
-                "reservation {reservation} expired unreleased, taking back {} machine(s)",
-                freed.len()
+                "{}'s {} expired unreleased, taking back {} machine(s)",
+                gone.alias,
+                gone.id,
+                gone.workers.len()
             );
-            control.tell_freed(&reservation, &freed).await;
+            control.tell_freed(&gone.id, &gone.workers).await;
         }
     }
 }
@@ -1271,13 +1273,14 @@ async fn run_command(
 
     let code = loop {
         tokio::select! {
-            line = out.next_line() => match line? {
-                Some(line) => write_line(send, &Outcome::Log { index, line, stderr: false }).await?,
-                None => {}
+            // `None` means that pipe reached its end, which says nothing about the
+            // process: the other pipe may still be talking, and the exit status is
+            // what actually ends this loop.
+            line = out.next_line() => if let Some(line) = line? {
+                write_line(send, &Outcome::Log { index, line, stderr: false }).await?;
             },
-            line = err.next_line() => match line? {
-                Some(line) => write_line(send, &Outcome::Log { index, line, stderr: true }).await?,
-                None => {}
+            line = err.next_line() => if let Some(line) = line? {
+                write_line(send, &Outcome::Log { index, line, stderr: true }).await?;
             },
             status = child.wait() => break status?.code(),
             _ = &mut deadline => {

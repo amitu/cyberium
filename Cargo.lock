@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "cm"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "data-encoding",
@@ -2823,8 +2823,8 @@ dependencies = [
 
 [[package]]
 name = "sirji"
-version = "0.0.0"
-source = "git+https://github.com/amitu/sirji#d7295b05ef8ddb94044f53f0afb36d005a70b300"
+version = "0.1.0"
+source = "git+https://github.com/amitu/sirji#2123e7de245b0cf9e5d4284b05007e0aac4fae91"
 dependencies = [
  "anyhow",
  "data-encoding",

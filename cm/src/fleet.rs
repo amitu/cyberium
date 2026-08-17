@@ -90,6 +90,16 @@ pub struct Allocation {
     pub expires_in: u64,
 }
 
+/// A reservation nobody released, and what it was holding.
+#[derive(Debug)]
+pub struct Expired {
+    pub id: String,
+    /// Who had it. Worth carrying: "r7 expired" tells an operator less than
+    /// "dana's r7 expired" when they are working out whose run died.
+    pub alias: String,
+    pub workers: Vec<String>,
+}
+
 /// Why allocation could not be satisfied in full.
 #[derive(Debug)]
 pub enum Shortfall {
@@ -122,10 +132,16 @@ impl Fleet {
         }
     }
 
+    // Only the tests look inside the fleet directly; everything the controller
+    // needs it asks for through `summary`, `allocate` and `release`. Kept behind
+    // cfg(test) rather than deleted — a test that cannot see the state it is
+    // asserting about ends up asserting about the API instead.
+    #[cfg(test)]
     pub fn workers(&self) -> impl Iterator<Item = &Worker> {
         self.workers.values()
     }
 
+    #[cfg(test)]
     pub fn reservations(&self) -> impl Iterator<Item = &Reservation> {
         self.reservations.values()
     }
@@ -232,20 +248,24 @@ impl Fleet {
     }
 
     /// Free everything past its expiry. The backstop.
-    pub fn expire(&mut self) -> Vec<(String, Vec<String>)> {
+    /// Returns the reservation, **who held it**, and the machines taken back.
+    ///
+    /// The alias travels with it because the operator reading that log line wants to
+    /// know whose run died, not only that a number expired.
+    pub fn expire(&mut self) -> Vec<Expired> {
         let now = now();
-        let stale: Vec<String> = self
+        let stale: Vec<(String, String)> = self
             .reservations
             .values()
             .filter(|r| r.expires_at <= now)
-            .map(|r| r.id.clone())
+            .map(|r| (r.id.clone(), r.alias.clone()))
             .collect();
 
         stale
             .into_iter()
-            .map(|id| {
-                let freed = self.free(&id);
-                (id, freed)
+            .map(|(id, alias)| {
+                let workers = self.free(&id);
+                Expired { id, alias, workers }
             })
             .collect()
     }
@@ -365,7 +385,8 @@ mod tests {
 
         let expired = f.expire();
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].1, vec!["gpu-1".to_string()]);
+        assert_eq!(expired[0].workers, vec!["gpu-1".to_string()]);
+        assert_eq!(expired[0].alias, "dana", "who lost it travels with it");
         assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran").is_ok());
     }
 

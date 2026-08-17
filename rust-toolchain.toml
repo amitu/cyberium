@@ -1,2 +1,4 @@
+# Pinned rather than floating on `stable`, so a build here and a build in CI are
+# the same build. Bumping this is a deliberate act with its own commit.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"

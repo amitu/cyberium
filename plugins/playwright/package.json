@@ -1,6 +1,6 @@
 {
   "name": "@cyberium/playwright",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Run your existing Playwright suite across a cm fleet from npm test",
   "license": "MIT OR Apache-2.0",
   "repository": "https://github.com/amitu/cyberium",

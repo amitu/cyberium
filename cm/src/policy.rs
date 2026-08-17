@@ -72,6 +72,10 @@ pub enum Ruling {
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub path: PathBuf,
+    /// The whole file, prose included. Read but not yet reasoned over: this is what
+    /// goes to the model once that call is wired, and it is loaded now so a broken
+    /// or unreadable policy fails at startup rather than under the first caller.
+    #[allow(dead_code)]
     pub text: String,
     grants: Grants,
 }

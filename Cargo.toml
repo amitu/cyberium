@@ -3,11 +3,11 @@ members = ["cm"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/amitu/cyberium"
-rust-version = "1.85"
+rust-version = "1.97.1"   # what we build and test with; see rust-toolchain.toml
 
 [workspace.dependencies]
 # A git dependency rather than a path one, deliberately: this is the test of
