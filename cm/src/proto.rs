@@ -31,6 +31,12 @@ use serde::{Deserialize, Serialize};
 pub enum Plea {
     /// Ask for machines.
     Nivedana(Nivedana),
+    /// Ask for nothing at all.
+    ///
+    /// Answered by any controller that admitted the caller, which makes it a
+    /// positive test of the whole chain — resolution, ticket, signature, dial —
+    /// without taking a machine away from anybody to prove it.
+    Ping,
     /// Done with them. Sent the moment the work finishes: a duration hint sizes a
     /// plan, it never justifies holding capacity idle.
     Release { reservation: String },
@@ -80,6 +86,15 @@ pub enum Verdict {
     Deny { rationale: String },
     /// Acknowledged — the answer to a release.
     Ok,
+    /// The answer to a ping: we are here, and this is what we have.
+    ///
+    /// The fleet summary is the second question anyone asks after "does this work" —
+    /// *will what I need ever match?* — and it discloses nothing a grant would not.
+    Pong {
+        machines: u32,
+        free: u32,
+        capabilities: Vec<String>,
+    },
 }
 
 /// Where a granted machine is, and the ticket that admits us to it.

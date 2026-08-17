@@ -5,7 +5,7 @@
 //! whole fleet. A worker knows only what it was told; a tester knows only what it
 //! was granted. Neither can allocate, and neither should try.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::proto::{Limits, Nivedana};
 
@@ -128,6 +128,22 @@ impl Fleet {
 
     pub fn reservations(&self) -> impl Iterator<Item = &Reservation> {
         self.reservations.values()
+    }
+
+    /// What is here, for a caller asking whether it is worth asking.
+    ///
+    /// Capabilities are the union across the fleet, deduplicated: enough to see that
+    /// `gpu` exists somewhere, which is what someone about to type `--need gpu`
+    /// wants to know.
+    pub fn summary(&self) -> (u32, u32, Vec<String>) {
+        let machines = self.workers.len() as u32;
+        let free = self.workers.values().filter(|w| w.free_slots() > 0).count() as u32;
+        let capabilities: BTreeSet<String> = self
+            .workers
+            .values()
+            .flat_map(|w| w.capabilities.iter().cloned())
+            .collect();
+        (machines, free, capabilities.into_iter().collect())
     }
 
     /// Machines that could serve this plea if they were free.
@@ -362,6 +378,24 @@ mod tests {
         f.depart("linux-1");
         let held: Vec<_> = f.reservations().map(|r| r.workers.len()).collect();
         assert_eq!(held, vec![1], "the reservation keeps its surviving machine");
+    }
+
+    #[test]
+    fn the_summary_answers_is_it_worth_asking() {
+        let mut f = fleet();
+        assert_eq!(
+            f.summary(),
+            (3, 3, vec!["gpu".to_string(), "linux".to_string()]),
+            "capabilities are the union across the fleet, deduplicated"
+        );
+
+        f.allocate(&plea(&["gpu"]), 1, "a", "dana").unwrap();
+        let (machines, free, _) = f.summary();
+        // Still three machines, but one of them is no longer on offer — which is
+        // the difference between "ask later" and "never".
+        assert_eq!((machines, free), (3, 2));
+
+        assert_eq!(Fleet::default().summary(), (0, 0, vec![]));
     }
 
     #[test]

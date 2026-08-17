@@ -131,6 +131,35 @@ Every capability asked for must be present. Extra ones never disqualify: asking
 for `linux` must not exclude the machine that is also a `gpu`, or the fleet
 fragments for no reason.
 
+## Is any of this working?
+
+```sh
+$ cm test cm-c@acme --ping
+pinging cm-c@acme
+  ok    identity               `cm-t` is oli8pqb2gbs1gb4o8ht9athl7ni0uaf0ubv81pd1v31n7rf885j0
+  ok    our sirji              reached omahtenu17vh6bgs8t2ahop3f6c5f7pvj6lvnfr1pii250fv6fu0
+  ok    resolve                cm-c@acme is 8jjgnu5arbiipum5juidkl3fg5jv9ve1ad7u61153gouc69u1krg
+  ok    dial                   ["10.20.1.254:62097", "127.0.0.1:62097"]
+  ok    auth                   the controller accepted our ticket
+  ok    fleet                  3 machine(s), 3 free, can ["linux", "node20"]
+```
+
+Every one of those hops is exercised by a real run too — but a real run reports only
+that it failed. These six have six different fixes, so the ping stops at the broken
+one and says which:
+
+```
+  FAIL  our sirji     … timed out — is the daemon running (`sirji daemon`)?
+  FAIL  resolve       we know nobody called "nosuchorg"
+  FAIL  resolve       we have no device called "nosuchdevice"
+  FAIL  resolve       "cm-c" is not connected
+  FAIL  auth          <why the controller turned us away>
+```
+
+An empty fleet is reported, not failed: a controller with no machines is working
+perfectly, and calling that broken sends people to debug credentials over a fleet
+that is merely idle. Pinging takes no machine from anybody.
+
 ## Machine hygiene
 
 A machine is lent to one caller after another, so somebody has to be responsible for

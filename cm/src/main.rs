@@ -51,6 +51,10 @@ cm — cost-aware allocation of test machines
         skip them, or see their output. A --post that fails takes the machine
         out of the fleet rather than lending out a dirty one.
 
+  cm test <name@org> --ping
+        check the whole chain — identity, our sirji, resolution, dial, ticket —
+        and say which link is broken. Takes no machine from anybody.
+
   cm test <name@org> \"<why>\" [--count N] [--need <cap>]... [--run <cmd>]
         ask for machines, use them, and give them back
         --repo <url>     fetch this before running   --ref <commit>  which commit
@@ -83,6 +87,9 @@ fn main() -> Result<std::process::ExitCode> {
         ["init", rest @ ..] => rt()?.block_on(init(rest)).map(|_| ok),
         ["controller"] => rt()?.block_on(controller()).map(|_| ok),
         ["worker", rest @ ..] => rt()?.block_on(worker(rest)).map(|_| ok),
+        // `why` is positional but optional: a ping asks for nothing, so making
+        // somebody justify one would be a small daily absurdity.
+        ["test", target, rest @ ..] if rest.contains(&"--ping") => rt()?.block_on(ping(target)),
         ["test", target, why, rest @ ..] => rt()?.block_on(test(target, why, rest)),
         _ => {
             eprintln!("{USAGE}");
@@ -410,6 +417,11 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
     // A tester may plead more than once on one connection, and releases on it too.
     while let Some(plea) = read_line::<Plea>(&mut recv).await? {
         let verdict = match plea {
+            Plea::Ping => {
+                let (machines, free, capabilities) = control.fleet.lock().await.summary();
+                println!("{alias} pinged us");
+                Verdict::Pong { machines, free, capabilities }
+            }
             Plea::Nivedana(nivedana) => decide(&control, &alias, &caller, &nivedana).await,
             Plea::Release { reservation } => {
                 let freed = control.fleet.lock().await.release(&reservation, &caller);
@@ -1423,6 +1435,150 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
     Ok(exit_with(&results))
 }
 
+// ---------------------------------------------------------------------------
+// ping
+// ---------------------------------------------------------------------------
+
+/// Walk the whole chain and say which link is broken.
+///
+/// Everything here is exercised by a real run too, but a real run reports only that
+/// it failed. This reports *where*: the four hops have four completely different
+/// fixes, and telling them apart is the entire point. Costs nobody a machine.
+async fn ping(target: &str) -> Result<std::process::ExitCode> {
+    fn ok(step: &str, detail: impl std::fmt::Display) {
+        println!("  ok    {step:<22} {detail}");
+    }
+    fn bad(step: &str, detail: impl std::fmt::Display) -> std::process::ExitCode {
+        println!("  FAIL  {step:<22} {detail}");
+        std::process::ExitCode::FAILURE
+    }
+
+    println!("pinging {target}");
+
+    // 1. Ourselves. A device with no home or no key never got as far as enrolling.
+    let home = home()?;
+    sirji::Settings::load(&home)?.activate();
+    let config = match load_config(&home) {
+        Ok(config) => config,
+        Err(e) => {
+            return Ok(bad(
+                "identity",
+                format!("{}: {e} — has `cm init` run here?", home.display()),
+            ));
+        }
+    };
+    let key = id52::decode(&config.key)?;
+    let secret = match keys(&home).secret(&key) {
+        Ok(secret) => secret,
+        Err(e) => return Ok(bad("identity", format!("cannot read our own key: {e:#}"))),
+    };
+    ok("identity", format!("`{}` is {}", config.name, config.key));
+
+    let (name, org) = match target.split_once('@') {
+        Some(parts) => parts,
+        None => return Ok(bad("target", format!("{target:?} is not name@org"))),
+    };
+
+    let endpoint = sirji::endpoint::bind_dialer(secret).await?;
+    let verdict = async {
+        // 2. Our own sirji. Everything else goes through it, so a failure here is
+        // never about the other organisation.
+        let parent = match config.parent.first() {
+            Some(address) => id52::decode(address)?,
+            None => return Ok(bad("our sirji", "no parent address in cm.toml")),
+        };
+        match dial_any(&endpoint, parent, &config.parent_hints).await {
+            Ok(conn) => {
+                conn.close(0u32.into(), b"ping");
+                ok("our sirji", format!("reached {}", config.parent[0]));
+            }
+            Err(e) => {
+                return Ok(bad(
+                    "our sirji",
+                    format!("{e:#} — is the daemon running (`sirji daemon`)?"),
+                ));
+            }
+        }
+
+        // 3. The name. One request, but three ways to fail, and the daemon's own
+        // words distinguish them: we do not know that organisation, they have no
+        // device by that name, or the device is not connected.
+        let resolved = sirji::daemon::ask_as_device(
+            &endpoint,
+            &config.parent,
+            &config.parent_hints,
+            &sirji::proto::Ask::ResolveFor {
+                name: name.to_string(),
+                alias: org.to_string(),
+            },
+        )
+        .await;
+        let (device, ticket, hints) = match resolved {
+            Ok(sirji::proto::Say::Resolved { device, ticket, hints }) => (device, ticket, hints),
+            Ok(sirji::proto::Say::No { reason }) => return Ok(bad("resolve", reason)),
+            Err(e) => return Ok(bad("resolve", format!("{e:#}"))),
+        };
+        ok("resolve", format!("{target} is {device}"));
+
+        // 4. The controller itself, dialled directly. The hop most likely to be a
+        // network problem rather than a configuration one.
+        let conn = match dial_any(&endpoint, id52::decode(&device)?, &hints).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                let where_ = if hints.is_empty() {
+                    "no hints, so this needed discovery".to_string()
+                } else {
+                    format!("tried {hints:?}, then discovery")
+                };
+                return Ok(bad("dial", format!("{e:#} — {where_}")));
+            }
+        };
+        ok(
+            "dial",
+            if hints.is_empty() { "found by discovery".to_string() } else { format!("{hints:?}") },
+        );
+
+        // 5. The ticket. Minted by our sirji, verified by the controller against its
+        // own parent's signature — which is the only reason it will talk to us.
+        let (mut send, recv) = conn.open_bi().await?;
+        let mut recv = BufReader::new(recv);
+        write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
+        write_line(&mut send, &Plea::Ping).await?;
+
+        let answer = read_line::<Verdict>(&mut recv).await;
+        let verdict = match answer {
+            Ok(Some(verdict)) => verdict,
+            Ok(None) => return Ok(bad("auth", "the controller hung up without answering")),
+            Err(e) => return Ok(bad("auth", format!("{e:#}"))),
+        };
+        let outcome = match verdict {
+            Verdict::Pong { machines, free, capabilities } => {
+                ok("auth", "the controller accepted our ticket");
+                let detail = if machines == 0 {
+                    "no machines are registered".to_string()
+                } else {
+                    format!("{machines} machine(s), {free} free, can {capabilities:?}")
+                };
+                // Not a failure: a controller with an empty fleet is working
+                // perfectly, and saying otherwise would send somebody debugging
+                // their credentials over a fleet that is merely idle.
+                ok("fleet", detail);
+                std::process::ExitCode::SUCCESS
+            }
+            Verdict::Deny { rationale } => bad("auth", rationale),
+            other => bad("auth", format!("unexpected answer: {other:?}")),
+        };
+
+        let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        Ok(outcome)
+    }
+    .await;
+
+    endpoint.close().await;
+    verdict
+}
+
 /// One complete errand: ask, use what you are given, give it back.
 struct Session {
     target: String,
@@ -1498,7 +1654,7 @@ async fn run(session: Session) -> Result<Results> {
                 return Ok(Vec::new());
             }
             Verdict::Deny { rationale } => bail!("denied: {rationale}"),
-            Verdict::Ok => bail!("unexpected acknowledgement"),
+            other => bail!("expected a verdict on our plea, got {other:?}"),
         };
         println!("  expires in {expires_in}s unless released");
         for w in &workers {

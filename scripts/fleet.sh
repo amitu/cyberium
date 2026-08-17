@@ -89,6 +89,10 @@ echo "--- controller sees ---"
 grep arrived cm-c.log | sed 's/^/  /' || echo "  (nobody arrived)"
 
 # --- the actual asks ------------------------------------------------------
+say "is any of this working?"
+# Every hop the real asks depend on, checked in order, taking nobody's machine.
+CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme --ping 2>&1 | sed 's/^/  /'
+
 say "ask for 2 linux machines, and really run something on them"
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
   "flaky suite, bisecting" --count 2 --need linux \
