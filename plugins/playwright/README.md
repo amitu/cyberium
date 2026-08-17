@@ -131,4 +131,4 @@ than no runner — CI goes green on a suite that did not pass.
 
 ## License
 
-Apache-2.0.
+MIT or Apache-2.0, at your option — see the repository root.
