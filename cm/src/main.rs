@@ -1596,6 +1596,20 @@ mod tests {
     }
 
     #[test]
+    fn every_shard_gets_its_own_tree() {
+        let home = std::path::Path::new("/cm");
+        let one = work_dir(home, "r7", 0);
+        let two = work_dir(home, "r7", 1);
+        // Two shards of one run must not share a checkout: a lockfile or a build
+        // cache written by one and read by the other is how a suite starts passing
+        // for reasons nobody chose.
+        assert_ne!(one, two);
+        // And both sit under the reservation, so ending it removes the lot.
+        let reservation = home.join("work").join("r7");
+        assert!(one.starts_with(&reservation) && two.starts_with(&reservation));
+    }
+
+    #[test]
     fn a_failing_shard_fails_the_run() {
         let ok = |code| Ok(Shard { worker: "w".into(), index: 0, code, artifacts: vec![] });
         let red = std::process::ExitCode::FAILURE;

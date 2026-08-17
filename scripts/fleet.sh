@@ -98,6 +98,15 @@ CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
   "training smoke test" --count 1 --need gpu \
   --run 'echo "training on the gpu box"' 2>&1 | sed 's/^/  /'
 
+say "a machine that has never seen the code fetches it itself"
+# The machine gets a checkout of its own, deleted when the reservation ends. It
+# holds nothing beforehand — which is the only assumption a real fleet can make.
+CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
+  "check out and look around" --count 1 --need linux \
+  --repo https://github.com/amitu/cyberium --ref main \
+  --dir examples/playwright \
+  --run 'echo "in $(pwd)"; ls tests/' 2>&1 | sed 's/^/  /'
+
 say "a command that fails, fails the run"
 # The exit code has to survive the trip. A distributed runner that reports success
 # for a job that failed is worse than one that does not run at all.

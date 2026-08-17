@@ -76,15 +76,17 @@ controller configured it is exactly `playwright test`; point it at one and the s
 
 ```sh
 $ CM_CONTROLLER=cm-c@acme CM_SHARDS=3 CM_NEED=node20 npm test
-granted 3 machine(s) as r3
-[cm-w-1] Running 5 tests using 1 worker
-[cm-w-2] Running 4 tests using 1 worker
-[cm-w-3] Running 4 tests using 1 worker
+machines will fetch 1c2b537b5ade from git@github.com:acme/suite.git
+granted 3 machine(s) as r2
+[cm-w-1] fetching 1c2b537b5ade… from git@github.com:acme/suite.git
+[cm-w-2] fetching 1c2b537b5ade… from git@github.com:acme/suite.git
+[cm-w-3] fetching 1c2b537b5ade… from git@github.com:acme/suite.git
+[cm-w-1] $ npm ci
   cm-w-1 finished shard 1 with success
   cm-w-2 finished shard 2 with success
   cm-w-3 finished shard 3 with success
 merging 3 shard report(s)
-  13 passed (2.5s)
+  13 passed (2.6s)
 ```
 
 Playwright has always known how to split a run — `--shard=i/N`, a blob report each,
@@ -98,14 +100,20 @@ runner would owe the same favour to every other, and the plugin it would have to
 for each is the one in `plugins/playwright` — about a hundred lines, entirely outside
 this repo's Rust.
 
-Two things worth knowing before the first run:
+**A machine starts with nothing.** It does not have your repo, and a fleet that
+assumed otherwise would only work on machines somebody had prepared by hand — which
+is the same as having no fleet. So each shard fetches the commit you are on, into a
+checkout of its own, runs `npm ci`, and has the whole lot deleted when the
+reservation ends. Nothing is reused between runs: a working tree left over from
+somebody else's job is how a green suite starts depending on what ran before it.
 
-- **Shards do not inherit your environment.** A worker is another machine. Send what
-  the run needs in `CM_ENV`.
-- **The workspace has to be there.** Today workers share a filesystem with the
-  caller; a machine across the room needs the repo put on it first. That is the one
-  seam left — sharding, blob transport and the merge are all already indifferent to
-  where the machine is.
+The plugin works out what to fetch from the checkout you are standing in — origin,
+`HEAD`, and where you are inside the repo — so the usual case needs no configuration
+at all. It warns if it cannot confirm your commit is pushed, and if you have
+uncommitted changes: the fleet tests the commit, not your disk.
+
+One thing that will bite otherwise: **shards do not inherit your environment.** A
+worker is another machine. Send what the run needs in `CM_ENV`.
 
 ## Capabilities
 
@@ -202,13 +210,13 @@ SIRJI=/path/to/sirji scripts/fleet.sh
 ## Status
 
 Early, and running end to end: enrolment, resolution, ticket, capability-matched
-allocation, real commands dispatched straight to the machines with their output
-streamed back live, artifacts returned as bytes, release, and reclaim after a caller
-walks away. Verified against a real 1,900-test Playwright suite, sharded across a
-fleet and merged into one report.
+allocation, machines fetching the code themselves into isolated checkouts, real
+commands with their output streamed back live, artifacts returned as bytes, release,
+and reclaim after a caller walks away. Verified against a real 1,900-test Playwright
+suite, sharded across a fleet and merged into one report.
 
-Next: the model call for `policy.md`'s prose half, and getting the workspace onto a
-machine that does not already have it.
+Next: the model call for `policy.md`'s prose half — the last stubbed part — and
+caching the install step, which is now the slowest thing in a run.
 
 ## License
 

@@ -77,6 +77,33 @@ function findCm() {
   return "cm"; // let PATH have the last word
 }
 
+/**
+ * The local Playwright config, for the merge to anchor paths to.
+ *
+ * Blob reports record the **absolute** directory the tests ran in, and
+ * `merge-reports` refuses to combine reports that disagree about it. Machines that
+ * fetched the repo themselves each have their own checkout path, so they always
+ * disagree — every distributed run would fail at the last step.
+ *
+ * Playwright's answer is `-c`: given a config, it takes that config's rootDir as
+ * the truth. Which is what we want anyway — the merged report should name paths in
+ * *your* checkout, the one you are about to go and look at.
+ */
+function mergeConfig() {
+  const explicit = playwrightArgs.findIndex((a) => a === "-c" || a === "--config");
+  if (explicit !== -1 && playwrightArgs[explicit + 1]) return playwrightArgs[explicit + 1];
+  for (const name of [
+    "playwright.config.ts",
+    "playwright.config.js",
+    "playwright.config.mjs",
+    "playwright.config.mts",
+    "playwright.config.cjs",
+  ]) {
+    if (existsSync(name)) return name;
+  }
+  return null;
+}
+
 /** Ask git something about this checkout. `null` if it cannot answer. */
 function git(...args) {
   const out = spawnSync("git", args, { encoding: "utf8" });
@@ -107,18 +134,21 @@ function workspace() {
   const ref = process.env.CM_REF ?? git("rev-parse", "HEAD");
   if (!ref) throw new Error("cannot resolve HEAD — set CM_REF");
 
-  // A commit nobody else can fetch produces three identical, mystifying clone
-  // failures a minute from now. Say so here instead, while the fix is obvious.
+  // A commit nobody else can fetch produces N identical, mystifying clone failures
+  // a minute from now, so it is worth flagging early — but only as a warning.
+  // `branch -r --contains` reads *local* remote-tracking refs, which are absent in
+  // a checkout that pushes by URL and never fetches. Refusing to run on that
+  // evidence blocks a perfectly good commit, which is the worse mistake: the
+  // machines will say plainly enough if they cannot get it.
   if (!process.env.CM_REF) {
-    const onRemote = git("branch", "-r", "--contains", ref);
-    if (!onRemote) {
-      throw new Error(
-        `HEAD (${ref.slice(0, 12)}) is not on any remote branch, so the machines ` +
-          `cannot fetch it. Push it, or set CM_REF to a commit that is.`,
+    if (!git("branch", "-r", "--contains", ref)) {
+      console.warn(
+        `cm-playwright: cannot confirm ${ref.slice(0, 12)} is pushed (no ` +
+          `remote-tracking ref contains it). If the machines cannot fetch it, ` +
+          `push it or set CM_REF.`,
       );
     }
-    const dirty = git("status", "--porcelain");
-    if (dirty) {
+    if (git("status", "--porcelain")) {
       console.warn(
         `cm-playwright: you have uncommitted changes — the fleet will test ` +
           `${ref.slice(0, 12)}, not what is on your disk.`,
@@ -234,9 +264,16 @@ async function onTheFleet(controller) {
   }
 
   console.log(`\nmerging ${found} shard report(s)`);
+  const config = mergeConfig();
   const merge = spawnSync(
     "npx",
-    ["playwright", "merge-reports", "--reporter=list,html", join(BLOB_DIR, "all")],
+    [
+      "playwright",
+      "merge-reports",
+      ...(config ? ["-c", config] : []),
+      "--reporter=list,html",
+      join(BLOB_DIR, "all"),
+    ],
     { stdio: "inherit" },
   );
 

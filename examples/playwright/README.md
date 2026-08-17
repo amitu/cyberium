@@ -35,16 +35,23 @@ CM_CONTROLLER=cm-c@acme CM_SHARDS=3 CM_NEED=node20 npm test
 ```
 
 ```
-granted 3 machine(s) as r3
-[cm-w-1] Running 5 tests using 1 worker
-[cm-w-2] Running 4 tests using 1 worker
-[cm-w-3] Running 4 tests using 1 worker
+machines will fetch 1c2b537b5ade from git@github.com:amitu/cyberium.git
+granted 3 machine(s) as r2
+[cm-w-1] fetching 1c2b537b5ade… from git@github.com:amitu/cyberium.git
+[cm-w-2] fetching 1c2b537b5ade… from git@github.com:amitu/cyberium.git
+[cm-w-3] fetching 1c2b537b5ade… from git@github.com:amitu/cyberium.git
+[cm-w-1] $ npm ci
   cm-w-1 finished shard 1 with success
   cm-w-2 finished shard 2 with success
   cm-w-3 finished shard 3 with success
 merging 3 shard report(s)
-  13 passed (2.5s)
+  13 passed (2.6s)
 ```
+
+Each machine fetched this repo itself — none of them had it — into a checkout of its
+own, which was deleted when the reservation ended. Since it fetches a **commit**,
+the thing being tested is whatever you last pushed, not what is on your disk; the
+plugin warns you when those differ.
 
 ## Watch it go red
 
