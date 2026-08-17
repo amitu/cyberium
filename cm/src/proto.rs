@@ -157,8 +157,15 @@ pub enum Upadesh {
         reservation: String,
         /// Run by a shell, so a caller can send what they would have typed.
         command: String,
-        /// Where to run it. The worker refuses a path it cannot enter rather than
-        /// silently running somewhere else.
+        /// Get the code first, and run in what that produces.
+        ///
+        /// Mutually exclusive with `cwd`: either the worker fetches a workspace or
+        /// it uses one already on the machine, and a caller who asks for both has
+        /// not decided which.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<Workspace>,
+        /// Where to run it, when the machine already has the code. The worker
+        /// refuses a path it cannot enter rather than silently running elsewhere.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
         /// Extra environment for the command. This is how a shard number reaches a
@@ -206,6 +213,35 @@ pub enum Outcome {
     No {
         reason: String,
     },
+}
+
+/// The code a machine needs before it can run anything.
+///
+/// A worker starts with nothing. It does not have your repo, and a fleet that
+/// assumed it did would only ever work on machines somebody had already prepared by
+/// hand — which is the same as having no fleet.
+///
+/// Fetched fresh per reservation into a directory of its own, and deleted when the
+/// reservation ends. Nothing is reused between runs: a working tree left over from
+/// somebody else's job is how a green suite starts depending on what ran before it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    /// Anything `git fetch` understands. It travels to the worker as written, so a
+    /// URL with a token in it hands that token to whoever runs the machine.
+    pub repo: String,
+    /// A commit, branch or tag. A commit is the honest choice — a branch means two
+    /// shards can disagree about what they tested.
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    /// Subdirectory of the checkout to work in, for a suite that does not live at
+    /// the repository root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// Run once after checkout, before the command: `npm ci`, `bundle install`.
+    /// Its output is streamed like any other, because "why is this slow" is
+    /// usually answered here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
 }
 
 /// A file coming back from a worker, base64 so it survives a JSON line.

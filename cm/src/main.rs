@@ -48,11 +48,15 @@ cm — cost-aware allocation of test machines
 
   cm test <name@org> \"<why>\" [--count N] [--need <cap>]... [--run <cmd>]
         ask for machines, use them, and give them back
-        --cwd <dir>      where to run it        --env K=V     extra environment
-        --collect <path> file to bring back     --artifacts <dir>  where to put it
+        --repo <url>     fetch this before running   --ref <commit>  which commit
+        --dir <subdir>   run below the repo root     --setup <cmd>   run once first
+        --cwd <dir>      run here instead, when the machine already has the code
+        --env K=V        extra environment           --collect <path>  bring back
+        --artifacts <d>  where to put what comes back
         --abandon        keep the grant and walk away, to watch it time out
         In --run, --env and --collect: {shard} is 1-based, {index} 0-based,
         {shards} the total.
+        Each shard gets its own checkout, deleted when the reservation ends.
 
 Test runners plug in on top of `cm test` rather than inside cm: a runner that knew
 about Playwright would owe the same favour to jest, pytest and whatever comes next.
@@ -613,6 +617,17 @@ async fn worker(args: &[&str]) -> Result<()> {
 
     let assigned: Assigned = Arc::new(Mutex::new(Default::default()));
 
+    // Anything under work/ belongs to a reservation from a previous life of this
+    // process, and every one of those is over. Clearing it at startup is also the
+    // recovery path for a worker that was killed mid-run and never got its Freed.
+    let stale = home.join("work");
+    if stale.exists() {
+        match std::fs::remove_dir_all(&stale) {
+            Ok(()) => println!("cleared workspaces from a previous run"),
+            Err(e) => eprintln!("could not clear {}: {e}", stale.display()),
+        }
+    }
+
     tokio::spawn({
         let config = config.clone();
         let home = home.clone();
@@ -713,6 +728,16 @@ async fn offer(
             Aadesh::Freed { reservation } => {
                 println!("released from {reservation}");
                 assigned.lock().await.remove(&reservation);
+                // The workspace dies with the reservation that paid for it. Tying
+                // it to the lifecycle that already exists means there is no second
+                // policy about when checkouts get cleaned up — and no machine that
+                // fills its disk with the last hundred runs.
+                let dir = home.join("work").join(&reservation);
+                if dir.exists()
+                    && let Err(e) = std::fs::remove_dir_all(&dir)
+                {
+                    eprintln!("could not remove {}: {e}", dir.display());
+                }
             }
         }
     }
@@ -729,8 +754,16 @@ async fn do_work(incoming: sirji::Incoming, assigned: Assigned, me: String) -> R
     let (mut send, recv) = conn.accept_bi().await?;
     let mut recv = BufReader::new(recv);
 
-    let Some(Upadesh::Run { reservation, command, cwd, env, collect, index, total }) =
-        read_line::<Upadesh>(&mut recv).await?
+    let Some(Upadesh::Run {
+        reservation,
+        command,
+        workspace,
+        cwd,
+        env,
+        collect,
+        index,
+        total,
+    }) = read_line::<Upadesh>(&mut recv).await?
     else {
         return Ok(());
     };
@@ -756,7 +789,10 @@ async fn do_work(incoming: sirji::Incoming, assigned: Assigned, me: String) -> R
     }
 
     println!("shard {}/{total} for {reservation}: {command}", index + 1);
-    let outcome = run_command(&mut send, &me, &command, cwd, &env, &collect, index, limits).await;
+    let outcome = run_shard(
+        &mut send, &me, &command, workspace, cwd, &env, &collect, index, limits, &reservation,
+    )
+    .await;
     let outcome = outcome.unwrap_or_else(|e| Outcome::No { reason: format!("{e:#}") });
     if let Outcome::Done { code, .. } = &outcome {
         println!("shard {}/{total} finished: {code:?}", index + 1);
@@ -767,11 +803,189 @@ async fn do_work(incoming: sirji::Incoming, assigned: Assigned, me: String) -> R
     Ok(())
 }
 
+/// Where a reservation's working trees live: `$CM_HOME/work/<reservation>/shard-N`.
+///
+/// Per reservation so the whole lot can be deleted when it ends, and per shard
+/// underneath because two shards of one run must not share a tree — a `.last-run`
+/// file, a lockfile, a build cache written by one and read by the other is exactly
+/// how a suite starts passing for reasons nobody chose.
+fn work_dir(home: &std::path::Path, reservation: &str, index: u32) -> std::path::PathBuf {
+    home.join("work").join(reservation).join(format!("shard-{}", index + 1))
+}
+
+/// Fetch the code, then run in it.
+///
+/// Splitting this from `run_command` keeps one fact visible: getting the workspace
+/// is *work the caller is paying for*, so its output is streamed and its failures
+/// are reported the same way the command's are. A clone that silently took four
+/// minutes would otherwise look like a slow test suite.
+#[allow(clippy::too_many_arguments)]
+async fn run_shard(
+    send: &mut sirji::SendStream,
+    me: &str,
+    command: &str,
+    workspace: Option<proto::Workspace>,
+    cwd: Option<String>,
+    env: &[(String, String)],
+    collect: &[String],
+    index: u32,
+    limits: Limits,
+    reservation: &str,
+) -> Result<Outcome> {
+    let Some(workspace) = workspace else {
+        return run_command(send, me, command, cwd, env, collect, index, limits).await;
+    };
+    if cwd.is_some() {
+        bail!("asked for both a workspace and a working directory — which one?");
+    }
+
+    let home = home()?;
+    let root = work_dir(&home, reservation, index);
+    // A tree from a previous attempt is not a head start, it is contamination.
+    if root.exists() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    std::fs::create_dir_all(&root)?;
+
+    if let Some(problem) = fetch(send, &workspace, &root, index, limits).await? {
+        return Ok(problem);
+    }
+
+    // The suite may live below the repository root. Resolve through the real path so
+    // a `dir` of `../../..` cannot walk out of the workspace we just made.
+    let mut here = root.clone();
+    if let Some(dir) = &workspace.dir {
+        here = root.join(dir);
+        let (real_root, real_here) = (root.canonicalize()?, here.canonicalize()?);
+        if !real_here.starts_with(&real_root) {
+            bail!("{dir} is outside the workspace");
+        }
+    }
+
+    if let Some(setup) = &workspace.setup {
+        log(send, index, format!("$ {setup}"), false).await?;
+        let outcome = run_command(
+            send,
+            me,
+            setup,
+            Some(here.to_string_lossy().into_owned()),
+            env,
+            &[],
+            index,
+            limits,
+        )
+        .await?;
+        // Setup failing is not the suite failing, and saying so saves an hour of
+        // reading test output for a problem that was `npm ci`.
+        match &outcome {
+            Outcome::Done { code: Some(0), .. } => {}
+            Outcome::Done { code, .. } => {
+                return Ok(Outcome::No {
+                    reason: format!("setup {:?} failed: {}", setup, describe(*code)),
+                });
+            }
+            _ => return Ok(outcome),
+        }
+    }
+
+    run_command(
+        send,
+        me,
+        command,
+        Some(here.to_string_lossy().into_owned()),
+        env,
+        collect,
+        index,
+        limits,
+    )
+    .await
+}
+
+/// Get `workspace.git_ref` into `root`. Returns `Some` if it could not be done.
+///
+/// Shallow first: one commit is all a test run needs, and on a repository of any
+/// size the difference between that and the full history is minutes per machine per
+/// run. Falls back to a complete clone, because shallow fetch of a bare commit needs
+/// a server that allows it and not every host does.
+async fn fetch(
+    send: &mut sirji::SendStream,
+    workspace: &proto::Workspace,
+    root: &std::path::Path,
+    index: u32,
+    limits: Limits,
+) -> Result<Option<Outcome>> {
+    let repo = &workspace.repo;
+    let git_ref = &workspace.git_ref;
+    log(send, index, format!("fetching {git_ref} from {repo}"), false).await?;
+
+    let shallow = format!(
+        "git init -q . && git remote add origin {repo} \
+         && git fetch -q --depth 1 origin {git_ref} && git checkout -q FETCH_HEAD"
+    );
+    if git(send, &shallow, root, index, limits).await? {
+        return Ok(None);
+    }
+
+    log(
+        send,
+        index,
+        "shallow fetch refused — cloning in full".to_string(),
+        true,
+    )
+    .await?;
+    // Start over: a half-initialised directory is not a base to build on.
+    std::fs::remove_dir_all(root)?;
+    std::fs::create_dir_all(root)?;
+
+    let full = format!("git clone -q {repo} . && git checkout -q {git_ref}");
+    if git(send, &full, root, index, limits).await? {
+        return Ok(None);
+    }
+
+    Ok(Some(Outcome::No {
+        reason: format!(
+            "could not get {git_ref} from {repo} — is it pushed, and can this machine read it?"
+        ),
+    }))
+}
+
+/// Run one git incantation, streaming it. `true` if it worked.
+async fn git(
+    send: &mut sirji::SendStream,
+    script: &str,
+    root: &std::path::Path,
+    index: u32,
+    limits: Limits,
+) -> Result<bool> {
+    let outcome = run_command(
+        send,
+        "git",
+        script,
+        Some(root.to_string_lossy().into_owned()),
+        &[],
+        &[],
+        index,
+        limits,
+    )
+    .await?;
+    Ok(matches!(outcome, Outcome::Done { code: Some(0), .. }))
+}
+
+async fn log(
+    send: &mut sirji::SendStream,
+    index: u32,
+    line: String,
+    stderr: bool,
+) -> Result<()> {
+    write_line(send, &Outcome::Log { index, line, stderr }).await
+}
+
 /// Run the command, streaming its output back as it appears.
 ///
 /// A shell runs it, because a caller should be able to send what they would have
 /// typed — pipes, `&&`, a shell function — rather than an argv this code would have
 /// to invent a quoting convention for.
+#[allow(clippy::too_many_arguments)]
 async fn run_command(
     send: &mut sirji::SendStream,
     me: &str,
@@ -877,16 +1091,34 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
     };
     let mut job = Job {
         command: "echo hello".to_string(),
+        workspace: None,
         cwd: None,
         env: Vec::new(),
         collect: Vec::new(),
     };
     let mut artifacts_dir = "cm-artifacts".to_string();
     let mut abandon = false;
+    let (mut repo, mut git_ref, mut dir, mut setup) = (None, None, None, None);
 
     let mut i = 0;
     while i < args.len() {
         match args[i] {
+            "--repo" => {
+                repo = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            "--ref" => {
+                git_ref = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            "--dir" => {
+                dir = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            "--setup" => {
+                setup = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
             "--cwd" => {
                 job.cwd = args.get(i + 1).map(|v| (*v).to_string());
                 i += 2;
@@ -936,6 +1168,16 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
             }
             other => bail!("unrecognised argument: {other}"),
         }
+    }
+
+    if let Some(repo) = repo {
+        // A ref is not optional. Defaulting to the default branch would mean two
+        // shards of one run could test two different commits, and the report would
+        // not say so.
+        let git_ref = git_ref.ok_or_else(|| anyhow::anyhow!("--repo also needs --ref"))?;
+        job.workspace = Some(proto::Workspace { repo, git_ref, dir, setup });
+    } else if git_ref.is_some() || dir.is_some() || setup.is_some() {
+        bail!("--ref, --dir and --setup only mean something with --repo");
     }
 
     let session = Session {
@@ -1099,6 +1341,10 @@ fn exit_with(results: &Results) -> std::process::ExitCode {
 struct Job {
     /// May contain `{shard}` (1-based), `{index}` (0-based) and `{shards}`.
     command: String,
+    /// Code to fetch first. The normal case for a real fleet: a worker starts with
+    /// nothing, and expecting it to already have your repo means expecting somebody
+    /// to have prepared that machine by hand.
+    workspace: Option<proto::Workspace>,
     cwd: Option<String>,
     env: Vec<(String, String)>,
     collect: Vec<String>,
@@ -1177,6 +1423,7 @@ async fn run_on(
         &Upadesh::Run {
             reservation: reservation.to_string(),
             command: job.shaped(&job.command, index, total),
+            workspace: job.workspace.clone(),
             cwd: job.cwd.clone(),
             env: job
                 .env
@@ -1271,6 +1518,7 @@ mod tests {
     fn job(command: &str) -> Job {
         Job {
             command: command.into(),
+            workspace: None,
             cwd: None,
             env: vec![],
             collect: vec![],
@@ -1293,6 +1541,7 @@ mod tests {
         // here; if only the command were substituted the two would disagree.
         let j = Job {
             command: "run".into(),
+            workspace: None,
             cwd: None,
             env: vec![("OUT".into(), "blob-{shard}.zip".into())],
             collect: vec!["blob-{shard}.zip".into()],

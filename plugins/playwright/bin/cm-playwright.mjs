@@ -20,6 +20,12 @@
 //   CM_HOME         which cm identity to use — see cm init
 //   CM_BIN          path to the cm binary, if it is somewhere unusual
 //
+//   CM_REPO         where machines fetch the code (default: this checkout's origin)
+//   CM_REF          which commit (default: HEAD, if you have pushed it)
+//   CM_DIR          subdirectory to run in (default: where you are, within the repo)
+//   CM_SETUP        install step on each machine (default `npm ci`)
+//   CM_NO_CLONE     set to use a workspace already on the machine instead
+//
 // Anything after the script name is passed to Playwright untouched:
 //
 //   npm test -- --project qa --grep @smoke
@@ -69,6 +75,61 @@ function findCm() {
     if (existsSync(path)) return path;
   }
   return "cm"; // let PATH have the last word
+}
+
+/** Ask git something about this checkout. `null` if it cannot answer. */
+function git(...args) {
+  const out = spawnSync("git", args, { encoding: "utf8" });
+  if (out.status !== 0) return null;
+  return out.stdout.trim() || null;
+}
+
+/**
+ * Work out what the machines should fetch, from the checkout you are standing in.
+ *
+ * Deriving it beats asking for it: the commit you want tested is almost always the
+ * one you are on, and a `CM_REF` that has to be kept up to date by hand is a `CM_REF`
+ * that will one day be wrong without anybody noticing.
+ *
+ * Returns null if the code says to use a workspace already on the machine.
+ */
+function workspace() {
+  if (process.env.CM_NO_CLONE) return null;
+
+  const repo = process.env.CM_REPO ?? git("remote", "get-url", "origin");
+  if (!repo) {
+    throw new Error(
+      "cannot tell where the machines should fetch the code from — " +
+        "set CM_REPO, or CM_NO_CLONE if they already have it",
+    );
+  }
+
+  const ref = process.env.CM_REF ?? git("rev-parse", "HEAD");
+  if (!ref) throw new Error("cannot resolve HEAD — set CM_REF");
+
+  // A commit nobody else can fetch produces three identical, mystifying clone
+  // failures a minute from now. Say so here instead, while the fix is obvious.
+  if (!process.env.CM_REF) {
+    const onRemote = git("branch", "-r", "--contains", ref);
+    if (!onRemote) {
+      throw new Error(
+        `HEAD (${ref.slice(0, 12)}) is not on any remote branch, so the machines ` +
+          `cannot fetch it. Push it, or set CM_REF to a commit that is.`,
+      );
+    }
+    const dirty = git("status", "--porcelain");
+    if (dirty) {
+      console.warn(
+        `cm-playwright: you have uncommitted changes — the fleet will test ` +
+          `${ref.slice(0, 12)}, not what is on your disk.`,
+      );
+    }
+  }
+
+  // Where we are, relative to the repository root: the suite may live well below it.
+  const dir = process.env.CM_DIR ?? git("rev-parse", "--show-prefix") ?? undefined;
+
+  return { repo, ref, dir, setup: process.env.CM_SETUP ?? "npm ci" };
 }
 
 /** Run something, inheriting stdio, and resolve with its exit code. */
@@ -135,7 +196,6 @@ async function onTheFleet(controller) {
     controller,
     process.env.CM_WHY ?? `${packageName()} suite`,
     "--count", String(shards),
-    "--cwd", process.cwd(),
     "--run", command,
     // Shards do not inherit this environment: a worker is another machine, and
     // anything the run needs has to be sent to it deliberately.
@@ -143,6 +203,18 @@ async function onTheFleet(controller) {
     "--collect", BLOB,
     "--artifacts", BLOB_DIR,
   ];
+  const code = workspace();
+  if (code) {
+    args.push("--repo", code.repo, "--ref", code.ref);
+    if (code.dir) args.push("--dir", code.dir);
+    if (code.setup) args.push("--setup", code.setup);
+    console.log(`machines will fetch ${code.ref.slice(0, 12)} from ${code.repo}`);
+  } else {
+    // The caller says the machines already have the code — which is only true when
+    // they share this filesystem. Honest for a laptop demo, not for a real fleet.
+    args.push("--cwd", process.cwd());
+  }
+
   for (const capability of list(process.env.CM_NEED)) args.push("--need", capability);
   for (const pair of list(process.env.CM_ENV)) {
     if (!pair.includes("=")) {
