@@ -1,0 +1,138 @@
+# Build `cm` for every platform it runs on, and attach the binaries to a release.
+#
+# Takes a tag and assumes Cargo.toml already says that version — the tag is the
+# input, not something this derives. Deliberate: a workflow that edits versions
+# during a release is a workflow that can disagree with the commit it built from.
+#
+# Every target is built on its **own native runner**. Cross-compiling would be
+# fewer jobs, but `ring` — under iroh, under rustls — wants a C toolchain for the
+# target, and every hour spent feeding cross-linkers is an hour not spent on the
+# product. Native runners are free here.
+#
+# Windows is absent on purpose: sirji's control socket is a unix socket and its
+# keystore uses unix file permissions, so cm does not compile there yet. That is a
+# port with a design question in it (Windows has no filesystem-permission
+# equivalent for "who may talk to this daemon"), not a matter of adding a target.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and attach binaries to, e.g. v0.1.0"
+        required: true
+        type: string
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # The tag reaches a shell and `actions/checkout`'s ref, and git permits `;` and
+  # `$` in ref names — so it is checked against a shape before it goes anywhere,
+  # rather than trusted because whoever dispatched the run has write access.
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.check.outputs.name }}
+    steps:
+      - id: check
+        env:
+          CANDIDATE: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$CANDIDATE" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "refusing to build from $CANDIDATE — expected something like v0.1.0" >&2
+            exit 1
+          fi
+          echo "name=$CANDIDATE" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: tag
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ needs.tag.outputs.name }}
+      TARGET: ${{ matrix.target }}
+    strategy:
+      # One platform failing should not hide whether the others work.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            native: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            native: true
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            native: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            native: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Safe to interpolate: the tag job has already established its shape.
+          ref: ${{ needs.tag.outputs.name }}
+
+      # rust-toolchain.toml pins the version, so rustup installs that and nothing
+      # here needs to name it twice.
+      - name: install the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --locked --target "$TARGET"
+
+      # Runs where the binary can execute. Every runner here is native, so this is
+      # every job — but it is written as a condition so adding a cross target later
+      # does not silently start running tests that cannot run.
+      - name: test
+        if: matrix.native
+        run: cargo test --release --locked --target "$TARGET"
+
+      - name: check it runs
+        if: matrix.native
+        # An unrunnable binary is the one failure packaging cannot catch.
+        run: "./target/$TARGET/release/cm --help"
+
+      - name: package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="cm-${TAG}-${TARGET}"
+          mkdir -p "dist/${name}"
+
+          cp "target/${TARGET}/release/cm" "dist/${name}/"
+          strip "dist/${name}/cm" || true          # cosmetic; never fail a release for it
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${name}/"
+
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          # Checksums beside the archive: a binary downloaded over a network
+          # somebody else administers is worth being able to verify.
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # `--clobber` so re-running a build replaces its asset rather than
+          # failing half way through a release nobody can now finish.
+          gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
+            --clobber --repo "$REPO"
