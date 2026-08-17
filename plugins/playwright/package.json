@@ -1,19 +1,15 @@
 {
   "name": "@cyberium/playwright",
   "version": "0.0.0",
-  "description": "Run an existing Playwright suite across a cm fleet, unmodified",
+  "description": "Run your existing Playwright suite across a cm fleet from npm test",
   "license": "Apache-2.0",
   "repository": "https://github.com/amitu/cyberium",
   "type": "module",
   "bin": {
     "cm-playwright": "./bin/cm-playwright.mjs"
   },
-  "exports": {
-    ".": "./index.mjs"
-  },
   "files": [
     "bin",
-    "index.mjs",
     "README.md"
   ],
   "peerDependencies": {

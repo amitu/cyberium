@@ -1,68 +1,191 @@
 #!/usr/bin/env node
 //
-// `cm-playwright` — run this repo's Playwright suite across a cm fleet.
+// Stands in for `playwright test` in your `npm test`, and runs the same suite
+// across a cm fleet instead of on this machine.
 //
-// It is a thin shim over `cm playwright`, and thin on purpose. Everything that
-// needs judgement — pleading, capability matching, dispatch, bringing the blob
-// reports home — happens in cm, which already speaks sirji and already holds the
-// device identity. Reimplementing any of that in Node would mean two versions of
-// it to keep honest.
+// Everything Playwright-shaped lives here rather than in cm: the shard arithmetic,
+// the blob reports, the merge. cm's side of it is `cm test`, which knows only how
+// to get machines and run a command on them — a runner that understood Playwright
+// would owe the same favour to jest, pytest and whatever comes next.
 //
-// What the shim adds is the thing a Node package is actually better at: being
-// installable next to the suite, so `npx cm-playwright` works with no separate
-// download step and no PATH surgery.
+// Configured entirely by environment, because `npm test` has nowhere to put flags
+// and a CI job has nowhere else to put configuration.
+//
+//   CM_CONTROLLER   name@org of the controller. Unset ⇒ run locally, as normal.
+//   CM_SHARDS       how many machines to ask for (default 4)
+//   CM_NEED         capabilities, comma separated: linux,node20
+//   CM_ENV          environment for the shards: GRPC_SERVER=off,APP_ENV=staging
+//   CM_WHY          the reason the controller weighs (default: this package's name)
+//   CM_RUNNER       how to start Playwright (default `npx playwright test`)
+//   CM_HOME         which cm identity to use — see cm init
+//   CM_BIN          path to the cm binary, if it is somewhere unusual
+//
+// Anything after the script name is passed to Playwright untouched:
+//
+//   npm test -- --project qa --grep @smoke
 
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, copyFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
+const BLOB_DIR = "cm-blob-report";
+// A name we choose, so collecting it afterwards needs no guessing about how
+// Playwright would have numbered it.
+const BLOB = "blob-report/cm-shard-{shard}.zip";
+
+const playwrightArgs = process.argv.slice(2);
+
+/** Split a comma-separated env value, tolerating spaces and trailing commas. */
+function list(value) {
+  return (value ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function packageName() {
+  try {
+    return JSON.parse(readFileSync("package.json", "utf8")).name ?? "a playwright suite";
+  } catch {
+    return "a playwright suite";
+  }
+}
+
 /**
- * Find the cm binary.
+ * Find the cm binary. Explicit env first, then the usual places.
  *
- * Explicit env first, then the usual places. We do NOT fall back to something
- * that merely looks plausible: running the wrong binary against a real fleet is
- * worse than saying we could not find the right one.
+ * We do not fall back to something that merely looks plausible: running the wrong
+ * binary against a real fleet is worse than saying we could not find the right one.
  */
 function findCm() {
   if (process.env.CM_BIN) return process.env.CM_BIN;
-
-  const candidates = [
+  for (const path of [
     join(process.cwd(), "node_modules", ".bin", "cm"),
     join(process.env.HOME ?? "", ".cargo", "bin", "cm"),
     "/usr/local/bin/cm",
     "/opt/homebrew/bin/cm",
-  ];
-  for (const path of candidates) {
+  ]) {
     if (existsSync(path)) return path;
   }
-  // Let PATH have the last word; if it is not there either, spawn reports it.
-  return "cm";
+  return "cm"; // let PATH have the last word
 }
 
-const cm = findCm();
-const args = ["playwright", ...process.argv.slice(2)];
+/** Run something, inheriting stdio, and resolve with its exit code. */
+function run(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: "inherit" });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => resolve(signal ? 1 : (code ?? 1)));
+  });
+}
 
-const child = spawn(cm, args, { stdio: "inherit" });
+/**
+ * No controller configured means no fleet, so run the suite the ordinary way.
+ *
+ * This is the property that makes the plugin safe to commit: `npm test` keeps
+ * working on a laptop with no cm, in a CI job that has not been given a fleet yet,
+ * and for the contributor who has never heard of any of this.
+ */
+async function locally() {
+  const [command, ...rest] = (process.env.CM_RUNNER ?? "npx playwright test").split(/\s+/);
+  return run(command, [...rest, ...playwrightArgs]);
+}
 
-child.on("error", (e) => {
-  if (e.code === "ENOENT") {
+/**
+ * Gather the per-shard directories cm wrote into one directory, which is the shape
+ * `merge-reports` wants. The shard number is already in each filename.
+ */
+function flattenBlobs() {
+  if (!existsSync(BLOB_DIR)) return 0;
+  const flat = join(BLOB_DIR, "all");
+  mkdirSync(flat, { recursive: true });
+
+  let found = 0;
+  for (const entry of readdirSync(BLOB_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === "all") continue;
+    const dir = join(BLOB_DIR, entry.name);
+    for (const file of readdirSync(dir)) {
+      if (file.endsWith(".zip")) {
+        copyFileSync(join(dir, file), join(flat, file));
+        found += 1;
+      }
+    }
+  }
+  return found;
+}
+
+async function onTheFleet(controller) {
+  const shards = Number(process.env.CM_SHARDS ?? 4);
+  if (!Number.isInteger(shards) || shards < 1) {
+    console.error(`cm-playwright: CM_SHARDS must be a positive integer, got ${process.env.CM_SHARDS}`);
+    return 1;
+  }
+
+  const runner = process.env.CM_RUNNER ?? "npx playwright test";
+  // `{shard}` and `{shards}` are filled in by cm, once per machine. `{shards}` is
+  // the number actually granted, not the number asked for — so a counter-offer of
+  // three machines still produces a correct, complete three-way split.
+  const command = [runner, ...playwrightArgs, "--shard={shard}/{shards}", "--reporter=blob"]
+    .join(" ")
+    .trim();
+
+  const args = [
+    "test",
+    controller,
+    process.env.CM_WHY ?? `${packageName()} suite`,
+    "--count", String(shards),
+    "--cwd", process.cwd(),
+    "--run", command,
+    // Shards do not inherit this environment: a worker is another machine, and
+    // anything the run needs has to be sent to it deliberately.
+    "--env", `PLAYWRIGHT_BLOB_OUTPUT_FILE=${BLOB}`,
+    "--collect", BLOB,
+    "--artifacts", BLOB_DIR,
+  ];
+  for (const capability of list(process.env.CM_NEED)) args.push("--need", capability);
+  for (const pair of list(process.env.CM_ENV)) {
+    if (!pair.includes("=")) {
+      console.error(`cm-playwright: CM_ENV wants K=V pairs, got ${JSON.stringify(pair)}`);
+      return 1;
+    }
+    args.push("--env", pair);
+  }
+
+  const verdict = await run(findCm(), args);
+
+  const found = flattenBlobs();
+  if (found === 0) {
+    console.error("cm-playwright: no shard reports came back — nothing to merge");
+    // Still a failure even if cm was happy: a run with no report is not a pass.
+    return verdict === 0 ? 1 : verdict;
+  }
+
+  console.log(`\nmerging ${found} shard report(s)`);
+  const merge = spawnSync(
+    "npx",
+    ["playwright", "merge-reports", "--reporter=list,html", join(BLOB_DIR, "all")],
+    { stdio: "inherit" },
+  );
+
+  // The suite's verdict wins over the merge's. A merge that succeeds cannot make a
+  // failing suite pass, and turning a red run green is the single worst thing a
+  // test tool can do.
+  if (verdict !== 0) return verdict;
+  return merge.status ?? 1;
+}
+
+const controller = process.env.CM_CONTROLLER;
+try {
+  process.exit(controller ? await onTheFleet(controller) : await locally());
+} catch (e) {
+  if (e?.code === "ENOENT") {
     console.error(
-      `cm-playwright: cannot find the cm binary (tried ${cm}).\n` +
+      `cm-playwright: cannot find the cm binary (tried ${findCm()}).\n` +
         `Set CM_BIN, or build it: https://github.com/amitu/cyberium`,
     );
     process.exit(127);
   }
-  console.error(`cm-playwright: ${e.message}`);
+  console.error(`cm-playwright: ${e?.message ?? e}`);
   process.exit(1);
-});
-
-// Pass the run's verdict straight through. A wrapper that turns a failing suite
-// into a passing exit code is the single worst thing a test tool can do.
-child.on("exit", (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal);
-    return;
-  }
-  process.exit(code ?? 1);
-});
+}

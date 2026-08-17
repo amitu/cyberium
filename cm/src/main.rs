@@ -54,13 +54,9 @@ cm — cost-aware allocation of test machines
         In --run, --env and --collect: {shard} is 1-based, {index} 0-based,
         {shards} the total.
 
-  cm playwright [--shards N] [--need <cap>]... [--env K=V]... [-- <pw args>]
-        run a Playwright suite across the fleet and merge the reports.
-        The suite is not modified: each machine runs `--shard=i/N --reporter=blob`,
-        the blobs come back, and Playwright's own `merge-reports` stitches them.
-        Shards do NOT inherit this shell's environment — a worker is another
-        machine. Pass what the run needs with --env.
-        Defaults come from a \"cm\" key in package.json.
+Test runners plug in on top of `cm test` rather than inside cm: a runner that knew
+about Playwright would owe the same favour to jest, pytest and whatever comes next.
+See plugins/ — the Playwright one is a `npm test` away.
 
 $CM_HOME defaults to ~/.cm. A device has its own home because a device may be on
 another machine.";
@@ -79,7 +75,6 @@ fn main() -> Result<std::process::ExitCode> {
         ["controller"] => rt()?.block_on(controller()).map(|_| ok),
         ["worker", rest @ ..] => rt()?.block_on(worker(rest)).map(|_| ok),
         ["test", target, why, rest @ ..] => rt()?.block_on(test(target, why, rest)),
-        ["playwright", rest @ ..] => rt()?.block_on(playwright(rest)),
         _ => {
             eprintln!("{USAGE}");
             bail!("unrecognised command: {}", args.join(" "));
@@ -969,8 +964,9 @@ type Results = Vec<Result<Shard>>;
 
 /// Resolve, plead, dispatch, release.
 ///
-/// Both `cm test` and `cm playwright` are this; they differ only in what command
-/// they send and what they do with what comes back.
+/// The whole of what cm offers a caller. Everything a test runner needs on top of
+/// this — shard arithmetic, report formats, merging — belongs to that runner's
+/// plugin, not here.
 async fn run(session: Session) -> Result<Results> {
     let home = home()?;
     sirji::Settings::load(&home)?.activate();
@@ -1078,214 +1074,6 @@ async fn run(session: Session) -> Result<Results> {
     conn.close(0u32.into(), b"done");
     endpoint.close().await;
     outcome
-}
-
-// ---------------------------------------------------------------------------
-// playwright
-// ---------------------------------------------------------------------------
-
-/// Where each shard writes its blob report, and what we ask for back.
-///
-/// Playwright's own distribution story is `--shard=i/N` writing a blob report, then
-/// `merge-reports` stitching them into one. That is the whole integration: cm
-/// supplies the machines and moves the blobs, and Playwright does the sharding and
-/// the merging it already knows how to do. Nothing here reimplements a test runner,
-/// which is why an existing suite runs unmodified.
-const BLOB: &str = "blob-report/cm-shard-{shard}.zip";
-
-/// Defaults a repo can commit, so `cm playwright` needs no flags and the suite
-/// itself stays untouched.
-///
-/// Two places, because two habits. A `cm` key in `package.json`:
-///
-/// ```jsonc
-/// { "cm": { "controller": "cm-c@acme", "need": ["linux", "node20"], "shards": 4 } }
-/// ```
-///
-/// or `cm.generated.json`, written by the `cm()` helper from the Playwright config
-/// for people who would rather declare it next to everything else about the run.
-/// The generated file wins: it was produced by the config that is about to run,
-/// while `package.json` may be describing a different intent entirely.
-#[derive(Debug, Default, serde::Deserialize)]
-struct PackageCm {
-    controller: Option<String>,
-    #[serde(default)]
-    need: Vec<String>,
-    shards: Option<u32>,
-    /// Defaults to `npx playwright test`, so a repo that runs its suite some other
-    /// way — a wrapper script, a different package manager — can say so.
-    runner: Option<String>,
-}
-
-fn package_cm(dir: &std::path::Path) -> PackageCm {
-    #[derive(serde::Deserialize)]
-    struct Package {
-        #[serde(default)]
-        cm: Option<PackageCm>,
-    }
-
-    if let Ok(text) = std::fs::read_to_string(dir.join("cm.generated.json"))
-        && let Ok(cm) = serde_json::from_str::<PackageCm>(&text)
-    {
-        return cm;
-    }
-    std::fs::read_to_string(dir.join("package.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Package>(&text).ok())
-        .and_then(|p| p.cm)
-        .unwrap_or_default()
-}
-
-async fn playwright(args: &[&str]) -> Result<std::process::ExitCode> {
-    // Everything after `--` belongs to Playwright, verbatim. Parsing its flags
-    // ourselves would mean tracking a surface we do not own and getting it wrong
-    // the first time it changes.
-    let (ours, theirs) = match args.iter().position(|a| *a == "--") {
-        Some(at) => (&args[..at], args[at + 1..].join(" ")),
-        None => (args, String::new()),
-    };
-
-    let cwd = std::env::current_dir()?;
-    let defaults = package_cm(&cwd);
-    let mut target = defaults.controller.unwrap_or_else(|| "cm-c@acme".to_string());
-    let mut need = defaults.need;
-    let mut shards = defaults.shards;
-    let mut runner = defaults
-        .runner
-        .unwrap_or_else(|| "npx playwright test".to_string());
-    let mut why = "playwright suite".to_string();
-    let mut merge = true;
-    // A worker inherits its own environment, not ours — it is another machine, and
-    // pretending otherwise is how a suite passes locally and fails on the fleet.
-    // Anything the run needs has to travel with the job, explicitly.
-    let mut env = vec![("PLAYWRIGHT_BLOB_OUTPUT_FILE".to_string(), BLOB.to_string())];
-
-    let mut i = 0;
-    while i < ours.len() {
-        match ours[i] {
-            "--env" => {
-                match ours.get(i + 1).and_then(|kv| kv.split_once('=')) {
-                    Some((k, v)) => env.push((k.to_string(), v.to_string())),
-                    None => bail!("--env wants K=V"),
-                }
-                i += 2;
-            }
-            "--controller" => {
-                target = ours.get(i + 1).unwrap_or(&"cm-c@acme").to_string();
-                i += 2;
-            }
-            "--shards" => {
-                shards = ours.get(i + 1).and_then(|v| v.parse().ok());
-                i += 2;
-            }
-            "--need" => {
-                if let Some(cap) = ours.get(i + 1) {
-                    need.push((*cap).to_string());
-                }
-                i += 2;
-            }
-            "--why" => {
-                why = ours.get(i + 1).unwrap_or(&"playwright suite").to_string();
-                i += 2;
-            }
-            "--runner" => {
-                runner = ours.get(i + 1).unwrap_or(&"npx playwright test").to_string();
-                i += 2;
-            }
-            "--no-merge" => {
-                merge = false;
-                i += 1;
-            }
-            other => bail!("unrecognised argument: {other} (Playwright's own go after `--`)"),
-        }
-    }
-
-    // The suite runs where we were invoked. Workers today share this filesystem;
-    // when they stop doing so this is the one line that has to become a transfer,
-    // and everything else — sharding, blobs, the merge — is already indifferent.
-    let root = cwd.to_string_lossy().to_string();
-
-    let command = format!(
-        "{runner} {theirs} --shard={{shard}}/{{shards}} --reporter=blob"
-    );
-    println!("each machine will run: {}", command.trim());
-
-    let session = Session {
-        target,
-        nivedana: Nivedana {
-            why,
-            count: shards,
-            capabilities: need,
-            role: std::env::var("CM_T_ROLE").ok(),
-        },
-        job: Job {
-            command,
-            cwd: Some(root),
-            // Playwright names the blob after the shard unless told otherwise, and
-            // "unless told otherwise" is exactly what we want: a name we chose, so
-            // collecting it needs no guessing about its numbering.
-            env,
-            collect: vec![BLOB.into()],
-        },
-        artifacts_dir: "cm-blob-report".to_string(),
-        abandon: false,
-    };
-
-    let results = run(session).await?;
-    if results.is_empty() {
-        return Ok(std::process::ExitCode::FAILURE);
-    }
-
-    if merge {
-        merge_reports()?;
-    }
-    Ok(exit_with(&results))
-}
-
-/// Hand the collected blobs back to Playwright to stitch together.
-///
-/// Its own tool, not ours: the blob format is Playwright's internal business and
-/// re-implementing the merge would be a promise to keep matching it forever.
-fn merge_reports() -> Result<()> {
-    let blobs = std::path::Path::new("cm-blob-report");
-    if !blobs.is_dir() {
-        eprintln!("no blob reports came back — nothing to merge");
-        return Ok(());
-    }
-
-    // merge-reports wants one directory of zips; ours arrive one directory per
-    // shard, so flatten first. Shard number is already in each filename.
-    let flat = blobs.join("all");
-    std::fs::create_dir_all(&flat)?;
-    let mut found = 0;
-    for entry in std::fs::read_dir(blobs)? {
-        let dir = entry?.path();
-        if !dir.is_dir() || dir == flat {
-            continue;
-        }
-        for file in std::fs::read_dir(&dir)? {
-            let file = file?.path();
-            if file.extension().is_some_and(|e| e == "zip") {
-                std::fs::copy(&file, flat.join(file.file_name().expect("a file")))?;
-                found += 1;
-            }
-        }
-    }
-    if found == 0 {
-        eprintln!("no blob reports came back — nothing to merge");
-        return Ok(());
-    }
-
-    println!("merging {found} shard report(s)");
-    let status = std::process::Command::new("npx")
-        .args(["playwright", "merge-reports", "--reporter=list,html"])
-        .arg(&flat)
-        .status()
-        .context("running `npx playwright merge-reports`")?;
-    if !status.success() {
-        bail!("merge-reports failed: {status}");
-    }
-    Ok(())
 }
 
 /// Exit as the run did. A distributed run that swallows a failing shard is worse
@@ -1576,32 +1364,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_generated_config_beats_package_json() {
-        let dir = std::env::temp_dir().join(format!("cm-test-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"cm":{"controller":"old@acme","shards":1}}"#,
-        )
-        .unwrap();
-        assert_eq!(package_cm(&dir).controller.as_deref(), Some("old@acme"));
 
-        std::fs::write(
-            dir.join("cm.generated.json"),
-            r#"{"controller":"new@acme","need":["gpu"],"shards":4}"#,
-        )
-        .unwrap();
-        let cfg = package_cm(&dir);
-        assert_eq!(cfg.controller.as_deref(), Some("new@acme"));
-        assert_eq!(cfg.shards, Some(4));
-        assert_eq!(cfg.need, vec!["gpu".to_string()]);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_repo_that_says_nothing_still_works() {
-        let cfg = package_cm(std::path::Path::new("/nonexistent"));
-        assert!(cfg.controller.is_none() && cfg.need.is_empty() && cfg.shards.is_none());
-    }
 }

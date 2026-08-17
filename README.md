@@ -61,15 +61,22 @@ cheap enough to run hundreds of.
 There is no shared secret anywhere, no API key, and no account. Identity is an
 ed25519 keypair, connections are QUIC, and the substrate handles all of it.
 
-## Playwright, unmodified
+## Still `npm test`
 
-The point of a fleet is the suite you already have. `cm playwright` runs one across
-it without touching a line of it:
+The point of a fleet is the suite you already have, run the way people already run
+it. Installing `@cyberium/playwright` changes one line of `package.json`:
+
+```jsonc
+{ "scripts": { "test": "cm-playwright" } }
+```
+
+and nothing else. No fixture, no reporter, no import, no spec file touched. With no
+controller configured it is exactly `playwright test`; point it at one and the same
+`npm test` fans out:
 
 ```sh
-$ cm playwright --shards 3 -- --project qa
-each machine will run: npx playwright test --project qa --shard={shard}/{shards} --reporter=blob
-granted 3 machine(s) as r7
+$ CM_CONTROLLER=cm-c@acme CM_SHARDS=3 CM_NEED=node20 npm test
+granted 3 machine(s) as r3
 [cm-w-1] Running 5 tests using 1 worker
 [cm-w-2] Running 4 tests using 1 worker
 [cm-w-3] Running 4 tests using 1 worker
@@ -77,24 +84,24 @@ granted 3 machine(s) as r7
   cm-w-2 finished shard 2 with success
   cm-w-3 finished shard 3 with success
 merging 3 shard report(s)
-  13 passed (2.6s)
+  13 passed (2.5s)
 ```
 
 Playwright has always known how to split a run — `--shard=i/N`, a blob report each,
-`merge-reports` at the end. What was missing was somebody to find the machines. So
-that is all cm does: every shard is an ordinary Playwright process that has no idea
-it is part of anything, which is exactly why the suite needs no changes.
+`merge-reports` at the end. What was missing was somebody to find the machines. Each
+shard is an ordinary Playwright process that has no idea it is part of anything,
+which is exactly why the suite needs no changes.
 
-There is no reporter and no fixture to install, because distribution happens
-*outside* the Playwright process. `plugins/playwright` is an npm package for
-`npx cm-playwright`; `examples/playwright` is a suite with nothing cm-specific in it,
-including a test that fails on demand — a distributed runner that loses a failure is
-worse than no runner, so that path has its own proof.
+**cm has no idea what Playwright is.** It hands out machines and runs commands; the
+plugin does the sharding, the blobs and the merge. A `cm` that understood one test
+runner would owe the same favour to every other, and the plugin it would have to grow
+for each is the one in `plugins/playwright` — about a hundred lines, entirely outside
+this repo's Rust.
 
 Two things worth knowing before the first run:
 
-- **Shards do not inherit your environment.** A worker is another machine. Pass what
-  the run needs with `--env K=V`.
+- **Shards do not inherit your environment.** A worker is another machine. Send what
+  the run needs in `CM_ENV`.
 - **The workspace has to be there.** Today workers share a filesystem with the
   caller; a machine across the room needs the repo put on it first. That is the one
   seam left — sharding, blob transport and the merge are all already indifferent to
