@@ -61,6 +61,45 @@ cheap enough to run hundreds of.
 There is no shared secret anywhere, no API key, and no account. Identity is an
 ed25519 keypair, connections are QUIC, and the substrate handles all of it.
 
+## Playwright, unmodified
+
+The point of a fleet is the suite you already have. `cm playwright` runs one across
+it without touching a line of it:
+
+```sh
+$ cm playwright --shards 3 -- --project qa
+each machine will run: npx playwright test --project qa --shard={shard}/{shards} --reporter=blob
+granted 3 machine(s) as r7
+[cm-w-1] Running 5 tests using 1 worker
+[cm-w-2] Running 4 tests using 1 worker
+[cm-w-3] Running 4 tests using 1 worker
+  cm-w-1 finished shard 1 with success
+  cm-w-2 finished shard 2 with success
+  cm-w-3 finished shard 3 with success
+merging 3 shard report(s)
+  13 passed (2.6s)
+```
+
+Playwright has always known how to split a run — `--shard=i/N`, a blob report each,
+`merge-reports` at the end. What was missing was somebody to find the machines. So
+that is all cm does: every shard is an ordinary Playwright process that has no idea
+it is part of anything, which is exactly why the suite needs no changes.
+
+There is no reporter and no fixture to install, because distribution happens
+*outside* the Playwright process. `plugins/playwright` is an npm package for
+`npx cm-playwright`; `examples/playwright` is a suite with nothing cm-specific in it,
+including a test that fails on demand — a distributed runner that loses a failure is
+worse than no runner, so that path has its own proof.
+
+Two things worth knowing before the first run:
+
+- **Shards do not inherit your environment.** A worker is another machine. Pass what
+  the run needs with `--env K=V`.
+- **The workspace has to be there.** Today workers share a filesystem with the
+  caller; a machine across the room needs the repo put on it first. That is the one
+  seam left — sharding, blob transport and the merge are all already indifferent to
+  where the machine is.
+
 ## Capabilities
 
 Plain strings, and deliberately so. The org invents its own vocabulary — `linux`,
@@ -156,9 +195,13 @@ SIRJI=/path/to/sirji scripts/fleet.sh
 ## Status
 
 Early, and running end to end: enrolment, resolution, ticket, capability-matched
-allocation, work dispatched straight to the machines, release, and reclaim after a
-caller walks away. The runner is a placeholder that reports what it was asked to
-do rather than doing it, and the model call is the next thing.
+allocation, real commands dispatched straight to the machines with their output
+streamed back live, artifacts returned as bytes, release, and reclaim after a caller
+walks away. Verified against a real 1,900-test Playwright suite, sharded across a
+fleet and merged into one report.
+
+Next: the model call for `policy.md`'s prose half, and getting the workspace onto a
+machine that does not already have it.
 
 ## License
 

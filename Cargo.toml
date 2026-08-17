@@ -17,7 +17,18 @@ rust-version = "1.85"
 sirji = { git = "https://github.com/amitu/sirji" }
 
 anyhow = "1"
+# Already in the tree beneath sirji, which uses it for id52. Naming it directly
+# rather than reaching through sirji's re-exports: artifacts travelling as base64 is
+# cm's own concern, not something the substrate should have an opinion about.
+data-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    # A worker runs commands and holds them to a deadline. Both are the job.
+    "process",
+    "time",
+] }
 toml = "0.9"

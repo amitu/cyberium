@@ -155,20 +155,63 @@ impl Default for Limits {
 pub enum Upadesh {
     Run {
         reservation: String,
+        /// Run by a shell, so a caller can send what they would have typed.
         command: String,
+        /// Where to run it. The worker refuses a path it cannot enter rather than
+        /// silently running somewhere else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// Extra environment for the command. This is how a shard number reaches a
+        /// test runner that reads it from the environment.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<(String, String)>,
+        /// Files to send back when it finishes, relative to `cwd`.
+        ///
+        /// Results have to travel as bytes, not as paths. A worker on another
+        /// machine shares no filesystem with the caller, and a design that works
+        /// only when it does is a design that has not left the laptop.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        collect: Vec<String>,
         /// Which shard of the plan this machine takes.
         index: u32,
         total: u32,
     },
 }
 
+/// What comes back up the same stream, in order: any number of `Log`s while the
+/// command runs, then exactly one `Done` or `No`.
+///
+/// Live output matters for a test runner. Holding it all until the end would mean
+/// a suite that takes ten minutes says nothing for ten minutes, and the first thing
+/// anyone would build on top is a way to see it sooner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "kebab-case")]
 pub enum Outcome {
+    Log {
+        index: u32,
+        line: String,
+        /// Which stream it came from, since a runner's summary and its errors are
+        /// worth telling apart.
+        stderr: bool,
+    },
     Done {
         worker: String,
         index: u32,
-        output: String,
+        /// The command's exit status. `None` means it was killed for exceeding its
+        /// limit, which is not the same as failing.
+        code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<Artifact>,
     },
-    No { reason: String },
+    No {
+        reason: String,
+    },
+}
+
+/// A file coming back from a worker, base64 so it survives a JSON line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Artifact {
+    /// The path asked for, as asked for, so the caller can match it up.
+    pub path: String,
+    pub base64: String,
 }

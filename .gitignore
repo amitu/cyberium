@@ -3,3 +3,15 @@
 keys/
 *.private-key
 .DS_Store
+
+# Node, for the plugin and the example
+node_modules/
+package-lock.json
+
+# What a distributed run leaves behind
+blob-report/
+cm-blob-report/
+cm-artifacts/
+playwright-report/
+test-results/
+cm.generated.json

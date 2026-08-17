@@ -21,12 +21,16 @@ mod proto;
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use fleet::{Fleet, Shortfall, Worker};
 use policy::Ruling;
-use proto::{Aadesh, Limits, Nivedana, Outcome, Plea, Register, Upadesh, Verdict, WorkerHandle};
+use proto::{
+    Aadesh, Artifact, Limits, Nivedana, Outcome, Plea, Register, Upadesh, Verdict, WorkerHandle,
+};
 use sirji::id52;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+// `write_all` here is quinn's own inherent method on the stream, not the tokio
+// trait's — importing `AsyncWriteExt` for it would be importing nothing.
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
 const USAGE: &str = "\
@@ -44,24 +48,38 @@ cm — cost-aware allocation of test machines
 
   cm test <name@org> \"<why>\" [--count N] [--need <cap>]... [--run <cmd>]
         ask for machines, use them, and give them back
-        --abandon  keep the grant and walk away, to watch it time out
+        --cwd <dir>      where to run it        --env K=V     extra environment
+        --collect <path> file to bring back     --artifacts <dir>  where to put it
+        --abandon        keep the grant and walk away, to watch it time out
+        In --run, --env and --collect: {shard} is 1-based, {index} 0-based,
+        {shards} the total.
+
+  cm playwright [--shards N] [--need <cap>]... [--env K=V]... [-- <pw args>]
+        run a Playwright suite across the fleet and merge the reports.
+        The suite is not modified: each machine runs `--shard=i/N --reporter=blob`,
+        the blobs come back, and Playwright's own `merge-reports` stitches them.
+        Shards do NOT inherit this shell's environment — a worker is another
+        machine. Pass what the run needs with --env.
+        Defaults come from a \"cm\" key in package.json.
 
 $CM_HOME defaults to ~/.cm. A device has its own home because a device may be on
 another machine.";
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
+    let ok = std::process::ExitCode::SUCCESS;
     match args.as_slice() {
         [] | ["-h"] | ["--help"] | ["help"] => {
             println!("{USAGE}");
-            Ok(())
+            Ok(ok)
         }
-        ["init", rest @ ..] => rt()?.block_on(init(rest)),
-        ["controller"] => rt()?.block_on(controller()),
-        ["worker", rest @ ..] => rt()?.block_on(worker(rest)),
+        ["init", rest @ ..] => rt()?.block_on(init(rest)).map(|_| ok),
+        ["controller"] => rt()?.block_on(controller()).map(|_| ok),
+        ["worker", rest @ ..] => rt()?.block_on(worker(rest)).map(|_| ok),
         ["test", target, why, rest @ ..] => rt()?.block_on(test(target, why, rest)),
+        ["playwright", rest @ ..] => rt()?.block_on(playwright(rest)),
         _ => {
             eprintln!("{USAGE}");
             bail!("unrecognised command: {}", args.join(" "));
@@ -113,8 +131,8 @@ fn keys(home: &std::path::Path) -> sirji::Keystore {
 }
 
 /// Where an endpoint is reachable, for the parent to hand on.
-fn listening(endpoint: &sirji::Endpoint) -> Vec<String> {
-    sirji::endpoint::reachable_at(endpoint)
+async fn listening(endpoint: &sirji::Endpoint) -> Vec<String> {
+    sirji::endpoint::reachable_at(endpoint).await
 }
 
 async fn write_line<T: serde::Serialize>(send: &mut sirji::SendStream, value: &T) -> Result<()> {
@@ -131,6 +149,23 @@ async fn read_line<T: serde::de::DeserializeOwned>(
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(line.trim())?))
+}
+
+/// How an exit status reads to a person.
+fn describe(code: Option<i32>) -> String {
+    match code {
+        Some(0) => "success".to_string(),
+        Some(n) => format!("exit {n}"),
+        None => "no exit code (killed)".to_string(),
+    }
+}
+
+fn b64_encode(bytes: &[u8]) -> String {
+    data_encoding::BASE64.encode(bytes)
+}
+
+fn b64_decode(text: &str) -> Result<Vec<u8>> {
+    Ok(data_encoding::BASE64.decode(text.as_bytes())?)
 }
 
 /// Errors that are how the transport reports normal endings, not faults.
@@ -265,7 +300,7 @@ async fn controller() -> Result<()> {
         signing: secret,
     });
 
-    let hints = listening(&endpoint);
+    let hints = listening(&endpoint).await;
     tokio::spawn({
         let config = config.clone();
         let home = home.clone();
@@ -586,7 +621,7 @@ async fn worker(args: &[&str]) -> Result<()> {
     tokio::spawn({
         let config = config.clone();
         let home = home.clone();
-        let hints = listening(&endpoint);
+        let hints = listening(&endpoint).await;
         let assigned = assigned.clone();
         async move {
             loop {
@@ -699,7 +734,7 @@ async fn do_work(incoming: sirji::Incoming, assigned: Assigned, me: String) -> R
     let (mut send, recv) = conn.accept_bi().await?;
     let mut recv = BufReader::new(recv);
 
-    let Some(Upadesh::Run { reservation, command, index, total }) =
+    let Some(Upadesh::Run { reservation, command, cwd, env, collect, index, total }) =
         read_line::<Upadesh>(&mut recv).await?
     else {
         return Ok(());
@@ -710,10 +745,12 @@ async fn do_work(incoming: sirji::Incoming, assigned: Assigned, me: String) -> R
     // consulted: the controller already decided, and re-deciding at the edge is
     // exactly how a worker ends up needing a policy file of its own.
     let holder = assigned.lock().await.get(&reservation).cloned();
-    let refusal = match holder {
-        None => Some(format!("we hold no reservation {reservation}")),
-        Some((expected, _)) if expected != caller => Some(format!("{reservation} is not yours")),
-        Some(_) => None,
+    let (refusal, limits) = match holder {
+        None => (Some(format!("we hold no reservation {reservation}")), Limits::default()),
+        Some((expected, _)) if expected != caller => {
+            (Some(format!("{reservation} is not yours")), Limits::default())
+        }
+        Some((_, limits)) => (None, limits),
     };
     if let Some(reason) = refusal {
         println!("refused {caller}: {reason}");
@@ -723,32 +760,158 @@ async fn do_work(incoming: sirji::Incoming, assigned: Assigned, me: String) -> R
         return Ok(());
     }
 
-    println!("running shard {}/{total} for {reservation}: {command:?}", index + 1);
-    // Placeholder for the real runner. Enough to prove the work reached the right
-    // machine under the right reservation, which is what had to be demonstrated.
-    let output = format!("{me} ran shard {}/{total} of {command:?}", index + 1);
-    write_line(&mut send, &Outcome::Done { worker: me, index, output }).await?;
+    println!("shard {}/{total} for {reservation}: {command}", index + 1);
+    let outcome = run_command(&mut send, &me, &command, cwd, &env, &collect, index, limits).await;
+    let outcome = outcome.unwrap_or_else(|e| Outcome::No { reason: format!("{e:#}") });
+    if let Outcome::Done { code, .. } = &outcome {
+        println!("shard {}/{total} finished: {code:?}", index + 1);
+    }
+    write_line(&mut send, &outcome).await?;
     send.finish()?;
     conn.closed().await;
     Ok(())
+}
+
+/// Run the command, streaming its output back as it appears.
+///
+/// A shell runs it, because a caller should be able to send what they would have
+/// typed — pipes, `&&`, a shell function — rather than an argv this code would have
+/// to invent a quoting convention for.
+async fn run_command(
+    send: &mut sirji::SendStream,
+    me: &str,
+    command: &str,
+    cwd: Option<String>,
+    env: &[(String, String)],
+    collect: &[String],
+    index: u32,
+    limits: Limits,
+) -> Result<Outcome> {
+    let root = match cwd {
+        Some(dir) => {
+            let path = std::path::PathBuf::from(&dir);
+            // Refuse rather than fall back to our own directory. Running the right
+            // command in the wrong place produces a plausible, wrong answer.
+            if !path.is_dir() {
+                bail!("{dir} is not a directory on this machine");
+            }
+            path
+        }
+        None => std::env::current_dir()?,
+    };
+
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(&root)
+        .envs(env.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("starting {command:?}"))?;
+
+    let mut out = BufReader::new(child.stdout.take().expect("piped")).lines();
+    let mut err = BufReader::new(child.stderr.take().expect("piped")).lines();
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(limits.max_seconds.max(1)));
+    tokio::pin!(deadline);
+
+    let code = loop {
+        tokio::select! {
+            line = out.next_line() => match line? {
+                Some(line) => write_line(send, &Outcome::Log { index, line, stderr: false }).await?,
+                None => {}
+            },
+            line = err.next_line() => match line? {
+                Some(line) => write_line(send, &Outcome::Log { index, line, stderr: true }).await?,
+                None => {}
+            },
+            status = child.wait() => break status?.code(),
+            _ = &mut deadline => {
+                // The limit came from the controller with the reservation. Killing
+                // is the whole point of having one: a run that ignores its ceiling
+                // holds a machine nobody can get back.
+                let _ = child.kill().await;
+                return Ok(Outcome::No {
+                    reason: format!("killed after {}s", limits.max_seconds),
+                });
+            }
+        }
+    };
+
+    // Drain whatever was still buffered when the process exited, or the last and
+    // most interesting lines — the failure summary — are the ones that go missing.
+    while let Some(line) = out.next_line().await? {
+        write_line(send, &Outcome::Log { index, line, stderr: false }).await?;
+    }
+    while let Some(line) = err.next_line().await? {
+        write_line(send, &Outcome::Log { index, line, stderr: true }).await?;
+    }
+
+    let mut artifacts = Vec::new();
+    for path in collect {
+        let full = root.join(path);
+        match std::fs::read(&full) {
+            Ok(bytes) => artifacts.push(Artifact {
+                path: path.clone(),
+                base64: b64_encode(&bytes),
+            }),
+            // Not an error: a shard that failed early may legitimately have
+            // produced no report, and the exit code already says so.
+            Err(e) => eprintln!("no {}: {e}", full.display()),
+        }
+    }
+
+    Ok(Outcome::Done {
+        worker: me.to_string(),
+        index,
+        code,
+        artifacts,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // the tester
 // ---------------------------------------------------------------------------
 
-async fn test(target: &str, why: &str, args: &[&str]) -> Result<()> {
+async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::ExitCode> {
     let mut nivedana = Nivedana {
         why: why.to_string(),
         role: std::env::var("CM_T_ROLE").ok(),
         ..Default::default()
     };
-    let mut command = "echo hello".to_string();
+    let mut job = Job {
+        command: "echo hello".to_string(),
+        cwd: None,
+        env: Vec::new(),
+        collect: Vec::new(),
+    };
+    let mut artifacts_dir = "cm-artifacts".to_string();
     let mut abandon = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i] {
+            "--cwd" => {
+                job.cwd = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            "--env" => {
+                if let Some((k, v)) = args.get(i + 1).and_then(|kv| kv.split_once('=')) {
+                    job.env.push((k.to_string(), v.to_string()));
+                }
+                i += 2;
+            }
+            "--collect" => {
+                if let Some(path) = args.get(i + 1) {
+                    job.collect.push((*path).to_string());
+                }
+                i += 2;
+            }
+            "--artifacts" => {
+                artifacts_dir = args.get(i + 1).unwrap_or(&"cm-artifacts").to_string();
+                i += 2;
+            }
             "--abandon" => {
                 // Walk away holding the grant, to show the controller taking it
                 // back on its own. Nothing a real caller would ask for; everything
@@ -772,7 +935,7 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<()> {
             }
             "--run" => {
                 if let Some(cmd) = args.get(i + 1) {
-                    command = (*cmd).to_string();
+                    job.command = (*cmd).to_string();
                 }
                 i += 2;
             }
@@ -780,14 +943,44 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<()> {
         }
     }
 
+    let session = Session {
+        target: target.to_string(),
+        nivedana,
+        job,
+        artifacts_dir,
+        abandon,
+    };
+    let results = run(session).await?;
+    Ok(exit_with(&results))
+}
+
+/// One complete errand: ask, use what you are given, give it back.
+struct Session {
+    target: String,
+    nivedana: Nivedana,
+    job: Job,
+    artifacts_dir: String,
+    abandon: bool,
+}
+
+/// What a session came back with. Empty when the plea was countered — the caller
+/// was told why, and nothing ran.
+type Results = Vec<Result<Shard>>;
+
+/// Resolve, plead, dispatch, release.
+///
+/// Both `cm test` and `cm playwright` are this; they differ only in what command
+/// they send and what they do with what comes back.
+async fn run(session: Session) -> Result<Results> {
     let home = home()?;
     sirji::Settings::load(&home)?.activate();
     let config = load_config(&home)?;
     let secret = keys(&home).secret(&id52::decode(&config.key)?)?;
 
-    let (name, org) = target
+    let (name, org) = session
+        .target
         .split_once('@')
-        .ok_or_else(|| anyhow::anyhow!("{target:?} is not name@org"))?;
+        .ok_or_else(|| anyhow::anyhow!("{:?} is not name@org", session.target))?;
 
     // Our parent knows who the organisation is. We do not, and should not.
     let endpoint = sirji::endpoint::bind_dialer(secret).await?;
@@ -805,7 +998,7 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<()> {
         sirji::proto::Say::Resolved { device, ticket, hints } => (device, ticket, hints),
         sirji::proto::Say::No { reason } => bail!("{reason}"),
     };
-    eprintln!("resolved {target} -> {device}");
+    eprintln!("resolved {} -> {device}", session.target);
 
     let conn = dial_any(&endpoint, id52::decode(&device)?, &hints).await?;
     let (mut send, recv) = conn.open_bi().await?;
@@ -816,7 +1009,7 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<()> {
     // cancelled out from under the runtime, which surfaced as a panic on exit.
     let outcome = async {
         write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
-        write_line(&mut send, &Plea::Nivedana(nivedana)).await?;
+        write_line(&mut send, &Plea::Nivedana(session.nivedana)).await?;
 
         let verdict: Verdict = read_line(&mut recv)
             .await?
@@ -832,7 +1025,7 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<()> {
             }
             Verdict::Counter { count, rationale } => {
                 println!("countered: {count} — {rationale}");
-                return Ok(());
+                return Ok(Vec::new());
             }
             Verdict::Deny { rationale } => bail!("denied: {rationale}"),
             Verdict::Ok => bail!("unexpected acknowledgement"),
@@ -843,29 +1036,41 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<()> {
         }
 
         // Talk to each machine directly. The controller allocated; it is not a proxy.
-        let total = workers.len() as u32;
-        for (index, handle) in workers.iter().enumerate() {
-            match run_on(&endpoint, handle, &reservation, &command, index as u32, total).await {
-                Ok(Outcome::Done { worker, output, .. }) => println!("  {worker}: {output}"),
-                Ok(Outcome::No { reason }) => println!("  {}: refused — {reason}", handle.name),
-                Err(e) => eprintln!("  {}: {e:#}", handle.name),
+        let results = dispatch(&endpoint, &workers, &reservation, &session.job).await;
+        let done: Vec<&Shard> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        for result in &results {
+            match result {
+                Ok(shard) => println!(
+                    "  {} finished shard {} with {}",
+                    shard.worker,
+                    shard.index + 1,
+                    describe(shard.code)
+                ),
+                Err(e) => eprintln!("  {e:#}"),
+            }
+        }
+        if done.iter().any(|s| !s.artifacts.is_empty()) {
+            let dir = std::path::PathBuf::from(&session.artifacts_dir);
+            for path in save_artifacts(&dir, &done)? {
+                println!("  kept {}", path.display());
             }
         }
 
-        if abandon {
+        if session.abandon {
             println!("walking away still holding {reservation}");
-            return Ok(());
+            return Ok(results);
         }
 
-        // Give them back at once. A duration hint sizes a plan; it never justifies
-        // holding capacity idle.
+        // Give them back at once — even when shards failed. A failed run is exactly
+        // when capacity is most worth returning, and holding it hostage to an error
+        // path is how a fleet fills up with machines nobody is using.
         write_line(&mut send, &Plea::Release { reservation: reservation.clone() }).await?;
         match read_line::<Verdict>(&mut recv).await? {
             Some(Verdict::Ok) => println!("released {reservation}"),
             Some(Verdict::Deny { rationale }) => eprintln!("release refused: {rationale}"),
             _ => eprintln!("release unacknowledged"),
         }
-        Ok(())
+        Ok(results)
     }
     .await;
 
@@ -875,14 +1080,306 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<()> {
     outcome
 }
 
+// ---------------------------------------------------------------------------
+// playwright
+// ---------------------------------------------------------------------------
+
+/// Where each shard writes its blob report, and what we ask for back.
+///
+/// Playwright's own distribution story is `--shard=i/N` writing a blob report, then
+/// `merge-reports` stitching them into one. That is the whole integration: cm
+/// supplies the machines and moves the blobs, and Playwright does the sharding and
+/// the merging it already knows how to do. Nothing here reimplements a test runner,
+/// which is why an existing suite runs unmodified.
+const BLOB: &str = "blob-report/cm-shard-{shard}.zip";
+
+/// Defaults a repo can commit, so `cm playwright` needs no flags and the suite
+/// itself stays untouched.
+///
+/// Two places, because two habits. A `cm` key in `package.json`:
+///
+/// ```jsonc
+/// { "cm": { "controller": "cm-c@acme", "need": ["linux", "node20"], "shards": 4 } }
+/// ```
+///
+/// or `cm.generated.json`, written by the `cm()` helper from the Playwright config
+/// for people who would rather declare it next to everything else about the run.
+/// The generated file wins: it was produced by the config that is about to run,
+/// while `package.json` may be describing a different intent entirely.
+#[derive(Debug, Default, serde::Deserialize)]
+struct PackageCm {
+    controller: Option<String>,
+    #[serde(default)]
+    need: Vec<String>,
+    shards: Option<u32>,
+    /// Defaults to `npx playwright test`, so a repo that runs its suite some other
+    /// way — a wrapper script, a different package manager — can say so.
+    runner: Option<String>,
+}
+
+fn package_cm(dir: &std::path::Path) -> PackageCm {
+    #[derive(serde::Deserialize)]
+    struct Package {
+        #[serde(default)]
+        cm: Option<PackageCm>,
+    }
+
+    if let Ok(text) = std::fs::read_to_string(dir.join("cm.generated.json"))
+        && let Ok(cm) = serde_json::from_str::<PackageCm>(&text)
+    {
+        return cm;
+    }
+    std::fs::read_to_string(dir.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Package>(&text).ok())
+        .and_then(|p| p.cm)
+        .unwrap_or_default()
+}
+
+async fn playwright(args: &[&str]) -> Result<std::process::ExitCode> {
+    // Everything after `--` belongs to Playwright, verbatim. Parsing its flags
+    // ourselves would mean tracking a surface we do not own and getting it wrong
+    // the first time it changes.
+    let (ours, theirs) = match args.iter().position(|a| *a == "--") {
+        Some(at) => (&args[..at], args[at + 1..].join(" ")),
+        None => (args, String::new()),
+    };
+
+    let cwd = std::env::current_dir()?;
+    let defaults = package_cm(&cwd);
+    let mut target = defaults.controller.unwrap_or_else(|| "cm-c@acme".to_string());
+    let mut need = defaults.need;
+    let mut shards = defaults.shards;
+    let mut runner = defaults
+        .runner
+        .unwrap_or_else(|| "npx playwright test".to_string());
+    let mut why = "playwright suite".to_string();
+    let mut merge = true;
+    // A worker inherits its own environment, not ours — it is another machine, and
+    // pretending otherwise is how a suite passes locally and fails on the fleet.
+    // Anything the run needs has to travel with the job, explicitly.
+    let mut env = vec![("PLAYWRIGHT_BLOB_OUTPUT_FILE".to_string(), BLOB.to_string())];
+
+    let mut i = 0;
+    while i < ours.len() {
+        match ours[i] {
+            "--env" => {
+                match ours.get(i + 1).and_then(|kv| kv.split_once('=')) {
+                    Some((k, v)) => env.push((k.to_string(), v.to_string())),
+                    None => bail!("--env wants K=V"),
+                }
+                i += 2;
+            }
+            "--controller" => {
+                target = ours.get(i + 1).unwrap_or(&"cm-c@acme").to_string();
+                i += 2;
+            }
+            "--shards" => {
+                shards = ours.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--need" => {
+                if let Some(cap) = ours.get(i + 1) {
+                    need.push((*cap).to_string());
+                }
+                i += 2;
+            }
+            "--why" => {
+                why = ours.get(i + 1).unwrap_or(&"playwright suite").to_string();
+                i += 2;
+            }
+            "--runner" => {
+                runner = ours.get(i + 1).unwrap_or(&"npx playwright test").to_string();
+                i += 2;
+            }
+            "--no-merge" => {
+                merge = false;
+                i += 1;
+            }
+            other => bail!("unrecognised argument: {other} (Playwright's own go after `--`)"),
+        }
+    }
+
+    // The suite runs where we were invoked. Workers today share this filesystem;
+    // when they stop doing so this is the one line that has to become a transfer,
+    // and everything else — sharding, blobs, the merge — is already indifferent.
+    let root = cwd.to_string_lossy().to_string();
+
+    let command = format!(
+        "{runner} {theirs} --shard={{shard}}/{{shards}} --reporter=blob"
+    );
+    println!("each machine will run: {}", command.trim());
+
+    let session = Session {
+        target,
+        nivedana: Nivedana {
+            why,
+            count: shards,
+            capabilities: need,
+            role: std::env::var("CM_T_ROLE").ok(),
+        },
+        job: Job {
+            command,
+            cwd: Some(root),
+            // Playwright names the blob after the shard unless told otherwise, and
+            // "unless told otherwise" is exactly what we want: a name we chose, so
+            // collecting it needs no guessing about its numbering.
+            env,
+            collect: vec![BLOB.into()],
+        },
+        artifacts_dir: "cm-blob-report".to_string(),
+        abandon: false,
+    };
+
+    let results = run(session).await?;
+    if results.is_empty() {
+        return Ok(std::process::ExitCode::FAILURE);
+    }
+
+    if merge {
+        merge_reports()?;
+    }
+    Ok(exit_with(&results))
+}
+
+/// Hand the collected blobs back to Playwright to stitch together.
+///
+/// Its own tool, not ours: the blob format is Playwright's internal business and
+/// re-implementing the merge would be a promise to keep matching it forever.
+fn merge_reports() -> Result<()> {
+    let blobs = std::path::Path::new("cm-blob-report");
+    if !blobs.is_dir() {
+        eprintln!("no blob reports came back — nothing to merge");
+        return Ok(());
+    }
+
+    // merge-reports wants one directory of zips; ours arrive one directory per
+    // shard, so flatten first. Shard number is already in each filename.
+    let flat = blobs.join("all");
+    std::fs::create_dir_all(&flat)?;
+    let mut found = 0;
+    for entry in std::fs::read_dir(blobs)? {
+        let dir = entry?.path();
+        if !dir.is_dir() || dir == flat {
+            continue;
+        }
+        for file in std::fs::read_dir(&dir)? {
+            let file = file?.path();
+            if file.extension().is_some_and(|e| e == "zip") {
+                std::fs::copy(&file, flat.join(file.file_name().expect("a file")))?;
+                found += 1;
+            }
+        }
+    }
+    if found == 0 {
+        eprintln!("no blob reports came back — nothing to merge");
+        return Ok(());
+    }
+
+    println!("merging {found} shard report(s)");
+    let status = std::process::Command::new("npx")
+        .args(["playwright", "merge-reports", "--reporter=list,html"])
+        .arg(&flat)
+        .status()
+        .context("running `npx playwright merge-reports`")?;
+    if !status.success() {
+        bail!("merge-reports failed: {status}");
+    }
+    Ok(())
+}
+
+/// Exit as the run did. A distributed run that swallows a failing shard is worse
+/// than no run at all: CI goes green on a suite that did not pass.
+fn exit_with(results: &Results) -> std::process::ExitCode {
+    let failed = results.iter().any(|r| match r {
+        Ok(shard) => shard.code != Some(0),
+        Err(_) => true,
+    });
+    if failed {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dispatch
+// ---------------------------------------------------------------------------
+
+/// One command, to be run once per granted machine with its shard number filled in.
+#[derive(Debug, Clone)]
+struct Job {
+    /// May contain `{shard}` (1-based), `{index}` (0-based) and `{shards}`.
+    command: String,
+    cwd: Option<String>,
+    env: Vec<(String, String)>,
+    collect: Vec<String>,
+}
+
+impl Job {
+    /// Fill in this machine's place in the plan.
+    ///
+    /// 1-based `{shard}` because every runner that takes a shard argument counts
+    /// from one; 0-based `{index}` as well, because filenames usually do not.
+    fn shaped(&self, text: &str, index: u32, total: u32) -> String {
+        text.replace("{shard}", &(index + 1).to_string())
+            .replace("{index}", &index.to_string())
+            .replace("{shards}", &total.to_string())
+    }
+}
+
+/// What one machine did.
+struct Shard {
+    worker: String,
+    index: u32,
+    code: Option<i32>,
+    artifacts: Vec<Artifact>,
+}
+
+/// Run the job on every granted machine at once.
+///
+/// At once, not in turn: running N shards sequentially would take exactly as long
+/// as running them here, which is the entire thing anyone is paying for. Each
+/// machine gets its own connection, and its output is printed as it arrives with
+/// the machine's name in front — interleaved on purpose, because a stalled shard
+/// should be visible while it is stalling rather than after everything else ends.
+async fn dispatch(
+    endpoint: &sirji::Endpoint,
+    workers: &[WorkerHandle],
+    reservation: &str,
+    job: &Job,
+) -> Vec<Result<Shard>> {
+    let total = workers.len() as u32;
+    let mut running = Vec::new();
+
+    for (index, handle) in workers.iter().enumerate() {
+        let endpoint = endpoint.clone();
+        let handle = handle.clone();
+        let reservation = reservation.to_string();
+        let job = job.clone();
+        running.push(tokio::spawn(async move {
+            run_on(&endpoint, &handle, &reservation, &job, index as u32, total).await
+        }));
+    }
+
+    let mut out = Vec::new();
+    for task in running {
+        out.push(match task.await {
+            Ok(result) => result,
+            Err(e) => Err(anyhow::anyhow!("shard task failed: {e}")),
+        });
+    }
+    out
+}
+
 async fn run_on(
     endpoint: &sirji::Endpoint,
     handle: &WorkerHandle,
     reservation: &str,
-    command: &str,
+    job: &Job,
     index: u32,
     total: u32,
-) -> Result<Outcome> {
+) -> Result<Shard> {
     let conn = dial_any(endpoint, id52::decode(&handle.key)?, &handle.hints).await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut recv = BufReader::new(recv);
@@ -891,7 +1388,18 @@ async fn run_on(
         &mut send,
         &Upadesh::Run {
             reservation: reservation.to_string(),
-            command: command.to_string(),
+            command: job.shaped(&job.command, index, total),
+            cwd: job.cwd.clone(),
+            env: job
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), job.shaped(v, index, total)))
+                .collect(),
+            collect: job
+                .collect
+                .iter()
+                .map(|p| job.shaped(p, index, total))
+                .collect(),
             index,
             total,
         },
@@ -899,11 +1407,53 @@ async fn run_on(
     .await?;
     send.finish()?;
 
-    let outcome = read_line(&mut recv)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("{} said nothing", handle.name))?;
-    conn.close(0u32.into(), b"done");
-    Ok(outcome)
+    // Logs until the one terminal message. The worker sends them as they happen,
+    // so this loop is also what keeps the connection demonstrably alive.
+    loop {
+        let Some(outcome) = read_line::<Outcome>(&mut recv).await? else {
+            bail!("{} stopped talking mid-run", handle.name);
+        };
+        match outcome {
+            Outcome::Log { line, stderr, .. } => {
+                if stderr {
+                    eprintln!("[{}] {line}", handle.name);
+                } else {
+                    println!("[{}] {line}", handle.name);
+                }
+            }
+            Outcome::Done { worker, index, code, artifacts } => {
+                conn.close(0u32.into(), b"done");
+                return Ok(Shard { worker, index, code, artifacts });
+            }
+            Outcome::No { reason } => {
+                conn.close(0u32.into(), b"done");
+                bail!("{} refused: {reason}", handle.name);
+            }
+        }
+    }
+}
+
+/// Write what the machines sent back, under one directory per shard so two shards
+/// producing the same filename do not overwrite each other.
+fn save_artifacts(dir: &std::path::Path, shards: &[&Shard]) -> Result<Vec<std::path::PathBuf>> {
+    let mut written = Vec::new();
+    for shard in shards {
+        for artifact in &shard.artifacts {
+            // The path came from another machine. Take the filename and nothing
+            // else: a worker that answered with `../../etc/something` should not be
+            // able to decide where our files land.
+            let name = std::path::Path::new(&artifact.path)
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("{:?} has no filename", artifact.path))?;
+            let into = dir.join(format!("shard-{}", shard.index + 1));
+            std::fs::create_dir_all(&into)?;
+            let path = into.join(name);
+            std::fs::write(&path, b64_decode(&artifact.base64)?)
+                .with_context(|| format!("writing {}", path.display()))?;
+            written.push(path);
+        }
+    }
+    Ok(written)
 }
 
 /// Hints first, discovery second. The hints came from the machine itself moments
@@ -924,4 +1474,134 @@ async fn dial_any(
 struct Knock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ticket: Option<sirji::Ticket>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(command: &str) -> Job {
+        Job {
+            command: command.into(),
+            cwd: None,
+            env: vec![],
+            collect: vec![],
+        }
+    }
+
+    #[test]
+    fn shard_numbering_matches_what_runners_expect() {
+        let j = job("");
+        // 1-based for the runner, 0-based for filenames, and both available at
+        // once — a test runner counts shards from one, a directory listing does not.
+        assert_eq!(j.shaped("--shard={shard}/{shards}", 0, 3), "--shard=1/3");
+        assert_eq!(j.shaped("--shard={shard}/{shards}", 2, 3), "--shard=3/3");
+        assert_eq!(j.shaped("report-{index}.zip", 0, 3), "report-0.zip");
+    }
+
+    #[test]
+    fn substitution_reaches_env_and_collected_paths_too() {
+        // The blob filename is set by env on the worker and read back by path
+        // here; if only the command were substituted the two would disagree.
+        let j = Job {
+            command: "run".into(),
+            cwd: None,
+            env: vec![("OUT".into(), "blob-{shard}.zip".into())],
+            collect: vec!["blob-{shard}.zip".into()],
+        };
+        assert_eq!(j.shaped(&j.env[0].1, 1, 2), "blob-2.zip");
+        assert_eq!(j.shaped(&j.collect[0], 1, 2), "blob-2.zip");
+    }
+
+    #[test]
+    fn a_worker_cannot_choose_where_our_files_land() {
+        // The path in an artifact came from another machine. Only its filename is
+        // ours to trust: answering with `../../..` must not write outside the
+        // directory the caller named.
+        let dir = std::env::temp_dir().join(format!("cm-test-{}", std::process::id()));
+        let shard = Shard {
+            worker: "w".into(),
+            index: 0,
+            code: Some(0),
+            artifacts: vec![Artifact {
+                path: "../../../etc/escaped.txt".into(),
+                base64: b64_encode(b"nope"),
+            }],
+        };
+        let written = save_artifacts(&dir, &[&shard]).unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0], dir.join("shard-1").join("escaped.txt"));
+        assert!(written[0].starts_with(&dir), "{:?} escaped", written[0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shards_are_kept_apart() {
+        // Two machines running the same command produce the same filename. One
+        // directory each, or the second silently overwrites the first's results.
+        let dir = std::env::temp_dir().join(format!("cm-test-two-{}", std::process::id()));
+        let shards: Vec<Shard> = (0..2)
+            .map(|index| Shard {
+                worker: format!("w{index}"),
+                index,
+                code: Some(0),
+                artifacts: vec![Artifact {
+                    path: "report.zip".into(),
+                    base64: b64_encode(format!("shard {index}").as_bytes()),
+                }],
+            })
+            .collect();
+        let written = save_artifacts(&dir, &shards.iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(written.len(), 2);
+        assert_ne!(written[0], written[1]);
+        assert_eq!(std::fs::read(&written[1]).unwrap(), b"shard 1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failing_shard_fails_the_run() {
+        let ok = |code| Ok(Shard { worker: "w".into(), index: 0, code, artifacts: vec![] });
+        let red = std::process::ExitCode::FAILURE;
+        let green = std::process::ExitCode::SUCCESS;
+        // No way to compare ExitCode, so compare the debug form — enough to catch
+        // the inversion, which is the mistake that matters here.
+        assert_eq!(format!("{:?}", exit_with(&vec![ok(Some(0))])), format!("{green:?}"));
+        assert_eq!(format!("{:?}", exit_with(&vec![ok(Some(0)), ok(Some(1))])), format!("{red:?}"));
+        // Killed for exceeding its limit is not success either.
+        assert_eq!(format!("{:?}", exit_with(&vec![ok(None)])), format!("{red:?}"));
+        // Neither is a shard we never heard back from.
+        assert_eq!(
+            format!("{:?}", exit_with(&vec![Err(anyhow::anyhow!("gone"))])),
+            format!("{red:?}")
+        );
+    }
+
+    #[test]
+    fn the_generated_config_beats_package_json() {
+        let dir = std::env::temp_dir().join(format!("cm-test-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"cm":{"controller":"old@acme","shards":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(package_cm(&dir).controller.as_deref(), Some("old@acme"));
+
+        std::fs::write(
+            dir.join("cm.generated.json"),
+            r#"{"controller":"new@acme","need":["gpu"],"shards":4}"#,
+        )
+        .unwrap();
+        let cfg = package_cm(&dir);
+        assert_eq!(cfg.controller.as_deref(), Some("new@acme"));
+        assert_eq!(cfg.shards, Some(4));
+        assert_eq!(cfg.need, vec!["gpu".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_repo_that_says_nothing_still_works() {
+        let cfg = package_cm(std::path::Path::new("/nonexistent"));
+        assert!(cfg.controller.is_none() && cfg.need.is_empty() && cfg.shards.is_none());
+    }
 }

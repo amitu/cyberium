@@ -1,0 +1,18 @@
+{
+  "name": "cm-playwright-example",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A Playwright suite that knows nothing about cm, distributed by cm",
+  "scripts": {
+    "test": "playwright test",
+    "test:fleet": "cm-playwright"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.0"
+  },
+  "cm": {
+    "controller": "cm-c@acme",
+    "need": ["node20"],
+    "shards": 3
+  }
+}

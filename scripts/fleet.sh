@@ -83,13 +83,27 @@ echo "--- controller sees ---"
 grep arrived cm-c.log | sed 's/^/  /' || echo "  (nobody arrived)"
 
 # --- the actual asks ------------------------------------------------------
-say "ask for 2 linux machines"
+say "ask for 2 linux machines, and really run something on them"
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
-  "flaky suite, bisecting" --count 2 --need linux --run "pytest -x" 2>&1 | sed 's/^/  /'
+  "flaky suite, bisecting" --count 2 --need linux \
+  --cwd "$LAB" \
+  --run 'echo "shard {shard} of {shards} on $(hostname -s)"; echo "report {shard}" > out-{shard}.txt' \
+  --collect "out-{shard}.txt" --artifacts "$LAB/collected" 2>&1 | sed 's/^/  /'
+echo "  --- what came back ---"
+find "$LAB/collected" -type f | sed 's/^/    /'
+cat "$LAB"/collected/*/*.txt | sed 's/^/    /'
 
 say "ask for a gpu machine"
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
-  "training smoke test" --count 1 --need gpu --run "train.py" 2>&1 | sed 's/^/  /'
+  "training smoke test" --count 1 --need gpu \
+  --run 'echo "training on the gpu box"' 2>&1 | sed 's/^/  /'
+
+say "a command that fails, fails the run"
+# The exit code has to survive the trip. A distributed runner that reports success
+# for a job that failed is worse than one that does not run at all.
+CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
+  "something broken" --count 1 --need linux --run 'exit 3' 2>&1 | sed 's/^/  /' \
+  && echo "  BUG: cm reported success" || echo "  cm exited non-zero, as it should"
 
 say "ask for something nothing can do"
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
@@ -101,14 +115,14 @@ CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
 
 say "walk away holding a grant"
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
-  "crashes halfway through" --count 1 --need gpu --run "flaky.py" --abandon 2>&1 | sed 's/^/  /'
+  "crashes halfway through" --count 1 --need gpu --run 'echo "started, then died"' --abandon 2>&1 | sed 's/^/  /'
 echo "  (the gpu machine is now held by nobody who will come back)"
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
-  "wants the same gpu" --count 1 --need gpu --run "x" 2>&1 | sed 's/^/  /' || true
+  "wants the same gpu" --count 1 --need gpu --run 'echo ran' 2>&1 | sed 's/^/  /' || true
 echo "  ... waiting for the timeout ..."
 sleep 16
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
-  "wants the same gpu, after the timeout" --count 1 --need gpu --run "x" 2>&1 | sed 's/^/  /'
+  "wants the same gpu, after the timeout" --count 1 --need gpu --run 'echo ran' 2>&1 | sed 's/^/  /'
 
 say "worker logs"
 for w in cm-w-1 cm-w-2 cm-w-3; do
