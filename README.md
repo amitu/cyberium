@@ -30,6 +30,32 @@ $ cm test cm-c@acme "whole suite at once" --count 9 --need gpu
 countered: 1 — policy allows 9, but 1 matching machine(s) are free
 ```
 
+## Getting it
+
+Binaries for macOS and Linux are attached to each
+[release](https://github.com/amitu/cyberium/releases), with a checksum beside each
+one — worth using, since the download crosses a network somebody else administers:
+
+```sh
+tag=v0.1.0; target=aarch64-apple-darwin        # or x86_64-apple-darwin,
+                                               # x86_64-unknown-linux-gnu,
+                                               # aarch64-unknown-linux-gnu
+curl -LO "https://github.com/amitu/cyberium/releases/download/$tag/cm-$tag-$target.tar.gz"
+curl -LO "https://github.com/amitu/cyberium/releases/download/$tag/cm-$tag-$target.tar.gz.sha256"
+shasum -c "cm-$tag-$target.tar.gz.sha256"
+tar xzf "cm-$tag-$target.tar.gz"
+```
+
+You will want [sirji](https://github.com/amitu/sirji) too — cm is a sirji device,
+and every role here needs a sirji to belong to.
+
+**There is no Windows binary yet**, and it is not a matter of adding a target: the
+control socket sirji uses is a unix socket, its keystore relies on unix file
+permissions, and cm runs commands through `sh`. Windows has answers for all three
+(named pipes with an ACL, file ACLs, `cmd`), but the first is a security-model
+decision rather than a translation — "filesystem permission is the authorization"
+needs its Windows equivalent chosen deliberately.
+
 ## How it is put together
 
 Three roles, all sirji **devices**, none holding any identity state:

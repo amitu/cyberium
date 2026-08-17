@@ -63,9 +63,14 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             native: true
+          # The one cross-build worth doing: Apple ships both SDKs, so clang
+          # targets x86_64 from an arm64 host with no third-party linker and `ring`
+          # builds happily. Intel macOS runners are being retired and this job sat
+          # unassigned for ten minutes waiting for one; cross-building removes the
+          # dependence on hardware that is going away.
           - target: x86_64-apple-darwin
-            runner: macos-13
-            native: true
+            runner: macos-latest
+            native: false
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             native: true
@@ -95,9 +100,9 @@ jobs:
       - name: build
         run: cargo build --release --locked --target "$TARGET"
 
-      # Runs where the binary can execute. Every runner here is native, so this is
-      # every job — but it is written as a condition so adding a cross target later
-      # does not silently start running tests that cannot run.
+      # Only where the binary can actually execute. The x86_64 macOS build is
+      # cross-compiled, and while the runner may well have Rosetta, a release
+      # should not depend on an emulator being installed to know whether it works.
       - name: test
         if: matrix.native
         run: cargo test --release --locked --target "$TARGET"
