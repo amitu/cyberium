@@ -146,11 +146,13 @@ impl Fleet {
         self.reservations.values()
     }
 
-    /// What is here, for a caller asking whether it is worth asking.
+    /// What is here — for the **operator**, not for a caller.
     ///
-    /// Capabilities are the union across the fleet, deduplicated: enough to see that
-    /// `gpu` exists somewhere, which is what someone about to type `--need gpu`
-    /// wants to know.
+    /// This used to answer a ping. It should not: a summary polled repeatedly tells
+    /// another organisation your utilisation over time, and from that your release
+    /// cadence and how often you have incidents. It belongs behind controller
+    /// introspection, which is who this is waiting for.
+    #[allow(dead_code)]
     pub fn summary(&self) -> (u32, u32, Vec<String>) {
         let machines = self.workers.len() as u32;
         let free = self.workers.values().filter(|w| w.free_slots() > 0).count() as u32;
@@ -167,21 +169,19 @@ impl Fleet {
         self.workers.values().filter(|w| w.satisfies(wanted)).count()
     }
 
-    /// Try to allocate `count` machines matching `nivedana`'s capabilities.
-    pub fn allocate(
-        &mut self,
-        nivedana: &Nivedana,
-        count: u32,
-        caller: &str,
-        alias: &str,
-    ) -> Result<Allocation, Shortfall> {
-        let wanted = &nivedana.capabilities;
-
+    /// Which machines *would* serve this, changing nothing.
+    ///
+    /// Split out from `allocate` so a dry run and a real one cannot drift. The
+    /// tempting alternative — a second function that estimates — is a slow-motion
+    /// bug: the day the two disagree, a dry run confidently reports a number the
+    /// real path will not give. Allocating and immediately releasing is no better,
+    /// since it briefly holds machines a concurrent caller then cannot see.
+    pub fn choose(&self, wanted: &[String], count: u32) -> Result<Vec<String>, Shortfall> {
         if self.capable(wanted) == 0 {
             // Distinguished from "busy" on purpose: no amount of waiting fixes
             // this, and telling the caller to retry would be a lie.
             return Err(Shortfall::NoneCapable {
-                wanted: wanted.clone(),
+                wanted: wanted.to_vec(),
             });
         }
 
@@ -200,6 +200,18 @@ impl Fleet {
                 available: chosen.len() as u32,
             });
         }
+        Ok(chosen)
+    }
+
+    /// Take `count` machines matching `nivedana`'s capabilities, and hold them.
+    pub fn allocate(
+        &mut self,
+        nivedana: &Nivedana,
+        count: u32,
+        caller: &str,
+        alias: &str,
+    ) -> Result<Allocation, Shortfall> {
+        let chosen = self.choose(&nivedana.capabilities, count)?;
 
         self.next += 1;
         let id = format!("r{}", self.next);
@@ -417,6 +429,40 @@ mod tests {
         assert_eq!((machines, free), (3, 2));
 
         assert_eq!(Fleet::default().summary(), (0, 0, vec![]));
+    }
+
+    #[test]
+    fn choosing_takes_nothing() {
+        // The property a dry run rests on. If choosing held anything, even
+        // briefly, a concurrent caller would see a fleet busier than it is.
+        let f = fleet();
+        for _ in 0..3 {
+            assert_eq!(f.choose(&["gpu".into()], 1).unwrap(), vec!["gpu-1".to_string()]);
+        }
+        assert_eq!(f.summary().1, 3, "still three free after three rehearsals");
+    }
+
+    #[test]
+    fn a_rehearsal_and_a_real_ask_agree() {
+        // Both go through `choose`, so they cannot drift — this pins that they are
+        // wired that way rather than merely written to look alike.
+        let mut f = fleet();
+        let rehearsed = f.choose(&["linux".into()], 2).unwrap();
+        let taken = f.allocate(&plea(&["linux"]), 2, "a", "dana").unwrap();
+        let names: Vec<String> = taken.workers.iter().map(|w| w.name.clone()).collect();
+        assert_eq!(rehearsed, names);
+    }
+
+    #[test]
+    fn a_rehearsal_sees_what_is_already_held() {
+        let mut f = fleet();
+        f.allocate(&plea(&["gpu"]), 1, "a", "dana").unwrap();
+        // Not "you could have one" — the machine is taken, and saying otherwise
+        // would be the dry run lying about the present.
+        match f.choose(&["gpu".into()], 1) {
+            Err(Shortfall::Fewer { available }) => assert_eq!(available, 0),
+            other => panic!("expected none free, got {other:?}"),
+        }
     }
 
     #[test]

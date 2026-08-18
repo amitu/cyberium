@@ -27,6 +27,7 @@
 //   CM_DIR          subdirectory to run in (default: where you are, within the repo)
 //   CM_SETUP        install step on each machine (default `npm ci`)
 //   CM_NO_CLONE     set to use a workspace already on the machine instead
+//   CM_DRY_RUN      ask what the fleet would give, run nothing, hold nothing
 //
 // Anything after the script name is passed to Playwright untouched:
 //
@@ -235,6 +236,11 @@ async function onTheFleet(controller) {
     args.push("--cwd", process.cwd());
   }
 
+  // Ask what the fleet would give and stop. Useful precisely when you do not yet
+  // trust the configuration — it exercises the whole chain, credentials included,
+  // without taking a machine from anyone to find out.
+  if (process.env.CM_DRY_RUN) args.push("--dry-run");
+
   for (const capability of list(process.env.CM_NEED)) args.push("--need", capability);
   for (const pair of list(process.env.CM_ENV)) {
     if (!pair.includes("=")) {
@@ -245,6 +251,10 @@ async function onTheFleet(controller) {
   }
 
   const verdict = await run(findCm(), args);
+
+  // A rehearsal ran nothing, so there is nothing to merge and no suite verdict to
+  // report — only whether the asking itself worked.
+  if (process.env.CM_DRY_RUN) return verdict;
 
   const found = flattenBlobs();
   if (found === 0) {

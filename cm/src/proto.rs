@@ -31,6 +31,13 @@ use serde::{Deserialize, Serialize};
 pub enum Plea {
     /// Ask for machines.
     Nivedana(Nivedana),
+    /// Ask what *would* happen, and take nothing.
+    ///
+    /// The same plea down the same path — policy, then the fleet's own selection —
+    /// stopping short of holding anything. A separate variant rather than a flag on
+    /// `Nivedana` because it is a different intent, not a different request: what
+    /// gets weighed is identical, and only the controller's last step differs.
+    Rehearse(Nivedana),
     /// Ask for nothing at all.
     ///
     /// Answered by any controller that admitted the caller, which makes it a
@@ -86,15 +93,29 @@ pub enum Verdict {
     Deny { rationale: String },
     /// Acknowledged — the answer to a release.
     Ok,
-    /// The answer to a ping: we are here, and this is what we have.
+    /// What a rehearsal would have got, as things stand right now.
     ///
-    /// The fleet summary is the second question anyone asks after "does this work" —
-    /// *will what I need ever match?* — and it discloses nothing a grant would not.
-    Pong {
-        machines: u32,
-        free: u32,
-        capabilities: Vec<String>,
-    },
+    /// No machines, no reservation, no handles — the handles would be a way to learn
+    /// fleet addresses without holding anything, and useless anyway, since a worker
+    /// refuses work for a reservation it was never told about.
+    ///
+    /// A snapshot, not a promise: by the time the caller asks for real, the fleet
+    /// has moved.
+    Would { count: u32, rationale: String },
+
+    /// The answer to a ping: we are here, and we accepted your ticket.
+    ///
+    /// Deliberately empty. It used to carry a fleet summary, justified as
+    /// disclosing nothing a grant would not — which was wrong. A grant tells you
+    /// about *your* request; a summary polled every minute tells another
+    /// organisation your utilisation over time, and from that your release cadence,
+    /// your team's size, and how often you have incidents.
+    ///
+    /// What a caller actually needs is answered better by asking: the fleet's two
+    /// shortfalls are scoped to their own request — nothing here can ever do this,
+    /// versus everything that can is busy — and neither generalises into
+    /// intelligence about the fleet.
+    Pong,
 }
 
 /// Where a granted machine is, and the ticket that admits us to it.

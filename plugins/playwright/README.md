@@ -35,6 +35,7 @@ configuration, so everything is an environment variable:
 | `CM_DIR` | subdirectory to run in (default: where you are, within the repo) |
 | `CM_SETUP` | install step on each machine (default `npm ci`) |
 | `CM_NO_CLONE` | use a workspace already on the machine instead |
+| `CM_DRY_RUN` | ask what the fleet would give; run nothing, hold nothing |
 
 Playwright's own arguments pass through untouched:
 
@@ -62,6 +63,17 @@ than this command pretending to be it. A repo can keep both:
   }
 }
 ```
+
+## Before you trust the configuration
+
+```sh
+CM_DRY_RUN=1 npm test
+```
+
+Exercises the whole chain — credentials, resolution, policy — and reports how many
+machines you would have been given, without taking one from anybody. That is the
+thing you want when wiring up CI and you are not yet sure the secrets, the
+controller name and the capabilities are all right.
 
 ## The machines fetch the code themselves
 

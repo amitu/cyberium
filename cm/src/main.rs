@@ -62,6 +62,7 @@ cm — cost-aware allocation of test machines
         --cwd <dir>      run here instead, when the machine already has the code
         --env K=V        extra environment           --collect <path>  bring back
         --artifacts <d>  where to put what comes back
+        --dry-run        what would I get? takes nothing from anybody
         --abandon        keep the grant and walk away, to watch it time out
         In --run, --env and --collect: {shard} is 1-based, {index} 0-based,
         {shards} the total.
@@ -420,11 +421,11 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
     while let Some(plea) = read_line::<Plea>(&mut recv).await? {
         let verdict = match plea {
             Plea::Ping => {
-                let (machines, free, capabilities) = control.fleet.lock().await.summary();
                 println!("{alias} pinged us");
-                Verdict::Pong { machines, free, capabilities }
+                Verdict::Pong
             }
             Plea::Nivedana(nivedana) => decide(&control, &alias, &caller, &nivedana).await,
+            Plea::Rehearse(nivedana) => rehearse(&control, &alias, &nivedana).await,
             Plea::Release { reservation } => {
                 let freed = control.fleet.lock().await.release(&reservation, &caller);
                 match freed {
@@ -467,6 +468,45 @@ fn admit(control: &Control, knock: &Knock, caller: &sirji::PublicKey) -> Result<
 }
 
 /// Policy decides entitlement; the fleet decides availability. Both must agree.
+/// Answer "what would I get", holding nothing.
+///
+/// Runs exactly the decision a real plea runs — the same policy, and the fleet's own
+/// selection through `choose` — and stops before the commit. Sharing `choose` rather
+/// than estimating is the whole point: an approximation would eventually disagree
+/// with the real path, and be believed.
+async fn rehearse(control: &Control, alias: &str, nivedana: &Nivedana) -> Verdict {
+    let (allowed, rationale) = match control.policy.weigh(alias, nivedana) {
+        Ruling::Deny { rationale } => return Verdict::Deny { rationale },
+        Ruling::Counter { count, rationale } => return Verdict::Counter { count, rationale },
+        Ruling::Allow { count, rationale } => (count, rationale),
+    };
+
+    let chosen = control
+        .fleet
+        .lock()
+        .await
+        .choose(&nivedana.capabilities, allowed);
+
+    println!("{alias} asked what they would get");
+    match chosen {
+        Ok(workers) => Verdict::Would {
+            count: workers.len() as u32,
+            rationale: rationale.unwrap_or_else(|| "as things stand".into()),
+        },
+        Err(Shortfall::NoneCapable { wanted }) => Verdict::Deny {
+            rationale: format!(
+                "no machine in the fleet can do {wanted:?} — waiting will not change that"
+            ),
+        },
+        Err(Shortfall::Fewer { available }) => Verdict::Would {
+            count: available,
+            rationale: format!(
+                "policy allows {allowed}, and {available} matching machine(s) are free right now"
+            ),
+        },
+    }
+}
+
 async fn decide(control: &Control, alias: &str, caller: &str, nivedana: &Nivedana) -> Verdict {
     let (allowed, rationale) = match control.policy.weigh(alias, nivedana) {
         Ruling::Deny { rationale } => return Verdict::Deny { rationale },
@@ -1345,6 +1385,7 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
     };
     let mut artifacts_dir = "cm-artifacts".to_string();
     let mut abandon = false;
+    let mut rehearsing = false;
     let (mut repo, mut git_ref, mut dir, mut setup) = (None, None, None, None);
 
     let mut i = 0;
@@ -1385,6 +1426,12 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
             "--artifacts" => {
                 artifacts_dir = args.get(i + 1).unwrap_or(&"cm-artifacts").to_string();
                 i += 2;
+            }
+            "--dry-run" => {
+                // Ask what would happen and take nothing. Nobody's run is disturbed
+                // to find out, which is what makes it usable on a busy fleet.
+                rehearsing = true;
+                i += 1;
             }
             "--abandon" => {
                 // Walk away holding the grant, to show the controller taking it
@@ -1433,6 +1480,7 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
         job,
         artifacts_dir,
         abandon,
+        rehearsing,
     };
     let results = run(session).await?;
     Ok(exit_with(&results))
@@ -1555,17 +1603,11 @@ async fn ping(target: &str) -> Result<std::process::ExitCode> {
             Err(e) => return Ok(bad("auth", format!("{e:#}"))),
         };
         let outcome = match verdict {
-            Verdict::Pong { machines, free, capabilities } => {
+            Verdict::Pong => {
                 ok("auth", "the controller accepted our ticket");
-                let detail = if machines == 0 {
-                    "no machines are registered".to_string()
-                } else {
-                    format!("{machines} machine(s), {free} free, can {capabilities:?}")
-                };
-                // Not a failure: a controller with an empty fleet is working
-                // perfectly, and saying otherwise would send somebody debugging
-                // their credentials over a fleet that is merely idle.
-                ok("fleet", detail);
+                // No fleet line. What is here is the controller's business; what a
+                // caller may have is answered by asking, and `--dry-run` answers it
+                // without taking anything.
                 std::process::ExitCode::SUCCESS
             }
             Verdict::Deny { rationale } => bad("auth", rationale),
@@ -1589,6 +1631,8 @@ struct Session {
     job: Job,
     artifacts_dir: String,
     abandon: bool,
+    /// Ask what would happen, run nothing, hold nothing.
+    rehearsing: bool,
 }
 
 /// What a session came back with. Empty when the plea was countered — the caller
@@ -1638,13 +1682,25 @@ async fn run(session: Session) -> Result<Results> {
     // cancelled out from under the runtime, which surfaced as a panic on exit.
     let outcome = async {
         write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
-        write_line(&mut send, &Plea::Nivedana(session.nivedana)).await?;
+        let plea = if session.rehearsing {
+            Plea::Rehearse(session.nivedana)
+        } else {
+            Plea::Nivedana(session.nivedana)
+        };
+        write_line(&mut send, &plea).await?;
 
         let verdict: Verdict = read_line(&mut recv)
             .await?
             .ok_or_else(|| anyhow::anyhow!("the controller said nothing"))?;
 
         let (reservation, workers, expires_in) = match verdict {
+            Verdict::Would { count, rationale } => {
+                // Nothing was held, so there is nothing to release and nothing to
+                // run. Said in the present tense on purpose: it is a snapshot, and
+                // the fleet will have moved by the time they ask for real.
+                println!("would get {count} machine(s) — {rationale}");
+                return Ok(Vec::new());
+            }
             Verdict::Grant { reservation, workers, expires_in, rationale } => {
                 println!("granted {} machine(s) as {reservation}", workers.len());
                 if let Some(r) = rationale {

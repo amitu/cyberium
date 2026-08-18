@@ -167,11 +167,10 @@ pinging cm-c@acme
   ok    resolve                cm-c@acme is 8jjgnu5arbiipum5juidkl3fg5jv9ve1ad7u61153gouc69u1krg
   ok    dial                   ["10.20.1.254:62097", "127.0.0.1:62097"]
   ok    auth                   the controller accepted our ticket
-  ok    fleet                  3 machine(s), 3 free, can ["linux", "node20"]
 ```
 
 Every one of those hops is exercised by a real run too — but a real run reports only
-that it failed. These six have six different fixes, so the ping stops at the broken
+that it failed. These five have five different fixes, so the ping stops at the broken
 one and says which:
 
 ```
@@ -182,9 +181,23 @@ one and says which:
   FAIL  auth          <why the controller turned us away>
 ```
 
-An empty fleet is reported, not failed: a controller with no machines is working
-perfectly, and calling that broken sends people to debug credentials over a fleet
-that is merely idle. Pinging takes no machine from anybody.
+Notice what it does **not** say: anything about the fleet. What is here is the
+controller's business. A summary polled every minute would tell another organisation
+your utilisation over time, and from that your release cadence and how often you have
+incidents — where a grant only ever tells you about your own request.
+
+What a caller actually wants to know is *what would I get*, and that has its own
+answer which takes nothing from anybody:
+
+```sh
+$ cm test cm-c@acme "sizing a run" --count 20 --need gpu --dry-run
+would get 4 machine(s) — policy allows 20, and 4 matching machine(s) are free right now
+```
+
+Same policy, same fleet selection, stopping before anything is held — the selection
+code is shared rather than approximated, because an estimate that drifts from the
+real path is worse than no estimate. It is a snapshot, not a promise: by the time you
+ask for real, the fleet has moved.
 
 ## Machine hygiene
 
