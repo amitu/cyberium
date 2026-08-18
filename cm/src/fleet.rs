@@ -132,16 +132,12 @@ impl Fleet {
         }
     }
 
-    // Only the tests look inside the fleet directly; everything the controller
-    // needs it asks for through `summary`, `allocate` and `release`. Kept behind
-    // cfg(test) rather than deleted — a test that cannot see the state it is
-    // asserting about ends up asserting about the API instead.
-    #[cfg(test)]
+    // The operator's view, and the tests'. Not a caller's — nothing here reaches
+    // anyone outside the organisation that runs this controller.
     pub fn workers(&self) -> impl Iterator<Item = &Worker> {
         self.workers.values()
     }
 
-    #[cfg(test)]
     pub fn reservations(&self) -> impl Iterator<Item = &Reservation> {
         self.reservations.values()
     }
@@ -150,9 +146,8 @@ impl Fleet {
     ///
     /// This used to answer a ping. It should not: a summary polled repeatedly tells
     /// another organisation your utilisation over time, and from that your release
-    /// cadence and how often you have incidents. It belongs behind controller
-    /// introspection, which is who this is waiting for.
-    #[allow(dead_code)]
+    /// cadence and how often you have incidents. It lives behind controller
+    /// introspection instead.
     pub fn summary(&self) -> (u32, u32, Vec<String>) {
         let machines = self.workers.len() as u32;
         let free = self.workers.values().filter(|w| w.free_slots() > 0).count() as u32;

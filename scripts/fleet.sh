@@ -149,6 +149,14 @@ sleep 16
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
   "wants the same gpu, after the timeout" --count 1 --need gpu --run 'echo ran' 2>&1 | sed 's/^/  /'
 
+say "the operator looks inside — cm-w-1 is acme's own device, so it may"
+CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM controller fleet 2>&1 | sed 's/^/  /'
+CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM controller reservations 2>&1 | sed 's/^/  /'
+
+say "dana is a peer, not one of acme's — the controller refuses"
+CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM controller fleet --controller cm-c@acme 2>&1 \
+  | sed 's/^/  /' || true
+
 say "the operator's hygiene scripts, around every tenancy on cm-w-1"
 grep hygiene cm-w-1.log | sed 's/^/  /' || echo "  (none ran)"
 

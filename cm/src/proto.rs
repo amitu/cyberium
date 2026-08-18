@@ -47,6 +47,32 @@ pub enum Plea {
     /// Done with them. Sent the moment the work finishes: a duration hint sizes a
     /// plan, it never justifies holding capacity idle.
     Release { reservation: String },
+
+    /// Look inside the controller. **Operators only.**
+    ///
+    /// Refused for anyone arriving with an alias, which is precisely the set of
+    /// callers from other organisations — see `Inspect` handling for why that check
+    /// is sound and why it is load-bearing.
+    Inspect { what: Look },
+}
+
+/// What an operator wants to see.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Look {
+    /// The roster: what is here, what it can do, who holds it.
+    Fleet,
+    /// Live reservations: who has what, and until when.
+    Reservations,
+}
+
+/// The answer to an `Inspect`. Deliberately rendered by the controller rather than
+/// returned as structures for the caller to format: this is one operator talking to
+/// their own controller, and a stable machine-readable shape is a promise worth
+/// making later, on purpose, rather than by accident now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sight {
+    pub lines: Vec<String>,
 }
 
 /// The plea.
@@ -102,6 +128,9 @@ pub enum Verdict {
     /// A snapshot, not a promise: by the time the caller asks for real, the fleet
     /// has moved.
     Would { count: u32, rationale: String },
+
+    /// What an operator asked to see.
+    Saw(Sight),
 
     /// The answer to a ping: we are here, and we accepted your ticket.
     ///

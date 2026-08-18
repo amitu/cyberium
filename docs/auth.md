@@ -4,6 +4,24 @@ How cm decides that a request is genuinely from who it claims. The general shape
 sirji's [standing pattern](https://github.com/amitu/sirji/blob/main/patterns/standing.md);
 this is what cm does with it.
 
+> ## Status: designed, mostly not built
+>
+> Worth stating before anything else, because this document reads like a
+> description and is largely a plan.
+>
+> **Built today:** a caller is a sirji device of its own sirji, and presents a
+> sealed ticket its parent minted. The controller verifies one signature and
+> learns an alias from it. That is the whole of it, and it works.
+>
+> **Not built:** OIDC, `cm auth login`, enrolment, the context JSON, per-org
+> policy, the plan tier, and the two credential tiers. None of it exists in the
+> binary.
+>
+> The consequence worth knowing: **the controller is single-tenant.** It holds one
+> `policy.md`, read at startup, and every admitted caller is weighed against it.
+> Everything below that says "per organisation" describes where this is going, not
+> where it is.
+
 ## No shared secrets
 
 cm has none, and does not need any. A shared secret is only required when an actor

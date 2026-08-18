@@ -43,6 +43,11 @@ cm — cost-aware allocation of test machines
   cm controller
         own the fleet: availability, allocation, timeouts
 
+  cm controller fleet [--controller <name>]
+  cm controller reservations [--controller <name>]
+        look inside a running controller. Only this organisation's own devices
+        may — a peer is refused, because what is here is nobody else's business.
+
   cm worker [--controller <name>] [--slots N] [--can <cap>]...
         offer this machine to the controller
         --pre <cmd>   make the machine fit before each tenancy
@@ -87,6 +92,12 @@ fn main() -> Result<std::process::ExitCode> {
         }
         ["init", rest @ ..] => rt()?.block_on(init(rest)).map(|_| ok),
         ["controller"] => rt()?.block_on(controller()).map(|_| ok),
+        ["controller", "fleet", rest @ ..] => {
+            rt()?.block_on(inspect(proto::Look::Fleet, rest)).map(|_| ok)
+        }
+        ["controller", "reservations", rest @ ..] => rt()?
+            .block_on(inspect(proto::Look::Reservations, rest))
+            .map(|_| ok),
         ["worker", rest @ ..] => rt()?.block_on(worker(rest)).map(|_| ok),
         // `why` is positional but optional: a ping asks for nothing, so making
         // somebody justify one would be a small daily absurdity.
@@ -371,6 +382,57 @@ async fn reap(control: Arc<Control>) {
 }
 
 impl Control {
+    /// What an operator asked to see.
+    ///
+    /// Rendered here rather than shipped as structures: this is the one view where
+    /// holder aliases and machine names appear together, and keeping it inside the
+    /// controller makes it obvious that none of it is on a path to a caller.
+    async fn look(&self, what: proto::Look) -> proto::Sight {
+        let fleet = self.fleet.lock().await;
+        let mut lines = Vec::new();
+
+        match what {
+            proto::Look::Fleet => {
+                let (machines, free, capabilities) = fleet.summary();
+                lines.push(format!(
+                    "{machines} machine(s), {free} with a free slot, can {capabilities:?}"
+                ));
+                for w in fleet.workers() {
+                    let held = if w.held_by.is_empty() {
+                        "idle".to_string()
+                    } else {
+                        format!("held by {}", w.held_by.join(", "))
+                    };
+                    lines.push(format!(
+                        "  {:<12} {}/{} free  can {:?}  {held}",
+                        w.name,
+                        w.free_slots(),
+                        w.slots,
+                        w.capabilities
+                    ));
+                }
+            }
+            proto::Look::Reservations => {
+                let now = fleet::now();
+                let mut any = false;
+                for r in fleet.reservations() {
+                    any = true;
+                    lines.push(format!(
+                        "  {:<6} {:<12} {} machine(s), {}s left",
+                        r.id,
+                        r.alias,
+                        r.workers.len(),
+                        r.expires_at.saturating_sub(now)
+                    ));
+                }
+                if !any {
+                    lines.push("nothing is held".into());
+                }
+            }
+        }
+        proto::Sight { lines }
+    }
+
     /// Tell each machine a reservation is over. Best-effort: one that has gone away
     /// needs no telling, and one that returns registers afresh.
     async fn tell_freed(&self, reservation: &str, workers: &[String]) {
@@ -407,8 +469,8 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
     let knock: Knock = serde_json::from_str(line.trim())
         .map_err(|e| anyhow::anyhow!("unreadable opening line: {e}"))?;
 
-    let alias = match admit(&control, &knock, &caller_key) {
-        Ok(alias) => alias,
+    let who = match admit(&control, &knock, &caller_key) {
+        Ok(who) => who,
         Err(rationale) => {
             write_line(&mut send, &Verdict::Deny { rationale }).await?;
             send.finish()?;
@@ -416,6 +478,7 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
             return Ok(());
         }
     };
+    let alias = who.alias.clone();
 
     // A tester may plead more than once on one connection, and releases on it too.
     while let Some(plea) = read_line::<Plea>(&mut recv).await? {
@@ -423,6 +486,19 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
             Plea::Ping => {
                 println!("{alias} pinged us");
                 Verdict::Pong
+            }
+            Plea::Inspect { what } => {
+                if who.operator {
+                    println!("{alias} looked at {what:?}");
+                    Verdict::Saw(control.look(what).await)
+                } else {
+                    // Said plainly rather than pretending the command does not
+                    // exist: an operator who typed it against the wrong controller
+                    // deserves to know why it refused.
+                    Verdict::Deny {
+                        rationale: "only this organisation's own devices may look inside".into(),
+                    }
+                }
             }
             Plea::Nivedana(nivedana) => decide(&control, &alias, &caller, &nivedana).await,
             Plea::Rehearse(nivedana) => rehearse(&control, &alias, &nivedana).await,
@@ -451,7 +527,7 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
 ///
 /// The ticket is the only source: we hold no `network.toml` and have never heard of
 /// the caller. Verifying our parent's signature is the whole of it.
-fn admit(control: &Control, knock: &Knock, caller: &sirji::PublicKey) -> Result<String, String> {
+fn admit(control: &Control, knock: &Knock, caller: &sirji::PublicKey) -> Result<Caller, String> {
     let Some(ticket) = &knock.ticket else {
         return Err("no ticket — resolve me as `name@org`".into());
     };
@@ -461,13 +537,40 @@ fn admit(control: &Control, knock: &Knock, caller: &sirji::PublicKey) -> Result<
     if ticket.name != control.config.name {
         return Err(format!("that ticket is for `{}`", ticket.name));
     }
-    Ok(ticket
-        .alias
-        .clone()
-        .unwrap_or_else(|| "an unnamed peer".into()))
+    Ok(Caller::from(ticket.alias.clone()))
+}
+
+/// Who is on the other end, and whether they are one of ours.
+struct Caller {
+    /// For display and for policy. Peers have a name; a sibling device does not.
+    alias: String,
+    /// A device of our **own** sirji rather than somebody else's peer.
+    operator: bool,
+}
+
+impl Caller {
+    /// The whole discriminator is whether the ticket carried an alias, and it is
+    /// sound for a reason worth writing down because it is load-bearing:
+    ///
+    /// our parent mints tickets two ways. A peer resolving us through `ResolveFor`
+    /// gets `alias = Some(their name)` — necessarily, because an alias is how a
+    /// `[[peer]]` is keyed in `network.toml` and one without a name cannot be looked
+    /// up. A sibling device resolving through `ResolveLocal` gets `alias = None`,
+    /// because there is no person behind a device.
+    ///
+    /// So no alias implies a device of our own organisation. If sirji ever mints an
+    /// aliasless ticket for a peer, this becomes wrong, which is what the test in
+    /// this file is there to catch.
+    fn from(alias: Option<String>) -> Self {
+        match alias {
+            Some(alias) => Self { alias, operator: false },
+            None => Self { alias: "an unnamed peer".into(), operator: true },
+        }
+    }
 }
 
 /// Policy decides entitlement; the fleet decides availability. Both must agree.
+///
 /// Answer "what would I get", holding nothing.
 ///
 /// Runs exactly the decision a real plea runs — the same policy, and the fleet's own
@@ -1487,6 +1590,81 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
 }
 
 // ---------------------------------------------------------------------------
+// looking inside the controller
+// ---------------------------------------------------------------------------
+
+/// Ask our own controller what it is holding.
+///
+/// Run as **another device of the same organisation**, which is what earns the
+/// answer: we resolve the controller through our shared parent with `ResolveLocal`,
+/// and a ticket minted that way carries no alias, which is how the controller knows
+/// we are one of its own rather than somebody's peer.
+///
+/// So this needs no new credential and no local socket — and it works when the
+/// controller is on a machine the operator cannot log into.
+async fn inspect(what: proto::Look, args: &[&str]) -> Result<()> {
+    let mut name = "cm-c".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--controller" => {
+                name = args.get(i + 1).unwrap_or(&"cm-c").to_string();
+                i += 2;
+            }
+            other => bail!("unrecognised argument: {other}"),
+        }
+    }
+
+    let home = home()?;
+    sirji::Settings::load(&home)?.activate();
+    let config = load_config(&home)?;
+    let secret = keys(&home).secret(&id52::decode(&config.key)?)?;
+
+    // A bare name is a sibling of ours; `name@org` is somebody else's controller.
+    // Both are askable — the *controller* decides who may look, not this command.
+    // Refusing locally would put the answer in the wrong place and produce a
+    // misleading error, since a peer's controller is perfectly reachable.
+    let ask = match name.split_once('@') {
+        Some((name, alias)) => sirji::proto::Ask::ResolveFor {
+            name: name.to_string(),
+            alias: alias.to_string(),
+        },
+        None => sirji::proto::Ask::ResolveLocal { name: name.clone() },
+    };
+
+    let endpoint = sirji::endpoint::bind_dialer(secret).await?;
+    let found =
+        sirji::daemon::ask_as_device(&endpoint, &config.parent, &config.parent_hints, &ask).await?;
+    let (device, ticket, hints) = match found {
+        sirji::proto::Say::Resolved { device, ticket, hints } => (device, ticket, hints),
+        sirji::proto::Say::No { reason } => bail!("cannot find `{name}`: {reason}"),
+    };
+
+    let conn = dial_any(&endpoint, id52::decode(&device)?, &hints).await?;
+    let (mut send, recv) = conn.open_bi().await?;
+    let mut recv = BufReader::new(recv);
+
+    write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
+    write_line(&mut send, &Plea::Inspect { what }).await?;
+
+    let outcome = match read_line::<Verdict>(&mut recv).await? {
+        Some(Verdict::Saw(sight)) => {
+            for line in sight.lines {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Some(Verdict::Deny { rationale }) => Err(anyhow::anyhow!("{rationale}")),
+        other => Err(anyhow::anyhow!("unexpected answer: {other:?}")),
+    };
+
+    let _ = send.finish();
+    conn.close(0u32.into(), b"done");
+    endpoint.close().await;
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // ping
 // ---------------------------------------------------------------------------
 
@@ -2080,6 +2258,22 @@ mod tests {
         assert!(why.contains("not yours"), "{why}");
         // And a reservation we never heard of is refused whoever asks.
         assert!(matches!(consider(None, "r9", "them"), Admission::Refuse(_)));
+    }
+
+    #[test]
+    fn only_our_own_devices_may_look_inside() {
+        // The whole check is "did the ticket carry an alias", and it is load-bearing
+        // rather than cosmetic — so pin it. Our parent mints an alias for every
+        // peer, because an alias is how a [[peer]] is keyed and one without a name
+        // could not be looked up; a sibling device has no person behind it and gets
+        // None. If sirji ever mints an aliasless ticket for a peer, this fails, and
+        // that is exactly when somebody needs to know.
+        assert!(Caller::from(None).operator, "a sibling device is one of ours");
+        assert!(
+            !Caller::from(Some("dana".into())).operator,
+            "a named peer is not"
+        );
+        assert_eq!(Caller::from(Some("dana".into())).alias, "dana");
     }
 
     #[test]
