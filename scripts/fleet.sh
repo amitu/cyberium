@@ -51,9 +51,17 @@ INV=$(SIRJI_HOME=$LAB/dana $SIRJI device invite cm-t | tail -1)
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM init --parent "$INV" | sed 's/^/  cm-t: /'
 
 # --- run the fleet --------------------------------------------------------
-say "short reservations, so a timeout is watchable in one run"
-mkdir -p "$LAB/cm-c/root"
-cat >"$LAB/cm-c/root/policy.md" <<'POLICY'
+say "onboard dana as a tenant of this controller"
+# The alias must be what acme's own sirji calls them, because that is what a
+# verified ticket carries and what picks their policy. `--ceiling` is acme's to
+# set; dana never sees it, and it is what stops dana's own policy.md from being
+# dana's own quota.
+CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant add dana --ceiling 3 \
+  --note "the demo tenant" 2>&1 | sed 's/^/  /'
+
+# Short reservations so a timeout is watchable in one run. This half of the
+# configuration is dana's own.
+cat >"$LAB/cm-c/root/tenants/dana/policy.md" <<'POLICY'
 # policy.md
 
 ```yaml
@@ -67,6 +75,8 @@ reservation_seconds: 8
 
 Anyone may ask for up to the standing limit without justification.
 POLICY
+
+CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant list 2>&1 | sed 's/^/  /'
 
 say "start controller and workers"
 CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM controller >cm-c.log 2>&1 &
@@ -98,6 +108,13 @@ for _ in 1 2; do
   CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
     "sizing a run" --count 3 --need linux --dry-run 2>&1 | grep would | sed 's/^/  /'
 done
+
+say "the tenant ceiling is acme's, and dana cannot argue with it"
+# dana's own policy.md allows 10. acme's tenant.toml says 3. The lower one wins,
+# and the caller is told which limit bit them — otherwise they would go and edit
+# a policy that was never the constraint.
+CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
+  "asking for more than acme allows" --count 10 --need linux --dry-run 2>&1 | sed 's/^/  /'
 
 say "ask for 2 linux machines, and really run something on them"
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \

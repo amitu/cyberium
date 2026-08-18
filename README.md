@@ -323,13 +323,27 @@ the standing limit; the prose is read and carried but not yet reasoned over. Tha
 sequencing is deliberate — the transport, the identity and the refusal paths are
 worth proving before anything non-deterministic joins in.
 
-**One controller, one policy, one tenant.** The file lives where `--root` points and
-is read at startup, so changing it means restarting. That is the right shape for an
-organisation running cm on its own machines. A hosted controller serving many
-organisations — each with its own policy bundle, under a plan-level ceiling, pushed
-by `cm upload-policy` and admitted only if its own tests pass — is designed in
-[docs/policy.md](docs/policy.md) and not built. Neither is the credential story in
-[docs/auth.md](docs/auth.md).
+**A folder per tenant, and two files with different owners:**
+
+```sh
+$ cm tenant add dana --ceiling 3
+tenant `dana` at …/tenants/dana
+  they edit …/tenants/dana/policy.md
+  you own  …/tenants/dana/tenant.toml
+```
+
+A tenant writes `policy.md`; the host writes `tenant.toml`. Without that split, an
+organisation authoring its own policy would be authoring its own quota —
+`standing_limit: 10000` is a valid file. The lower of the two wins, and the caller is
+told *which* limit bit them, so nobody edits a policy that was never the constraint.
+
+The tenant is chosen by **the verified alias in the caller's ticket** — minted by the
+controller's own sirji, not asserted by the caller — so this needed no accounts and
+no new credential. Adding a tenant or editing a policy needs no restart.
+
+What is not built: `nivedanas/`, the model call, `cm test-policy`, `cm upload-policy`,
+and the credential story in [docs/auth.md](docs/auth.md). See
+[docs/policy.md](docs/policy.md), which also lists what is still unresolved.
 
 ## Try it
 

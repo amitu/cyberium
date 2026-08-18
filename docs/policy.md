@@ -2,10 +2,9 @@
 
 Where the organisation's rules live, how they get there, and who may change them.
 
-> **Status.** The file, its two halves, and the deterministic gate are built and
-> running. `nivedanas/`, the model call, `cm test-policy`, `cm upload-policy` and
-> per-organisation policy are designed and **not built** — today the controller
-> reads one `policy.md` from `--root` at startup and weighs every caller against it.
+> **Status.** The file, its two halves, the deterministic gate, **one policy per
+> tenant** and **the host's ceiling** are built and running. `nivedanas/`, the model
+> call, `cm test-policy` and `cm upload-policy` are designed and **not built**.
 
 ## The file has two halves on purpose
 
@@ -60,26 +59,54 @@ above it. It matters for the hosted case: without an outer ceiling, an organisat
 authoring its own `policy.md` would be authoring its own quota, and `standing_limit:
 10000` is a valid file.
 
-## Tenancy, plainly
+## Tenancy: a folder each
 
-**Today:** one controller, one `policy.md`, one set of rules. Anyone the
-organisation's sirji has a relationship with is weighed against the same file. That
-is the right shape for an organisation running cm on its own machines, and it is
-what the fleet script demonstrates.
+```text
+<root>/tenants/
+  dana/
+    tenant.toml      what the host decides about them — chiefly a ceiling
+    policy.md        what they decide for themselves
+  kiran/
+    tenant.toml
+    policy.md
+```
 
-**Designed:** a hosted controller serving many organisations, each with its own
-policy bundle, selected by which organisation the caller was attested as belonging
-to. The pieces that changes:
+```sh
+cm tenant add dana --ceiling 3 --note "the demo tenant"
+cm tenant list
+```
 
-- `Control` holds a policy **per organisation** rather than one
-- a bundle is `policy.md` + `nivedanas/` + `policy-tests/`, versioned together
-- the plan tier appears above it
-- and a caller's organisation has to be *attested*, which is what
-  [auth.md](auth.md) is about
+**The tenant key is the verified alias from the caller's ticket**, and that is what
+makes this work without any new machinery. The alias is minted by the controller's
+*own* sirji from its `network.toml` — it is not something a caller asserts, it is the
+host's record of who they are. So multi-tenancy needed no attestation layer, no
+accounts and no OIDC. It works with what was already being verified.
 
-None of that is built. It is written down because the single-tenant code should not
-acquire assumptions that make it hard — which is why `weigh` already takes the asker
-rather than reading an ambient identity.
+The split between the two files is the whole point: **a tenant writes `policy.md`;
+the host writes `tenant.toml`.** Without it, an organisation authoring its own policy
+would be authoring its own quota, and `standing_limit: 10000` is a valid file.
+
+Three consequences worth knowing:
+
+- **An unknown alias is refused as "not a tenant"**, distinct from a policy refusal,
+  because the fix is entirely different — somebody has to run `cm tenant add`.
+- **A tenant folder with no `tenant.toml` gets the default ceiling, not an unlimited
+  one.** Missing host configuration must never mean "no limit".
+- **Adding a tenant or editing a policy needs no restart.** Every tenant is validated
+  at startup so a broken file stops the controller there; a tenant's folder is then
+  re-read when they next ask, and a re-read that fails keeps the last known-good copy
+  and complains rather than taking an organisation offline mid-run.
+
+### Still open
+
+- **A caller from our own organisation has no tenant.** A sibling device's ticket
+  carries no alias — that is exactly how introspection tells operators from peers —
+  so there is nothing to key a policy on. Own-org devices can look inside but not
+  allocate. Fine for a hosted controller; wrong for a self-hosted one where the
+  developers *are* devices of the org's sirji, and unresolved.
+- A bundle should be `policy.md` + `nivedanas/` + `policy-tests/` versioned together;
+  today it is a folder with one file that matters.
+- Nothing revokes or suspends a tenant beyond deleting the folder.
 
 ## Getting a policy onto a controller
 

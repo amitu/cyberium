@@ -60,25 +60,12 @@ pub struct Reservation {
     pub expires_at: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Fleet {
     workers: BTreeMap<String, Worker>,
     reservations: BTreeMap<String, Reservation>,
     /// Monotonic, so reservation ids are unique within a controller's life.
     next: u64,
-    /// How long a grant lasts unreleased, from `policy.md`.
-    lifetime: u64,
-}
-
-impl Default for Fleet {
-    fn default() -> Self {
-        Self {
-            workers: Default::default(),
-            reservations: Default::default(),
-            next: 0,
-            lifetime: RESERVATION_SECS,
-        }
-    }
 }
 
 /// What allocating produced: the machines, and the reservation holding them.
@@ -110,14 +97,6 @@ pub enum Shortfall {
 }
 
 impl Fleet {
-    /// A fleet whose grants last `lifetime` seconds unreleased.
-    pub fn lasting(lifetime: u64) -> Self {
-        Self {
-            lifetime: lifetime.max(1),
-            ..Default::default()
-        }
-    }
-
     pub fn arrive(&mut self, worker: Worker) {
         self.workers.insert(worker.name.clone(), worker);
     }
@@ -199,18 +178,25 @@ impl Fleet {
     }
 
     /// Take `count` machines matching `nivedana`'s capabilities, and hold them.
+    ///
+    /// `lifetime` is passed in rather than held here: it comes from the *tenant's*
+    /// policy, and with a policy per tenant there is no single number the fleet
+    /// could own. The fleet tracks machines; how long a grant lasts is somebody
+    /// else's rule.
     pub fn allocate(
         &mut self,
         nivedana: &Nivedana,
         count: u32,
         caller: &str,
         alias: &str,
+        lifetime: u64,
     ) -> Result<Allocation, Shortfall> {
+        let lifetime = lifetime.max(1);
         let chosen = self.choose(&nivedana.capabilities, count)?;
 
         self.next += 1;
         let id = format!("r{}", self.next);
-        let expires_at = now() + self.lifetime;
+        let expires_at = now() + lifetime;
 
         for name in &chosen {
             if let Some(w) = self.workers.get_mut(name) {
@@ -234,8 +220,8 @@ impl Fleet {
                 .filter_map(|n| self.workers.get(n).cloned())
                 .collect(),
             reservation: id,
-            limits: Limits { max_seconds: self.lifetime },
-            expires_in: self.lifetime,
+            limits: Limits { max_seconds: lifetime },
+            expires_in: lifetime,
         })
     }
 
@@ -324,7 +310,7 @@ mod tests {
     #[test]
     fn allocates_only_machines_that_can_do_the_work() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["gpu"]), 1, "caller", "dana").unwrap();
+        let a = f.allocate(&plea(&["gpu"]), 1, "caller", "dana", RESERVATION_SECS).unwrap();
         assert_eq!(a.workers.len(), 1);
         assert_eq!(a.workers[0].name, "gpu-1");
     }
@@ -334,18 +320,18 @@ mod tests {
         // Asking for linux must not exclude the machine that is also a gpu, or the
         // fleet fragments for no reason.
         let mut f = fleet();
-        let a = f.allocate(&plea(&["linux"]), 3, "caller", "dana").unwrap();
+        let a = f.allocate(&plea(&["linux"]), 3, "caller", "dana", RESERVATION_SECS).unwrap();
         assert_eq!(a.workers.len(), 3);
     }
 
     #[test]
     fn impossible_and_merely_busy_are_different_answers() {
         let mut f = fleet();
-        match f.allocate(&plea(&["risc-v"]), 1, "caller", "dana") {
+        match f.allocate(&plea(&["risc-v"]), 1, "caller", "dana", RESERVATION_SECS) {
             Err(Shortfall::NoneCapable { wanted }) => assert_eq!(wanted, vec!["risc-v".to_string()]),
             other => panic!("expected NoneCapable, got {other:?}"),
         }
-        match f.allocate(&plea(&["gpu"]), 5, "caller", "dana") {
+        match f.allocate(&plea(&["gpu"]), 5, "caller", "dana", RESERVATION_SECS) {
             Err(Shortfall::Fewer { available }) => assert_eq!(available, 1),
             other => panic!("expected Fewer, got {other:?}"),
         }
@@ -354,8 +340,8 @@ mod tests {
     #[test]
     fn an_allocated_machine_is_not_offered_twice() {
         let mut f = fleet();
-        f.allocate(&plea(&["gpu"]), 1, "a", "dana").unwrap();
-        match f.allocate(&plea(&["gpu"]), 1, "b", "kiran") {
+        f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
+        match f.allocate(&plea(&["gpu"]), 1, "b", "kiran", RESERVATION_SECS) {
             Err(Shortfall::Fewer { available }) => assert_eq!(available, 0),
             other => panic!("expected the machine to be busy, got {other:?}"),
         }
@@ -364,17 +350,17 @@ mod tests {
     #[test]
     fn releasing_returns_the_machines() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana").unwrap();
+        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
         let freed = f.release(&a.reservation, "a").unwrap();
         assert_eq!(freed, vec!["gpu-1".to_string()]);
         // And it can be had again.
-        assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran").is_ok());
+        assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran", RESERVATION_SECS).is_ok());
     }
 
     #[test]
     fn only_the_holder_may_release() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana").unwrap();
+        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
         let err = f.release(&a.reservation, "someone-else").unwrap_err();
         assert!(err.contains("not granted to you"), "{err}");
         // And the machine is still held.
@@ -384,7 +370,7 @@ mod tests {
     #[test]
     fn expiry_frees_a_reservation_nobody_released() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana").unwrap();
+        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
         assert!(f.expire().is_empty(), "not due yet");
 
         // Reach in and age it, rather than sleeping ten minutes.
@@ -394,13 +380,13 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].workers, vec!["gpu-1".to_string()]);
         assert_eq!(expired[0].alias, "dana", "who lost it travels with it");
-        assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran").is_ok());
+        assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran", RESERVATION_SECS).is_ok());
     }
 
     #[test]
     fn a_departing_worker_leaves_its_reservations() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["linux"]), 2, "a", "dana").unwrap();
+        let a = f.allocate(&plea(&["linux"]), 2, "a", "dana", RESERVATION_SECS).unwrap();
         assert_eq!(a.workers.len(), 2);
 
         f.depart("linux-1");
@@ -417,7 +403,7 @@ mod tests {
             "capabilities are the union across the fleet, deduplicated"
         );
 
-        f.allocate(&plea(&["gpu"]), 1, "a", "dana").unwrap();
+        f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
         let (machines, free, _) = f.summary();
         // Still three machines, but one of them is no longer on offer — which is
         // the difference between "ask later" and "never".
@@ -443,7 +429,7 @@ mod tests {
         // wired that way rather than merely written to look alike.
         let mut f = fleet();
         let rehearsed = f.choose(&["linux".into()], 2).unwrap();
-        let taken = f.allocate(&plea(&["linux"]), 2, "a", "dana").unwrap();
+        let taken = f.allocate(&plea(&["linux"]), 2, "a", "dana", RESERVATION_SECS).unwrap();
         let names: Vec<String> = taken.workers.iter().map(|w| w.name.clone()).collect();
         assert_eq!(rehearsed, names);
     }
@@ -451,7 +437,7 @@ mod tests {
     #[test]
     fn a_rehearsal_sees_what_is_already_held() {
         let mut f = fleet();
-        f.allocate(&plea(&["gpu"]), 1, "a", "dana").unwrap();
+        f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
         // Not "you could have one" — the machine is taken, and saying otherwise
         // would be the dry run lying about the present.
         match f.choose(&["gpu".into()], 1) {
@@ -462,21 +448,26 @@ mod tests {
 
     #[test]
     fn the_lifetime_comes_from_outside() {
-        let mut f = Fleet::lasting(30);
+        // Per grant, because it comes from the tenant's policy and there is a policy
+        // per tenant — the fleet could not own one number if it wanted to.
+        let mut f = Fleet::default();
         f.arrive(worker("linux-1", 1, &["linux"]));
-        let a = f.allocate(&plea(&["linux"]), 1, "a", "dana").unwrap();
+        let a = f.allocate(&plea(&["linux"]), 1, "a", "dana", 30).unwrap();
         assert_eq!(a.expires_in, 30);
         assert_eq!(a.limits.max_seconds, 30);
+
         // A zero would expire every grant the instant it was made.
-        assert_eq!(Fleet::lasting(0).lifetime, 1);
+        f.release(&a.reservation, "a").unwrap();
+        let b = f.allocate(&plea(&["linux"]), 1, "a", "dana", 0).unwrap();
+        assert_eq!(b.expires_in, 1);
     }
 
     #[test]
     fn slots_allow_more_than_one_reservation_per_machine() {
         let mut f = Fleet::default();
         f.arrive(worker("big", 3, &["linux"]));
-        assert!(f.allocate(&plea(&["linux"]), 1, "a", "dana").is_ok());
-        assert!(f.allocate(&plea(&["linux"]), 1, "b", "kiran").is_ok());
+        assert!(f.allocate(&plea(&["linux"]), 1, "a", "dana", RESERVATION_SECS).is_ok());
+        assert!(f.allocate(&plea(&["linux"]), 1, "b", "kiran", RESERVATION_SECS).is_ok());
         assert_eq!(f.workers().next().unwrap().free_slots(), 1);
     }
 }

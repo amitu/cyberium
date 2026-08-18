@@ -17,6 +17,7 @@
 
 mod fleet;
 mod policy;
+mod tenant;
 mod proto;
 
 use std::sync::Arc;
@@ -42,6 +43,13 @@ cm — cost-aware allocation of test machines
 
   cm controller
         own the fleet: availability, allocation, timeouts
+
+  cm tenant add <alias> [--ceiling N] [--note <text>]
+  cm tenant list
+        onboard whoever this controller serves. <alias> must be the name our own
+        sirji knows them by — that is what a verified ticket carries, and what
+        picks their policy. They write policy.md; you write tenant.toml, which
+        is what stops an organisation setting its own quota.
 
   cm controller fleet [--controller <name>]
   cm controller reservations [--controller <name>]
@@ -92,6 +100,8 @@ fn main() -> Result<std::process::ExitCode> {
         }
         ["init", rest @ ..] => rt()?.block_on(init(rest)).map(|_| ok),
         ["controller"] => rt()?.block_on(controller()).map(|_| ok),
+        ["tenant", "add", alias, rest @ ..] => tenant_add(alias, rest).map(|_| ok),
+        ["tenant", "list"] => tenant_list().map(|_| ok),
         ["controller", "fleet", rest @ ..] => {
             rt()?.block_on(inspect(proto::Look::Fleet, rest)).map(|_| ok)
         }
@@ -287,7 +297,10 @@ async fn init(args: &[&str]) -> Result<()> {
 /// to two callers.
 struct Control {
     config: Config,
-    policy: policy::Policy,
+    /// One policy per tenant, keyed by the alias our own sirji minted into their
+    /// ticket. Behind a lock because it re-reads from disk, so a policy edit or a
+    /// new tenant takes effect without a restart.
+    tenants: Mutex<tenant::Tenants>,
     fleet: Mutex<Fleet>,
     /// A channel per registered worker, for pushing orders down its open stream.
     orders: Mutex<std::collections::BTreeMap<String, tokio::sync::mpsc::Sender<Aadesh>>>,
@@ -299,23 +312,34 @@ async fn controller() -> Result<()> {
     sirji::Settings::load(&home)?.activate();
     let config = load_config(&home)?;
 
-    // Read policy at startup so a broken file fails here, not on the first plea
-    // with somebody waiting on it.
-    let policy = policy::Policy::load(&config.root)?;
+    // Every tenant is read and validated here, not lazily: a policy that does not
+    // parse should stop the controller starting, rather than surface an hour later
+    // on somebody's first plea with them waiting on the other end.
+    let tenants = tenant::Tenants::load(&config.root)?;
     println!("controller `{}` listening as {}", config.name, config.key);
-    println!(
-        "policy {} — grants last {}s unreleased",
-        policy.path.display(),
-        policy.reservation_secs()
-    );
+    if tenants.len() == 0 {
+        // Not an error — a controller with no tenants is correctly configured for
+        // nobody. Said loudly because every plea will be refused until this is
+        // fixed, and the refusal alone would not explain why.
+        println!(
+            "no tenants in {} — every plea will be refused.\n  add one with `cm tenant add <alias>`",
+            tenant::Tenants::dir_in(&config.root).display()
+        );
+    } else {
+        println!(
+            "{} tenant(s): {}",
+            tenants.len(),
+            tenants.aliases().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
 
     let secret = keys(&home).secret(&id52::decode(&config.key)?)?;
     let endpoint = sirji::bind(secret.clone()).await?;
 
     let control = Arc::new(Control {
-        fleet: Mutex::new(Fleet::lasting(policy.reservation_secs())),
+        fleet: Mutex::new(Fleet::default()),
         config: config.clone(),
-        policy,
+        tenants: Mutex::new(tenants),
         orders: Mutex::new(Default::default()),
         // Tickets admitting a caller to a worker are signed by us, and verified by
         // the worker against the controller key it registered with. The mechanism
@@ -382,6 +406,51 @@ async fn reap(control: Arc<Control>) {
 }
 
 impl Control {
+    /// How many machines this caller is entitled to, by their tenant's policy and
+    /// then their tenant's ceiling. `Err` carries the refusal to send back.
+    ///
+    /// Two clamps in order, and the order matters: the tenant's own policy divides
+    /// what they have, and the host's ceiling decides how much that is. Without the
+    /// second, an organisation writing its own `policy.md` would be writing its own
+    /// quota.
+    async fn entitlement(
+        &self,
+        alias: &str,
+        nivedana: &Nivedana,
+    ) -> std::result::Result<(u32, Option<String>), Verdict> {
+        let mut tenants = self.tenants.lock().await;
+        let Some(tenant) = tenants.get(alias) else {
+            // Named, but not onboarded. Distinguished from a policy refusal because
+            // the fix is completely different — somebody has to run `cm tenant add`.
+            return Err(Verdict::Deny {
+                rationale: format!("{alias} is not a tenant of this controller"),
+            });
+        };
+
+        let (allowed, rationale) = match tenant.policy.weigh(alias, nivedana) {
+            Ruling::Deny { rationale } => return Err(Verdict::Deny { rationale }),
+            Ruling::Counter { count, rationale } => {
+                return Err(Verdict::Counter { count, rationale });
+            }
+            Ruling::Allow { count, rationale } => (count, rationale),
+        };
+
+        // Say which limit bit them. "You get 10" without a reason invites somebody
+        // to go and edit a policy that was never the constraint.
+        let (allowed, capped) = tenant.clamp(allowed);
+        Ok((allowed, capped.or(rationale)))
+    }
+
+    /// How long this tenant's grants last unreleased.
+    async fn lifetime_for(&self, alias: &str) -> u64 {
+        self.tenants
+            .lock()
+            .await
+            .get(alias)
+            .map(|t| t.policy.reservation_secs())
+            .unwrap_or(fleet::RESERVATION_SECS)
+    }
+
     /// What an operator asked to see.
     ///
     /// Rendered here rather than shipped as structures: this is the one view where
@@ -578,10 +647,9 @@ impl Caller {
 /// than estimating is the whole point: an approximation would eventually disagree
 /// with the real path, and be believed.
 async fn rehearse(control: &Control, alias: &str, nivedana: &Nivedana) -> Verdict {
-    let (allowed, rationale) = match control.policy.weigh(alias, nivedana) {
-        Ruling::Deny { rationale } => return Verdict::Deny { rationale },
-        Ruling::Counter { count, rationale } => return Verdict::Counter { count, rationale },
-        Ruling::Allow { count, rationale } => (count, rationale),
+    let (allowed, rationale) = match control.entitlement(alias, nivedana).await {
+        Ok(pair) => pair,
+        Err(refusal) => return refusal,
     };
 
     let chosen = control
@@ -604,22 +672,22 @@ async fn rehearse(control: &Control, alias: &str, nivedana: &Nivedana) -> Verdic
         Err(Shortfall::Fewer { available }) => Verdict::Would {
             count: available,
             rationale: format!(
-                "policy allows {allowed}, and {available} matching machine(s) are free right now"
+                "you may have up to {allowed}, and {available} matching machine(s) are free right now"
             ),
         },
     }
 }
 
 async fn decide(control: &Control, alias: &str, caller: &str, nivedana: &Nivedana) -> Verdict {
-    let (allowed, rationale) = match control.policy.weigh(alias, nivedana) {
-        Ruling::Deny { rationale } => return Verdict::Deny { rationale },
-        Ruling::Counter { count, rationale } => return Verdict::Counter { count, rationale },
-        Ruling::Allow { count, rationale } => (count, rationale),
+    let (allowed, rationale) = match control.entitlement(alias, nivedana).await {
+        Ok(pair) => pair,
+        Err(refusal) => return refusal,
     };
+    let lifetime = control.lifetime_for(alias).await;
 
     let allocation = {
         let mut guard = control.fleet.lock().await;
-        match guard.allocate(nivedana, allowed, caller, alias) {
+        match guard.allocate(nivedana, allowed, caller, alias, lifetime) {
             Ok(allocation) => allocation,
             Err(Shortfall::NoneCapable { wanted }) => {
                 return Verdict::Deny {
@@ -632,7 +700,7 @@ async fn decide(control: &Control, alias: &str, caller: &str, nivedana: &Nivedan
                 return Verdict::Counter {
                     count: available,
                     rationale: format!(
-                        "policy allows {allowed}, but {available} matching machine(s) are free"
+                        "you may have up to {allowed}, but {available} matching machine(s) are free"
                     ),
                 };
             }
@@ -1587,6 +1655,85 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
     };
     let results = run(session).await?;
     Ok(exit_with(&results))
+}
+
+// ---------------------------------------------------------------------------
+// tenants
+// ---------------------------------------------------------------------------
+
+/// Onboard a tenant, whose alias must be the name **our own sirji** knows them by.
+///
+/// Deliberately local: this writes files under the controller's root, and it is the
+/// host's decision rather than a request anybody makes over the wire. When there is
+/// a hosted product with an account system, that system calls this — it does not
+/// become a plea.
+fn tenant_add(alias: &str, args: &[&str]) -> Result<()> {
+    let mut terms = tenant::Terms::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--ceiling" => {
+                terms.ceiling = args
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| anyhow::anyhow!("--ceiling wants a number"))?;
+                i += 2;
+            }
+            "--note" => {
+                terms.note = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            other => bail!("unrecognised argument: {other}"),
+        }
+    }
+
+    let config = load_config(&home()?)?;
+    let dir = tenant::Tenants::add(&config.root, alias, terms.clone())?;
+
+    // Read it straight back rather than describing what we just wrote: if it does
+    // not load, the operator finds out now rather than when the tenant first asks.
+    let mut tenants = tenant::Tenants::load(&config.root)?;
+    let written = tenants
+        .get(alias)
+        .ok_or_else(|| anyhow::anyhow!("wrote {} but could not read it back", dir.display()))?;
+
+    println!("tenant `{alias}` at {}", dir.display());
+    println!("  ceiling {} machine(s)", written.terms.ceiling);
+    println!("  they edit {}", written.policy.path.display());
+    println!("  you own  {}", dir.join(tenant::FILE).display());
+    // No restart: the controller re-reads a tenant's folder when they next ask.
+    println!("a running controller will pick this up on their next plea.");
+    Ok(())
+}
+
+fn tenant_list() -> Result<()> {
+    let config = load_config(&home()?)?;
+    let tenants = tenant::Tenants::load(&config.root)?;
+    if tenants.len() == 0 {
+        println!(
+            "no tenants in {}",
+            tenant::Tenants::dir_in(&config.root).display()
+        );
+        return Ok(());
+    }
+    let mut loaded = tenants;
+    let aliases: Vec<String> = loaded.aliases().cloned().collect();
+    for alias in aliases {
+        if let Some(t) = loaded.get(&alias) {
+            println!(
+                "  {:<16} ceiling {:<5} grants last {}s{}",
+                t.alias,
+                t.terms.ceiling,
+                t.policy.reservation_secs(),
+                t.terms
+                    .note
+                    .as_ref()
+                    .map(|n| format!("  — {n}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
