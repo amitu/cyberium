@@ -64,6 +64,8 @@ pub enum Look {
     Fleet,
     /// Live reservations: who has what, and until when.
     Reservations,
+    /// Budgets: what each tenant may spend, and what is spent or committed.
+    Spend,
 }
 
 /// The answer to an `Inspect`. Deliberately rendered by the controller rather than
@@ -175,6 +177,11 @@ pub struct Register {
     /// What it can do. Matched against what a plea asks for.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// Credits per minute while held. The machine announces its own cost, because it
+    /// is the thing that knows; zero means unstated, and unstated means one, since a
+    /// machine of unknown cost must not be free.
+    #[serde(default)]
+    pub rate: u32,
     /// Where it listens, so a caller can be sent straight to it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<String>,

@@ -60,6 +60,7 @@ say "onboard the payments team as a tenant, with dana in it"
 # shape — one policy and one budget for several people — and it is why a tenant's
 # name need not be any caller's alias.
 CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant add payments --ceiling 3 \
+  --credits 60 --window 3600 \
   --member dana --note "the demo team" 2>&1 | sed 's/^/  /'
 
 # Short reservations so a timeout is watchable in one run. This half of the
@@ -96,11 +97,13 @@ sleep 2
 # machine owner's, not the caller's: nothing a caller sends can skip them, and a
 # `--post` that failed takes the machine out of the fleet rather than lending out a
 # box that may still hold the last tenant's work.
-CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM worker --slots 1 --can linux \
+CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM worker --slots 1 --can linux --rate 1 \
   --pre 'echo "[hygiene] scrubbing before the next tenant"' \
   --post 'echo "[hygiene] taking back what was left"' >cm-w-1.log 2>&1 &
-CM_HOME=$LAB/cm-w-2 SIRJI_HOME=$LAB/cm-w-2 $CM worker --slots 1 --can linux >cm-w-2.log 2>&1 &
-CM_HOME=$LAB/cm-w-3 SIRJI_HOME=$LAB/cm-w-3 $CM worker --slots 2 --can linux --can gpu >cm-w-3.log 2>&1 &
+CM_HOME=$LAB/cm-w-2 SIRJI_HOME=$LAB/cm-w-2 $CM worker --slots 1 --can linux --rate 2 >cm-w-2.log 2>&1 &
+# The gpu box costs eight times the cheap one, so `--need linux` must never pick it
+# while an ordinary machine is idle.
+CM_HOME=$LAB/cm-w-3 SIRJI_HOME=$LAB/cm-w-3 $CM worker --slots 2 --can linux --can gpu --rate 8 >cm-w-3.log 2>&1 &
 for _ in $(seq 30); do
   [ "$(grep -c arrived cm-c.log || true)" -ge 3 ] && break
   sleep 1
@@ -180,6 +183,11 @@ CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
 say "the admin looks inside"
 CM_HOME=$LAB/cm-ops SIRJI_HOME=$LAB/cm-ops $CM admin fleet 2>&1 | sed 's/^/  /'
 CM_HOME=$LAB/cm-ops SIRJI_HOME=$LAB/cm-ops $CM admin reservations 2>&1 | sed 's/^/  /'
+
+say "what has the payments team spent?"
+# Credits, not currency: the fleet prices machines relative to each other and
+# leaves exchange rates to whoever bills.
+CM_HOME=$LAB/cm-ops SIRJI_HOME=$LAB/cm-ops $CM admin spend 2>&1 | sed 's/^/  /'
 
 say "cm-w-1 is one of acme's devices too, and still may not look"
 # The reason this class exists. A machine that offers capacity has no business

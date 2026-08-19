@@ -361,15 +361,55 @@ controller's own sirji, not asserted by the caller — so this needed no account
 no new credential. Adding a tenant or editing a policy needs no restart.
 
 What is not built: `nivedanas/`, the model call, `cm test-policy`, `cm upload-policy`,
-**budgets**, and the credential story. Three design notes carry those, each opening
-with what does and does not exist: [docs/policy.md](docs/policy.md),
-[docs/budget.md](docs/budget.md) and [docs/auth.md](docs/auth.md).
+and the credential story. Three design notes carry those, each opening with what does
+and does not exist: [docs/policy.md](docs/policy.md), [docs/budget.md](docs/budget.md)
+and [docs/auth.md](docs/auth.md).
 
-Budgets matter more than the ceiling does, and are the bigger gap: a ceiling of three
-machines says nothing about whether they ran for a minute or a fortnight, and the
-fortnight is what somebody pays for. `docs/budget.md` settles the unit — **a credit**,
-being one minute of the cheapest machine class, declared by each worker — and leaves
-the arithmetic to build.
+## Budgets
+
+A ceiling of three machines says nothing about whether they ran for a minute or a
+fortnight, and the fortnight is what somebody pays for.
+
+```sh
+$ cm worker --slots 3 --can linux --rate 1          # each machine announces
+$ cm worker --slots 3 --can linux --can gpu --rate 10   # what it costs
+
+$ cm tenant add team --credits 40 --window 3600 --member dana
+$ cm admin spend
+  team             34 of 40 credit(s) used, 0 committed, 6 left
+```
+
+The unit is **a credit** — one minute of the cheapest machine class — and money never
+enters the fleet, because a GPU box and a small Linux box are not comparable in dollars
+across regions and contracts, while *"that one costs ten of these"* is true everywhere.
+
+Consequences worth knowing, each of which was a decision:
+
+- **Selection is cheapest first.** Without it, a cost-aware allocator was accidentally
+  indifferent to price — `--need linux` could spend the GPU box's rate while an
+  ordinary machine sat idle.
+- **Commitments count, not just spend.** Otherwise a tenant starts a hundred runs at
+  once while comfortably under budget and finds out afterwards.
+- **Machines are priced individually.** At rates 1, 2 and 8 a three-machine grant
+  costs 11 a minute, not 3.
+- **The refusal says which limit bit.** `budget spent: 34 of 40 credit(s) used or
+  committed in the last 3600s` — and a partial answer says what the remainder buys.
+- **Unix time only.** No timezone in configuration, no date in a filename, because
+  what counts as a day is policy and policy changes. Windows are rolling seconds.
+
+The ledger is one append-only file per tenant, which is what makes "why is our budget
+gone" answerable — a running total never is:
+
+```
+1787126227 1  r1 1 cheap
+1787126231 11 r2 1 cheap,dear
+```
+
+Not built: currency conversion (`daily_budget: "200 INR"`), and the named calendars
+a team will want (*"our day starts at 08:00 New York, daylight saving included"*) —
+both need the model, and the split is settled in [docs/budget.md](docs/budget.md):
+the model names the rule, deterministic code does the calendar arithmetic against a
+real tz database, because DST is not a thing to trust a language model with.
 
 ## Try it
 

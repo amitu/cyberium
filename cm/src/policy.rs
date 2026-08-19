@@ -89,6 +89,12 @@ struct Grants {
     /// How long a grant survives unreleased. An org rule, not a constant: it has to
     /// sit above the longest suite anyone runs here.
     reservation_seconds: u64,
+    /// Credits this tenant allows itself per rolling window. Inside whatever the host
+    /// allows, never beyond it.
+    daily_budget: Option<u64>,
+    /// Seconds the budget is counted over. Rolling, so no timezone is involved; a
+    /// named calendar is a thing the prose half will express once a model reads it.
+    budget_window: Option<u64>,
 }
 
 impl Default for Grants {
@@ -97,6 +103,8 @@ impl Default for Grants {
             requesters: vec!["everyone".into()],
             standing_limit: 10,
             reservation_seconds: 600,
+            daily_budget: None,
+            budget_window: None,
         }
     }
 }
@@ -156,6 +164,13 @@ impl Policy {
         self.grants.reservation_seconds
     }
 
+    /// What this tenant allows itself, as (credits, window seconds).
+    pub fn budget(&self) -> Option<(u64, u64)> {
+        self.grants.daily_budget.map(|c| {
+            (c, self.grants.budget_window.unwrap_or(crate::budget::WINDOW_SECS))
+        })
+    }
+
     fn may_ask(&self, asker: &str) -> bool {
         self.grants
             .requesters
@@ -204,6 +219,16 @@ fn parse_grants(text: &str) -> Result<Grants> {
                     grants.standing_limit = value
                         .parse()
                         .with_context(|| format!("standing_limit: {value:?} is not a number"))?;
+                }
+                "daily_budget" => {
+                    grants.daily_budget = Some(value.parse().with_context(|| {
+                        format!("daily_budget: {value:?} is not a number of credits")
+                    })?);
+                }
+                "budget_window" => {
+                    grants.budget_window = Some(value.parse().with_context(|| {
+                        format!("budget_window: {value:?} is not a number of seconds")
+                    })?);
                 }
                 "reservation_seconds" => {
                     grants.reservation_seconds = value.parse().with_context(|| {

@@ -1,7 +1,9 @@
 # Budgets, and the unit they are counted in
 
-> **Status: designed, not built.** The unit, where rates are declared, and how a
-> budget clamps a grant are settled here. No code reads any of it yet.
+> **Status: built**, in its deterministic form. Worker rates, cost on close, the
+> per-tenant ledger, the two rolling-window budgets and the clamp all run. What is
+> **not** built: currency conversion, prose budgets (they need the model), and the
+> named-calendar windows described below — the rolling window is what works today.
 
 Allocation without a budget is only half an allocator. A ceiling of three machines
 says nothing about whether those three ran for a minute or a fortnight, and the
@@ -41,8 +43,13 @@ cm worker --slots 1 --can linux --rate 1
 cm worker --slots 2 --can linux --can gpu --rate 8
 ```
 
-Credits per minute, per slot in use. A worker that says nothing costs the default of
-one, because a machine of unknown cost must not be free.
+Credits per minute while held. A worker that says nothing costs one, because a machine
+of unknown cost must not be free.
+
+And selection is **cheapest first**, which this made necessary rather than merely
+nice: picking in name order left a cost-aware allocator accidentally indifferent to
+price, so `--need linux` could spend a GPU box's rate while an ordinary machine sat
+idle.
 
 Announced rather than configured centrally for the same reason capabilities are: the
 machine knows, and a second list to keep in step is a second list to get wrong.
@@ -53,13 +60,27 @@ machine knows, and a second list to keep in step is a second list to get wrong.
 cost = Σ over granted machines (rate) × minutes held
 ```
 
-Charged on **release or expiry**, against the reservation's tenant, for the time
-actually held — not the time asked for. A caller who releases early pays less, which
-is the incentive the design already wants: releasing promptly is how capacity comes
-back.
+Charged on **release or expiry**, against the reservation's **tenant** — not the
+caller, since several callers may share one — for the time actually held rather than
+the time asked for. A caller who releases early pays less, which is the incentive the
+design already wanted: releasing promptly is how capacity comes back. A caller who
+walks away pays for the full lifetime, because that is what they cost the fleet.
 
-The expiry backstop matters here too. A caller who walks away pays for the full
-reservation lifetime, because that is what they cost the fleet.
+Part-minutes count as a minute. A fifty-second run costing nothing would make the
+fleet free to anybody willing to churn.
+
+The rate is **fixed when the grant is made**, not looked up at close: a machine may
+have departed by then, and in any case you pay what was agreed when you took it.
+
+**Commitments count against the budget, not just spend.** A budget that looked only at
+what had been spent would let a tenant start a hundred runs at once while comfortably
+under it and find out afterwards. So the check is `budget − spent − worst-case of open
+reservations`, and a grant is allowed only if it would still fit when nobody releases.
+
+Machines are priced **individually, in the order they would be taken**. At rates 1, 2
+and 8 a three-machine grant costs 11 a minute, not 3 — pricing them all at the
+cheapest was a bug this design had for about an hour, and a budget that over-permits
+is one that discovers the overspend afterwards.
 
 ## Two budgets, like the two ceilings
 

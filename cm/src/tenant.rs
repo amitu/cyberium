@@ -46,6 +46,15 @@ pub struct Terms {
     /// else's callers, and with them somebody else's budget.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
+    /// Credits this tenant may spend per `window`. `None` means the host has set no
+    /// budget, which is different from zero — see `Tenant::budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u64>,
+    /// The rolling window those credits are counted over, in **seconds**. No
+    /// calendar and no timezone: a billing limit that needed to know when a team's
+    /// day starts would be answering a question it has no business asking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
     /// Free-form, for whoever has to work out later why this tenant exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -55,7 +64,7 @@ impl Default for Terms {
     fn default() -> Self {
         // Deliberately modest. A ceiling that has to be raised on purpose is better
         // than one nobody noticed was effectively infinite.
-        Self { ceiling: 10, members: Vec::new(), note: None }
+        Self { ceiling: 10, members: Vec::new(), credits: None, window: None, note: None }
     }
 }
 
@@ -68,6 +77,24 @@ pub struct Tenant {
 }
 
 impl Tenant {
+    /// The budget in force, as (credits, window seconds), or `None` if neither the
+    /// host nor the tenant set one.
+    ///
+    /// The **lower** of the two when both do, for the same reason as the ceiling: a
+    /// tenant dividing what it has must not be able to enlarge it.
+    pub fn budget(&self) -> Option<(u64, u64)> {
+        let host = self.terms.credits.map(|c| {
+            (c, self.terms.window.unwrap_or(crate::budget::WINDOW_SECS))
+        });
+        let own = self.policy.budget();
+        match (host, own) {
+            (Some(h), Some(o)) => Some(if o.0 <= h.0 { o } else { h }),
+            (Some(h), None) => Some(h),
+            (None, Some(o)) => Some(o),
+            (None, None) => None,
+        }
+    }
+
     /// The caller aliases that count as this tenant.
     pub fn members(&self) -> Vec<&str> {
         if self.terms.members.is_empty() {
@@ -369,7 +396,7 @@ mod tests {
         Tenants::add(
             &root,
             "payments",
-            Terms { ceiling: 5, members: vec!["dana".into()], note: None },
+            Terms { ceiling: 5, members: vec!["dana".into()], ..Terms::default() },
         )
         .unwrap();
         let mut tenants = Tenants::load(&root).unwrap();
@@ -390,7 +417,7 @@ mod tests {
             Terms {
                 ceiling: 5,
                 members: vec!["dana".into(), "kiran".into()],
-                note: None,
+                ..Terms::default()
             },
         )
         .unwrap();
@@ -419,8 +446,8 @@ mod tests {
         // Picking a winner would put somebody's spend on somebody else's budget,
         // arbitrarily, and nobody would know which.
         let root = temp();
-        Tenants::add(&root, "payments", Terms { ceiling: 5, members: vec!["dana".into()], note: None }).unwrap();
-        Tenants::add(&root, "platform", Terms { ceiling: 5, members: vec!["dana".into()], note: None }).unwrap();
+        Tenants::add(&root, "payments", Terms { ceiling: 5, members: vec!["dana".into()], ..Terms::default() }).unwrap();
+        Tenants::add(&root, "platform", Terms { ceiling: 5, members: vec!["dana".into()], ..Terms::default() }).unwrap();
 
         let err = Tenants::load(&root).unwrap_err();
         let text = format!("{err:#}");

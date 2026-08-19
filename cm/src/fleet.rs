@@ -31,6 +31,10 @@ pub struct Worker {
     pub hints: Vec<String>,
     pub slots: u32,
     pub capabilities: Vec<String>,
+    /// Credits per minute while held. Announced by the machine, because the machine
+    /// is the thing that knows what it is — the same reasoning as capabilities, and
+    /// a second list kept centrally is a second list to get wrong.
+    pub rate: u32,
     /// Reservations currently holding a slot here. Length is how busy it is.
     pub held_by: Vec<String>,
 }
@@ -55,9 +59,35 @@ pub struct Reservation {
     pub id: String,
     /// The key that may use it. Bound into every ticket we minted for it.
     pub caller: String,
+    /// Who asked, for display.
     pub alias: String,
+    /// Who **pays**. Not the same thing: several callers may share one tenant.
+    pub tenant: String,
     pub workers: Vec<String>,
+    /// Credits per minute for the whole grant, fixed when it was made.
+    ///
+    /// Recorded rather than looked up at close: a machine may have departed by then,
+    /// and in any case you pay what was agreed when you took it.
+    pub rate: u32,
+    pub started_at: u64,
     pub expires_at: u64,
+}
+
+impl Reservation {
+    /// What this has cost so far, in credits.
+    ///
+    /// Part-minutes count as a minute. Charging nothing for a fifty-second run would
+    /// make a fleet free to anybody willing to churn.
+    pub fn cost_by(&self, at: u64) -> u64 {
+        let minutes = at.saturating_sub(self.started_at).div_ceil(60).max(1);
+        minutes * self.rate as u64
+    }
+
+    /// The most this can still cost if nobody releases it — what a budget has to
+    /// assume is already committed.
+    pub fn worst_case(&self) -> u64 {
+        self.cost_by(self.expires_at)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -77,14 +107,27 @@ pub struct Allocation {
     pub expires_in: u64,
 }
 
-/// A reservation nobody released, and what it was holding.
+/// A reservation that has ended, released or expired, and what it cost.
 #[derive(Debug)]
-pub struct Expired {
-    pub id: String,
-    /// Who had it. Worth carrying: "r7 expired" tells an operator less than
-    /// "dana's r7 expired" when they are working out whose run died.
-    pub alias: String,
-    pub workers: Vec<String>,
+pub struct Closed {
+    pub reservation: Reservation,
+    pub minutes: u64,
+    pub credits: u64,
+}
+
+impl Closed {
+    pub fn id(&self) -> &str {
+        &self.reservation.id
+    }
+    pub fn alias(&self) -> &str {
+        &self.reservation.alias
+    }
+    pub fn tenant(&self) -> &str {
+        &self.reservation.tenant
+    }
+    pub fn workers(&self) -> &[String] {
+        &self.reservation.workers
+    }
 }
 
 /// Why allocation could not be satisfied in full.
@@ -159,15 +202,22 @@ impl Fleet {
             });
         }
 
-        let mut chosen: Vec<String> = Vec::new();
-        for worker in self.workers.values() {
-            if chosen.len() as u32 >= count {
-                break;
-            }
-            if worker.satisfies(wanted) && worker.free_slots() > 0 {
-                chosen.push(worker.name.clone());
-            }
-        }
+        // **Cheapest first.** Asking for `linux` should not spend a GPU box's rate
+        // when an ordinary one is idle — this is a cost-aware allocator, and picking
+        // by name order made it accidentally indifferent to price. A stable sort, so
+        // machines of equal rate still come in a predictable order.
+        let mut candidates: Vec<&Worker> = self
+            .workers
+            .values()
+            .filter(|w| w.satisfies(wanted) && w.free_slots() > 0)
+            .collect();
+        candidates.sort_by_key(|w| w.rate);
+
+        let chosen: Vec<String> = candidates
+            .into_iter()
+            .take(count as usize)
+            .map(|w| w.name.clone())
+            .collect();
 
         if (chosen.len() as u32) < count {
             return Err(Shortfall::Fewer {
@@ -175,6 +225,46 @@ impl Fleet {
             });
         }
         Ok(chosen)
+    }
+
+    /// The per-machine rates of the machines that would be chosen, in pick order.
+    ///
+    /// Separate from `choose` because a budget needs the prices even when it will
+    /// end up granting fewer than asked for — and cheapest-first means this list is
+    /// ascending, so a budget can simply walk it.
+    pub fn rates_for(&self, wanted: &[String], count: u32) -> Vec<u32> {
+        let mut candidates: Vec<&Worker> = self
+            .workers
+            .values()
+            .filter(|w| w.satisfies(wanted) && w.free_slots() > 0)
+            .collect();
+        candidates.sort_by_key(|w| w.rate);
+        candidates
+            .into_iter()
+            .take(count as usize)
+            .map(|w| w.rate)
+            .collect()
+    }
+
+    /// Credits per minute for a set of machines.
+    pub fn rate_of(&self, names: &[String]) -> u32 {
+        names
+            .iter()
+            .filter_map(|n| self.workers.get(n))
+            .map(|w| w.rate)
+            .sum()
+    }
+
+    /// The most this tenant's open reservations can still cost.
+    ///
+    /// A budget that looked only at what has been *spent* would let somebody start a
+    /// hundred runs at once while comfortably under it, and find out afterwards.
+    pub fn committed(&self, tenant: &str) -> u64 {
+        self.reservations
+            .values()
+            .filter(|r| r.tenant == tenant)
+            .map(|r| r.worst_case())
+            .sum()
     }
 
     /// Take `count` machines matching `nivedana`'s capabilities, and hold them.
@@ -189,10 +279,12 @@ impl Fleet {
         count: u32,
         caller: &str,
         alias: &str,
+        tenant: &str,
         lifetime: u64,
     ) -> Result<Allocation, Shortfall> {
         let lifetime = lifetime.max(1);
         let chosen = self.choose(&nivedana.capabilities, count)?;
+        let rate = self.rate_of(&chosen);
 
         self.next += 1;
         let id = format!("r{}", self.next);
@@ -209,7 +301,10 @@ impl Fleet {
                 id: id.clone(),
                 caller: caller.to_string(),
                 alias: alias.to_string(),
+                tenant: tenant.to_string(),
                 workers: chosen.clone(),
+                rate,
+                started_at: now(),
                 expires_at,
             },
         );
@@ -230,14 +325,14 @@ impl Fleet {
     ///
     /// `caller` must be the key the reservation was granted to: a release is an
     /// instruction about someone else's capacity if anyone may send it.
-    pub fn release(&mut self, id: &str, caller: &str) -> Result<Vec<String>, String> {
+    pub fn release(&mut self, id: &str, caller: &str) -> Result<Closed, String> {
         let Some(reservation) = self.reservations.get(id) else {
             return Err(format!("no reservation {id}"));
         };
         if reservation.caller != caller {
             return Err(format!("{id} was not granted to you"));
         }
-        Ok(self.free(id))
+        Ok(self.close(id).expect("just found it"))
     }
 
     /// Free everything past its expiry. The backstop.
@@ -245,34 +340,36 @@ impl Fleet {
     ///
     /// The alias travels with it because the operator reading that log line wants to
     /// know whose run died, not only that a number expired.
-    pub fn expire(&mut self) -> Vec<Expired> {
+    pub fn expire(&mut self) -> Vec<Closed> {
         let now = now();
-        let stale: Vec<(String, String)> = self
+        let stale: Vec<String> = self
             .reservations
             .values()
             .filter(|r| r.expires_at <= now)
-            .map(|r| (r.id.clone(), r.alias.clone()))
+            .map(|r| r.id.clone())
             .collect();
 
-        stale
-            .into_iter()
-            .map(|(id, alias)| {
-                let workers = self.free(&id);
-                Expired { id, alias, workers }
-            })
-            .collect()
+        stale.into_iter().filter_map(|id| self.close(&id)).collect()
     }
 
-    fn free(&mut self, id: &str) -> Vec<String> {
-        let Some(reservation) = self.reservations.remove(id) else {
-            return Vec::new();
-        };
+    /// Give the machines back, and say what it cost.
+    ///
+    /// One place, so a released reservation and an expired one are billed the same
+    /// way — a caller who walks away pays for the time they held, which is exactly
+    /// what they cost the fleet.
+    fn close(&mut self, id: &str) -> Option<Closed> {
+        let reservation = self.reservations.remove(id)?;
         for name in &reservation.workers {
             if let Some(w) = self.workers.get_mut(name) {
                 w.held_by.retain(|held| held != id);
             }
         }
-        reservation.workers
+        let at = now();
+        Some(Closed {
+            credits: reservation.cost_by(at),
+            minutes: at.saturating_sub(reservation.started_at).div_ceil(60).max(1),
+            reservation,
+        })
     }
 }
 
@@ -281,12 +378,17 @@ mod tests {
     use super::*;
 
     fn worker(name: &str, slots: u32, caps: &[&str]) -> Worker {
+        priced(name, slots, caps, 1)
+    }
+
+    fn priced(name: &str, slots: u32, caps: &[&str], rate: u32) -> Worker {
         Worker {
             name: name.into(),
             key: format!("key-{name}"),
             hints: vec![],
             slots,
             capabilities: caps.iter().map(|c| (*c).to_string()).collect(),
+            rate,
             held_by: vec![],
         }
     }
@@ -310,7 +412,7 @@ mod tests {
     #[test]
     fn allocates_only_machines_that_can_do_the_work() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["gpu"]), 1, "caller", "dana", RESERVATION_SECS).unwrap();
+        let a = f.allocate(&plea(&["gpu"]), 1, "caller", "dana", "dana", RESERVATION_SECS).unwrap();
         assert_eq!(a.workers.len(), 1);
         assert_eq!(a.workers[0].name, "gpu-1");
     }
@@ -320,18 +422,18 @@ mod tests {
         // Asking for linux must not exclude the machine that is also a gpu, or the
         // fleet fragments for no reason.
         let mut f = fleet();
-        let a = f.allocate(&plea(&["linux"]), 3, "caller", "dana", RESERVATION_SECS).unwrap();
+        let a = f.allocate(&plea(&["linux"]), 3, "caller", "dana", "dana", RESERVATION_SECS).unwrap();
         assert_eq!(a.workers.len(), 3);
     }
 
     #[test]
     fn impossible_and_merely_busy_are_different_answers() {
         let mut f = fleet();
-        match f.allocate(&plea(&["risc-v"]), 1, "caller", "dana", RESERVATION_SECS) {
+        match f.allocate(&plea(&["risc-v"]), 1, "caller", "dana", "dana", RESERVATION_SECS) {
             Err(Shortfall::NoneCapable { wanted }) => assert_eq!(wanted, vec!["risc-v".to_string()]),
             other => panic!("expected NoneCapable, got {other:?}"),
         }
-        match f.allocate(&plea(&["gpu"]), 5, "caller", "dana", RESERVATION_SECS) {
+        match f.allocate(&plea(&["gpu"]), 5, "caller", "dana", "dana", RESERVATION_SECS) {
             Err(Shortfall::Fewer { available }) => assert_eq!(available, 1),
             other => panic!("expected Fewer, got {other:?}"),
         }
@@ -340,8 +442,8 @@ mod tests {
     #[test]
     fn an_allocated_machine_is_not_offered_twice() {
         let mut f = fleet();
-        f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
-        match f.allocate(&plea(&["gpu"]), 1, "b", "kiran", RESERVATION_SECS) {
+        f.allocate(&plea(&["gpu"]), 1, "a", "dana", "dana", RESERVATION_SECS).unwrap();
+        match f.allocate(&plea(&["gpu"]), 1, "b", "kiran", "kiran", RESERVATION_SECS) {
             Err(Shortfall::Fewer { available }) => assert_eq!(available, 0),
             other => panic!("expected the machine to be busy, got {other:?}"),
         }
@@ -350,17 +452,17 @@ mod tests {
     #[test]
     fn releasing_returns_the_machines() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
-        let freed = f.release(&a.reservation, "a").unwrap();
-        assert_eq!(freed, vec!["gpu-1".to_string()]);
+        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", "dana", RESERVATION_SECS).unwrap();
+        let closed = f.release(&a.reservation, "a").unwrap();
+        assert_eq!(closed.workers(), ["gpu-1".to_string()]);
         // And it can be had again.
-        assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran", RESERVATION_SECS).is_ok());
+        assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran", "kiran", RESERVATION_SECS).is_ok());
     }
 
     #[test]
     fn only_the_holder_may_release() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
+        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", "dana", RESERVATION_SECS).unwrap();
         let err = f.release(&a.reservation, "someone-else").unwrap_err();
         assert!(err.contains("not granted to you"), "{err}");
         // And the machine is still held.
@@ -370,7 +472,7 @@ mod tests {
     #[test]
     fn expiry_frees_a_reservation_nobody_released() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
+        let a = f.allocate(&plea(&["gpu"]), 1, "a", "dana", "dana", RESERVATION_SECS).unwrap();
         assert!(f.expire().is_empty(), "not due yet");
 
         // Reach in and age it, rather than sleeping ten minutes.
@@ -378,15 +480,15 @@ mod tests {
 
         let expired = f.expire();
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].workers, vec!["gpu-1".to_string()]);
-        assert_eq!(expired[0].alias, "dana", "who lost it travels with it");
-        assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran", RESERVATION_SECS).is_ok());
+        assert_eq!(expired[0].workers(), ["gpu-1".to_string()]);
+        assert_eq!(expired[0].alias(), "dana", "who lost it travels with it");
+        assert!(f.allocate(&plea(&["gpu"]), 1, "b", "kiran", "kiran", RESERVATION_SECS).is_ok());
     }
 
     #[test]
     fn a_departing_worker_leaves_its_reservations() {
         let mut f = fleet();
-        let a = f.allocate(&plea(&["linux"]), 2, "a", "dana", RESERVATION_SECS).unwrap();
+        let a = f.allocate(&plea(&["linux"]), 2, "a", "dana", "dana", RESERVATION_SECS).unwrap();
         assert_eq!(a.workers.len(), 2);
 
         f.depart("linux-1");
@@ -403,7 +505,7 @@ mod tests {
             "capabilities are the union across the fleet, deduplicated"
         );
 
-        f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
+        f.allocate(&plea(&["gpu"]), 1, "a", "dana", "dana", RESERVATION_SECS).unwrap();
         let (machines, free, _) = f.summary();
         // Still three machines, but one of them is no longer on offer — which is
         // the difference between "ask later" and "never".
@@ -429,7 +531,7 @@ mod tests {
         // wired that way rather than merely written to look alike.
         let mut f = fleet();
         let rehearsed = f.choose(&["linux".into()], 2).unwrap();
-        let taken = f.allocate(&plea(&["linux"]), 2, "a", "dana", RESERVATION_SECS).unwrap();
+        let taken = f.allocate(&plea(&["linux"]), 2, "a", "dana", "dana", RESERVATION_SECS).unwrap();
         let names: Vec<String> = taken.workers.iter().map(|w| w.name.clone()).collect();
         assert_eq!(rehearsed, names);
     }
@@ -437,7 +539,7 @@ mod tests {
     #[test]
     fn a_rehearsal_sees_what_is_already_held() {
         let mut f = fleet();
-        f.allocate(&plea(&["gpu"]), 1, "a", "dana", RESERVATION_SECS).unwrap();
+        f.allocate(&plea(&["gpu"]), 1, "a", "dana", "dana", RESERVATION_SECS).unwrap();
         // Not "you could have one" — the machine is taken, and saying otherwise
         // would be the dry run lying about the present.
         match f.choose(&["gpu".into()], 1) {
@@ -447,18 +549,85 @@ mod tests {
     }
 
     #[test]
+    fn the_cheapest_capable_machine_goes_first() {
+        // This is a *cost-aware* allocator, and picking in name order made it
+        // accidentally indifferent to price: asking for linux could spend a GPU box's
+        // rate while an ordinary one sat idle.
+        let mut f = Fleet::default();
+        f.arrive(priced("expensive", 1, &["linux", "gpu"], 8));
+        f.arrive(priced("cheap", 1, &["linux"], 1));
+        f.arrive(priced("middling", 1, &["linux"], 3));
+
+        assert_eq!(f.choose(&["linux".into()], 1).unwrap(), vec!["cheap".to_string()]);
+        assert_eq!(
+            f.choose(&["linux".into()], 2).unwrap(),
+            vec!["cheap".to_string(), "middling".to_string()]
+        );
+        // A capability only the expensive machine has still gets it.
+        assert_eq!(f.choose(&["gpu".into()], 1).unwrap(), vec!["expensive".to_string()]);
+    }
+
+    #[test]
+    fn a_grant_is_priced_when_it_is_made() {
+        let mut f = Fleet::default();
+        f.arrive(priced("a", 1, &["linux"], 3));
+        f.arrive(priced("b", 1, &["linux"], 5));
+        let a = f.allocate(&plea(&["linux"]), 2, "k", "dana", "payments", 600).unwrap();
+
+        let r = f.reservations().next().unwrap();
+        assert_eq!(r.rate, 8, "the sum of both machines");
+        assert_eq!(r.tenant, "payments", "who pays is not who asked");
+        // A part-minute is a minute: a fifty-second run must not be free, or a fleet
+        // is free to anybody willing to churn.
+        assert_eq!(r.cost_by(r.started_at), 8);
+        assert_eq!(r.cost_by(r.started_at + 61), 16);
+        // And the worst case is the whole lifetime, which is what a budget must
+        // assume is already committed.
+        assert_eq!(r.worst_case(), 8 * 10);
+        drop(a);
+    }
+
+    #[test]
+    fn closing_reports_the_cost_and_releases_the_machines() {
+        let mut f = Fleet::default();
+        f.arrive(priced("a", 1, &["linux"], 4));
+        let a = f.allocate(&plea(&["linux"]), 1, "k", "dana", "payments", 600).unwrap();
+
+        let closed = f.release(&a.reservation, "k").unwrap();
+        assert_eq!(closed.credits, 4, "one minute minimum at 4/min");
+        assert_eq!(closed.tenant(), "payments");
+        assert_eq!(f.workers().next().unwrap().free_slots(), 1);
+    }
+
+    #[test]
+    fn commitments_are_counted_before_they_are_spent() {
+        // The hole a spend-only budget leaves: a hundred runs started at once while
+        // comfortably under it, discovered afterwards.
+        let mut f = Fleet::default();
+        f.arrive(priced("a", 1, &["linux"], 2));
+        f.arrive(priced("b", 1, &["linux"], 2));
+        assert_eq!(f.committed("payments"), 0);
+
+        f.allocate(&plea(&["linux"]), 2, "k", "dana", "payments", 600).unwrap();
+        // Two machines at 2/min for 10 minutes, if nobody releases.
+        assert_eq!(f.committed("payments"), 40);
+        // And it is per tenant, not fleet-wide.
+        assert_eq!(f.committed("platform"), 0);
+    }
+
+    #[test]
     fn the_lifetime_comes_from_outside() {
         // Per grant, because it comes from the tenant's policy and there is a policy
         // per tenant — the fleet could not own one number if it wanted to.
         let mut f = Fleet::default();
         f.arrive(worker("linux-1", 1, &["linux"]));
-        let a = f.allocate(&plea(&["linux"]), 1, "a", "dana", 30).unwrap();
+        let a = f.allocate(&plea(&["linux"]), 1, "a", "dana", "dana", 30).unwrap();
         assert_eq!(a.expires_in, 30);
         assert_eq!(a.limits.max_seconds, 30);
 
         // A zero would expire every grant the instant it was made.
         f.release(&a.reservation, "a").unwrap();
-        let b = f.allocate(&plea(&["linux"]), 1, "a", "dana", 0).unwrap();
+        let b = f.allocate(&plea(&["linux"]), 1, "a", "dana", "dana", 0).unwrap();
         assert_eq!(b.expires_in, 1);
     }
 
@@ -466,8 +635,8 @@ mod tests {
     fn slots_allow_more_than_one_reservation_per_machine() {
         let mut f = Fleet::default();
         f.arrive(worker("big", 3, &["linux"]));
-        assert!(f.allocate(&plea(&["linux"]), 1, "a", "dana", RESERVATION_SECS).is_ok());
-        assert!(f.allocate(&plea(&["linux"]), 1, "b", "kiran", RESERVATION_SECS).is_ok());
+        assert!(f.allocate(&plea(&["linux"]), 1, "a", "dana", "dana", RESERVATION_SECS).is_ok());
+        assert!(f.allocate(&plea(&["linux"]), 1, "b", "kiran", "kiran", RESERVATION_SECS).is_ok());
         assert_eq!(f.workers().next().unwrap().free_slots(), 1);
     }
 }

@@ -16,6 +16,7 @@
 //! fleet lives in exactly one place.
 
 mod admin;
+mod budget;
 mod fleet;
 mod policy;
 mod proto;
@@ -57,9 +58,11 @@ cm — cost-aware allocation of test machines
 
   cm admin fleet [--controller <name>]
   cm admin reservations [--controller <name>]
+  cm admin spend [--controller <name>]
         look inside a running controller, as an admin device.
 
-  cm tenant add <name> [--ceiling N] [--member <alias>]... [--note <text>]
+  cm tenant add <name> [--ceiling N] [--credits N] [--window SECS]
+                       [--member <alias>]... [--note <text>]
   cm tenant list
         onboard whoever this controller serves — always, self-hosted too, where
         a tenant is usually a team. Members are the caller aliases our own sirji
@@ -67,8 +70,10 @@ cm — cost-aware allocation of test machines
         They write policy.md; you write tenant.toml, which is what stops a
         tenant setting its own quota or claiming somebody else's callers.
 
-  cm worker [--controller <name>] [--slots N] [--can <cap>]...
-        offer this machine to the controller
+  cm worker [--controller <name>] [--slots N] [--can <cap>]... [--rate N]
+        offer this machine to the controller. --rate is what it costs in
+        credits per minute while held; the machine announces its own, because
+        the machine is what knows. Unstated means 1, never free.
         --pre <cmd>   make the machine fit before each tenancy
         --post <cmd>  take back what the last tenant left
         Both belong to whoever runs the machine: a caller cannot supply them,
@@ -122,6 +127,9 @@ fn main() -> Result<std::process::ExitCode> {
         ["admin", "reservations", rest @ ..] => rt()?
             .block_on(inspect(proto::Look::Reservations, rest))
             .map(|_| ok),
+        ["admin", "spend", rest @ ..] => {
+            rt()?.block_on(inspect(proto::Look::Spend, rest)).map(|_| ok)
+        }
         ["worker", rest @ ..] => rt()?.block_on(worker(rest)).map(|_| ok),
         // `why` is positional but optional: a ping asks for nothing, so making
         // somebody justify one would be a small daily absurdity.
@@ -434,12 +442,16 @@ async fn reap(control: Arc<Control>) {
         let expired = control.fleet.lock().await.expire();
         for gone in expired {
             println!(
-                "{}'s {} expired unreleased, taking back {} machine(s)",
-                gone.alias,
-                gone.id,
-                gone.workers.len()
+                "{}'s {} expired unreleased, taking back {} machine(s) — {} credit(s)",
+                gone.alias(),
+                gone.id(),
+                gone.workers().len(),
+                gone.credits
             );
-            control.tell_freed(&gone.id, &gone.workers).await;
+            // Billed exactly like a release. A caller who walked away pays for the
+            // time they held, which is what they cost the fleet.
+            control.charge(&gone);
+            control.tell_freed(gone.id(), gone.workers()).await;
         }
     }
 }
@@ -477,7 +489,101 @@ impl Control {
         // Say which limit bit them. "You get 10" without a reason invites somebody
         // to go and edit a policy that was never the constraint.
         let (allowed, capped) = tenant.clamp(allowed);
-        Ok((allowed, capped.or(rationale)))
+        let mut rationale = capped.or(rationale);
+
+        // Third clamp: money. A ceiling of three machines says nothing about whether
+        // they run for a minute or a fortnight, and the fortnight is what somebody
+        // pays for.
+        if let Some((budget_credits, window)) = tenant.budget() {
+            let name = tenant.alias.clone();
+            let lifetime = tenant.policy.reservation_secs();
+            let wanted = nivedana.capabilities.clone();
+            drop(tenants);
+
+            let dir = tenant::Tenants::dir_in(&self.config.root).join(&name);
+            let now = fleet::now();
+            let (room, rates) = {
+                let fleet = self.fleet.lock().await;
+                // Price the machines that would *actually* be picked, in the order
+                // they would be picked. Machines are not interchangeable, and
+                // pricing them all at the cheapest over-permits.
+                let rates = fleet.rates_for(&wanted, allowed);
+                let room = budget::Room {
+                    budget: budget_credits,
+                    spent: budget::spent(&dir, now, window),
+                    committed: fleet.committed(&name),
+                };
+                (room, rates)
+            };
+
+            let affordable = room.affordable(&rates, lifetime);
+            if affordable == 0 {
+                return Err(Verdict::Deny {
+                    rationale: format!(
+                        "budget spent: {} of {budget_credits} credit(s) used or committed \
+                         in the last {window}s",
+                        room.spent + room.committed
+                    ),
+                });
+            }
+            if affordable < allowed {
+                return Ok((
+                    affordable,
+                    Some(format!(
+                        "{allowed} allowed, but {} credit(s) left of {budget_credits} \
+                         buys {affordable}",
+                        room.left()
+                    )),
+                ));
+            }
+        }
+
+        Ok((allowed, rationale))
+    }
+
+    /// Write a closed reservation into its tenant's ledger.
+    ///
+    /// Never fails the caller. The machines have already come back, and refusing to
+    /// acknowledge that would strand them — an unrecorded line is a billing problem,
+    /// a stuck reservation is an outage.
+    fn charge(&self, closed: &fleet::Closed) {
+        let dir = tenant::Tenants::dir_in(&self.config.root).join(closed.tenant());
+        let entry = budget::Entry {
+            at: fleet::now(),
+            credits: closed.credits,
+            reservation: closed.id().to_string(),
+            minutes: closed.minutes,
+            machines: closed.workers().to_vec(),
+        };
+        if let Err(e) = budget::record(&dir, &entry) {
+            eprintln!("could not record {} credits for {}: {e:#}", closed.credits, closed.tenant());
+        }
+    }
+
+    /// What this tenant's budget still allows.
+    ///
+    /// The lower of two windows, like the two ceilings: the host's in `tenant.toml`
+    /// and the tenant's own in `policy.md`. Both rolling seconds, so neither needs a
+    /// calendar or a timezone.
+    async fn room(&self, tenant: &tenant::Tenant) -> Option<budget::Room> {
+        let (budget_credits, window) = tenant.budget()?;
+        let dir = tenant::Tenants::dir_in(&self.config.root).join(&tenant.alias);
+        let now = fleet::now();
+        Some(budget::Room {
+            budget: budget_credits,
+            spent: budget::spent(&dir, now, window),
+            committed: self.fleet.lock().await.committed(&tenant.alias),
+        })
+    }
+
+    /// Which tenant this caller bills to.
+    async fn tenant_of(&self, alias: &str) -> String {
+        self.tenants
+            .lock()
+            .await
+            .for_caller(alias)
+            .map(|t| t.alias.clone())
+            .unwrap_or_else(|| alias.to_string())
     }
 
     /// How long this tenant's grants last unreleased.
@@ -519,6 +625,36 @@ impl Control {
                         w.capabilities
                     ));
                 }
+            }
+            proto::Look::Spend => {
+                // Every tenant at once, which only an admin ever sees — a tenant
+                // learning its neighbours' spend would be the ping's fleet summary
+                // all over again.
+                drop(fleet);
+                let names: Vec<String> = {
+                    let tenants = self.tenants.lock().await;
+                    tenants.names().cloned().collect()
+                };
+                if names.is_empty() {
+                    lines.push("no tenants".into());
+                }
+                for name in names {
+                    let t = {
+                        let tenants = self.tenants.lock().await;
+                        tenants.by_name(&name).cloned()
+                    };
+                    let Some(t) = t else { continue };
+                    match self.room(&t).await {
+                        Some(room) => lines.push(format!(
+                            "  {:<16} {} of {} credit(s) used, {} committed, {} left",
+                            t.alias, room.spent, room.budget, room.committed, room.left()
+                        )),
+                        // No budget is a real state, and saying "0 of 0" would read
+                        // as a tenant that may spend nothing.
+                        None => lines.push(format!("  {:<16} no budget set", t.alias)),
+                    }
+                }
+                return proto::Sight { lines };
             }
             proto::Look::Reservations => {
                 let now = fleet::now();
@@ -610,14 +746,16 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
             Plea::Nivedana(nivedana) => decide(&control, &alias, &caller, &nivedana).await,
             Plea::Rehearse(nivedana) => rehearse(&control, &alias, &nivedana).await,
             Plea::Release { reservation } => {
-                let freed = control.fleet.lock().await.release(&reservation, &caller);
-                match freed {
-                    Ok(workers) => {
+                let closed = control.fleet.lock().await.release(&reservation, &caller);
+                match closed {
+                    Ok(closed) => {
                         println!(
-                            "{alias} released {reservation} ({} machine(s))",
-                            workers.len()
+                            "{alias} released {reservation} ({} machine(s), {} credit(s))",
+                            closed.workers().len(),
+                            closed.credits
                         );
-                        control.tell_freed(&reservation, &workers).await;
+                        control.charge(&closed);
+                        control.tell_freed(reservation.as_str(), closed.workers()).await;
                         Verdict::Ok
                     }
                     Err(reason) => Verdict::Deny { rationale: reason },
@@ -738,10 +876,12 @@ async fn decide(control: &Control, alias: &str, caller: &str, nivedana: &Nivedan
         Err(refusal) => return refusal,
     };
     let lifetime = control.lifetime_for(alias).await;
+    // Who pays. Not the caller's alias: several callers may share one tenant.
+    let tenant_name = control.tenant_of(alias).await;
 
     let allocation = {
         let mut guard = control.fleet.lock().await;
-        match guard.allocate(nivedana, allowed, caller, alias, lifetime) {
+        match guard.allocate(nivedana, allowed, caller, alias, &tenant_name, lifetime) {
             Ok(allocation) => allocation,
             Err(Shortfall::NoneCapable { wanted }) => {
                 return Verdict::Deny {
@@ -817,8 +957,8 @@ async fn serve_worker(
 ) -> Result<()> {
     let name = register.name.clone();
     println!(
-        "worker {name} arrived: {} slot(s), can {:?}",
-        register.slots, register.capabilities
+        "worker {name} arrived: {} slot(s), {} credit(s)/min, can {:?}",
+        register.slots, register.rate.max(1), register.capabilities
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Aadesh>(16);
@@ -829,6 +969,8 @@ async fn serve_worker(
         hints: register.hints,
         slots: register.slots.max(1),
         capabilities: register.capabilities,
+        // A machine of unknown cost must not be free, so silence means one.
+        rate: register.rate.max(1),
         held_by: Vec::new(),
     });
 
@@ -910,6 +1052,7 @@ async fn worker(args: &[&str]) -> Result<()> {
     let mut controller_name = "cm-c".to_string();
     let mut slots = 1u32;
     let mut capabilities: Vec<String> = Vec::new();
+    let mut rate = 1u32;
     let mut hygiene = Hygiene::default();
 
     let mut i = 0;
@@ -929,6 +1072,12 @@ async fn worker(args: &[&str]) -> Result<()> {
             }
             "--slots" => {
                 slots = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
+                i += 2;
+            }
+            "--rate" => {
+                // What this machine costs, in credits per minute while held. The
+                // machine announces it because the machine is what knows.
+                rate = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
                 i += 2;
             }
             "--can" => {
@@ -961,7 +1110,7 @@ async fn worker(args: &[&str]) -> Result<()> {
     // We listen, because a caller granted this machine dials it directly.
     let endpoint = sirji::bind(secret).await?;
     println!(
-        "worker `{}` listening as {} — {} slot(s), can {:?}",
+        "worker `{}` listening as {} — {} slot(s), {rate} credit(s)/min, can {:?}",
         config.name, config.key, slots, capabilities
     );
 
@@ -991,6 +1140,7 @@ async fn worker(args: &[&str]) -> Result<()> {
                     &controller_name,
                     slots,
                     &capabilities,
+                    rate,
                     &hints,
                     &assigned,
                     &hygiene,
@@ -1031,6 +1181,7 @@ async fn offer(
     controller_name: &str,
     slots: u32,
     capabilities: &[String],
+    rate: u32,
     hints: &[String],
     assigned: &Assigned,
     hygiene: &Hygiene,
@@ -1063,6 +1214,7 @@ async fn offer(
             name: config.name.clone(),
             slots,
             capabilities: capabilities.to_vec(),
+            rate,
             hints: hints.to_vec(),
         },
     )
@@ -1790,6 +1942,14 @@ fn tenant_add(alias: &str, args: &[&str]) -> Result<()> {
     let mut i = 0;
     while i < args.len() {
         match args[i] {
+            "--credits" => {
+                terms.credits = args.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--window" => {
+                terms.window = args.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
             "--ceiling" => {
                 terms.ceiling = args
                     .get(i + 1)
@@ -1825,6 +1985,10 @@ fn tenant_add(alias: &str, args: &[&str]) -> Result<()> {
     println!("tenant `{alias}` at {}", dir.display());
     println!("  ceiling {} machine(s)", written.terms.ceiling);
     println!("  members  {}", written.members().join(", "));
+    match written.budget() {
+        Some((c, w)) => println!("  budget   {c} credit(s) per rolling {w}s"),
+        None => println!("  budget   none — machines are capped, spending is not"),
+    }
     println!("  they edit {}", written.policy.path.display());
     println!("  you own  {}", dir.join(tenant::FILE).display());
     // No restart: the controller re-reads a tenant's folder when they next ask.
@@ -1845,10 +2009,14 @@ fn tenant_list() -> Result<()> {
     for t in tenants.all() {
         {
             println!(
-                "  {:<16} ceiling {:<5} grants last {:<6} members {}{}",
+                "  {:<16} ceiling {:<5} grants last {:<6} budget {:<14} members {}{}",
                 t.alias,
                 t.terms.ceiling,
                 format!("{}s", t.policy.reservation_secs()),
+                match t.budget() {
+                    Some((c, w)) => format!("{c}/{w}s"),
+                    None => "none".to_string(),
+                },
                 t.members().join(","),
                 t.terms
                     .note
