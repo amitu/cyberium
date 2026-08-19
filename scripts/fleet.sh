@@ -14,6 +14,7 @@
 # ~104 bytes cannot be bound at all.
 set -euo pipefail
 
+HERE=$(cd "$(dirname "$0")" && pwd)
 LAB=${LAB:-/tmp/cmlab}
 SIRJI=${SIRJI:-sirji}
 CM=${CM:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/cm}
@@ -91,6 +92,14 @@ CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM admin add ops "$OPS_KEY" \
 CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM admin list 2>&1 | sed 's/^/  /'
 
 say "start controller and workers"
+# A model is not optional: cm decides allocations by weighing policy.md, and there is
+# no unweighed mode. This scenario is about transport, capabilities and reclaim, so it
+# runs a well-behaved local stand-in that gives what was asked inside the stated
+# limits — see scripts/model.sh for the scenario about the limits themselves.
+python3 "$HERE/fakemodel.py" 8733 allow ask "$LAB/prompt.log" >/dev/null 2>&1 &
+echo $! > "$LAB/model.pid"
+sleep 1
+CM_MODEL_KEY=test-not-a-real-key CM_MODEL_URL=http://127.0.0.1:8733 \
 CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM controller >cm-c.log 2>&1 &
 sleep 2
 # cm-w-1 runs the operator's hygiene scripts around every tenancy. They are the
@@ -209,5 +218,7 @@ done
 
 say "controller log"
 sed 's/^/  /' cm-c.log
+
+kill "$(cat "$LAB/model.pid")" 2>/dev/null || true
 
 say "done — logs in $LAB"

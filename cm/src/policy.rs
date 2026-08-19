@@ -11,9 +11,10 @@
 //! Everything else is prose, and the prose is where the number comes from — every
 //! plea, not only the large ones. The block's limits bound that answer rather than
 //! pre-empting it: `max_limit` is a ceiling interpretation may not exceed, and
-//! `standing_limit` is what this org stands behind when the prose cannot be weighed
-//! at all. Answering the ordinary case from the block alone would leave a policy
-//! that only spoke about exceptions.
+//! `standing_limit` is what this org calls an ordinary request — sent to the model so
+//! it has some idea what "normal" looks like here, since one told only a ceiling
+//! drifts toward the ceiling. Answering the ordinary case from the block alone would
+//! leave a policy that only spoke about exceptions.
 
 use std::path::{Path, PathBuf};
 
@@ -72,9 +73,9 @@ pub enum Ruling {
         /// What the caller asked for. An upper bound on the answer: nobody is given
         /// machines they did not ask for.
         wanted: u32,
-        /// The answer when the prose cannot be weighed — no model configured, or the
-        /// call failed. Not a floor, and not a fast path: the deterministic number
-        /// this organisation is willing to stand behind with nothing interpreted.
+        /// What this organisation calls an ordinary request. Calibration for the
+        /// model, and nothing else: not a floor, not a fast path, and not a fallback —
+        /// a plea that cannot be weighed fails rather than quietly landing here.
         standing: u32,
         /// The most any interpretation may grant. **Never** exceeded, whatever the
         /// model says.
@@ -331,7 +332,7 @@ mod tests {
     #[test]
     fn asking_for_a_lot_is_a_question_for_the_prose_not_a_refusal() {
         // The deterministic half does not counter, because it does not have a number
-        // to counter with — 4 is what this org falls back to, not what it decided.
+        // to counter with — 4 is what this org calls ordinary, not what it decided.
         let p = policy("```yaml\nrequesters:\n  - everyone\nstanding_limit: 4\n```");
         match p.weigh("dana", &plea(Some(50))) {
             Ruling::Consider { wanted, standing, ceiling } => {
@@ -386,8 +387,9 @@ mod tests {
 
     #[test]
     fn a_max_below_the_standing_limit_is_ignored_not_obeyed() {
-        // It would otherwise *lower* the number this org already stands behind with
-        // nothing interpreted, which is not what a maximum means.
+        // It would otherwise put the ceiling *below* what this org calls an ordinary
+        // request, which is not what a maximum means — and would leave a model told
+        // that normal is 10 and it may grant at most 5.
         let p = policy("```yaml\nstanding_limit: 10\nmax_limit: 5\n```");
         match p.weigh("dana", &plea(Some(50))) {
             Ruling::Consider { standing, ceiling, .. } => assert_eq!((standing, ceiling), (10, 10)),

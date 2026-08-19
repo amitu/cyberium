@@ -39,37 +39,85 @@ limit?" cannot be asked before the prose is read, because what the limit *is* fo
 given plea is one of the things the prose decides.
 
 ```yaml
-standing_limit: 2      # the answer when the prose cannot be weighed
+standing_limit: 2      # what this org calls an ordinary request
 max_limit: 4           # the most any interpretation may grant. Absent means it may
                        # lower a number but never raise one.
 ```
 
-Neither is a stage before the model; both are bounds on its answer. Three rules hold
-regardless of what any model returns:
+Neither is a stage before the model; both are bounds on its answer, and **both are
+shown to it**. So is the tenant's ceiling, the budget, what has been spent, and how
+many machines are free right now. The model is given every constraint the controller
+would enforce, so that it can honour them and explain itself in the same breath — a
+model that answers six and is silently cut to two has told the caller a story about a
+decision that did not happen.
+
+Two rules hold regardless of what any model returns:
 
 1. **It can only be persuaded within a range a human wrote.** The answer is clamped
-   to `max_limit`, and to what the caller actually asked for. The model argues; it
-   never becomes the gate. With no `max_limit`, interpretation can still refuse or
-   trim but cannot expand entitlement — the default, so opting in is deliberate.
+   to the tightest ceiling that applies, and to what the caller actually asked for.
+   The model argues; it never becomes the gate. With no `max_limit`, interpretation
+   can still refuse or trim but cannot expand entitlement — the default, so opting in
+   is deliberate.
 2. **A refusal is always honoured.** Clamping is one-directional; down is safe.
-3. **Unreachable is not permission.** No key, a timeout, an error — the standing
-   limit answers and says so in the rationale, and never grants more than was asked
-   for, because a fallback is not a quota to fill. A fleet that stopped working
-   because an API was down would be worse than one with no prose at all.
 
-`standing_limit` is sent to the model too, as calibration: this is the figure the
-organisation falls back to, explicitly *not* a floor or a target. A model told only
-a ceiling and nothing about what is ordinary here would drift toward the ceiling.
+`standing_limit` is calibration and nothing more: what this organisation calls an
+ordinary request, sent so the model knows what normal looks like here, and labelled in
+the prompt as explicitly *not* a floor or a target. A model told only a ceiling drifts
+toward the ceiling. It is not a fallback — see below.
+
+### There is no unweighed mode
+
+No key, a timeout, an API having a bad day: **the request fails**, with a verdict that
+says nothing was decided rather than that anything was refused.
+
+An earlier version fell back to `standing_limit` here, and that was worse than
+failing. It hands out machines on cm's authority rather than the organisation's, and
+it does so invisibly — at exactly the moment the one component that reads the policy
+has stopped working. The failure nobody notices is a fleet that keeps running while
+nobody's rules are being applied. A missing key is fatal at **startup**, too: an
+operator learns it from a deploy log rather than from somebody's CI output.
+
+```sh
+CM_MODEL_URL=…   # point it at your own endpoint to run one locally
+```
+
+### The clamps are a sanity net, not the logic
+
+Every limit is re-checked after the answer comes back. Because every limit was also in
+the prompt, a clamp that bites means something is **wrong** — a policy arguing past
+its own numbers, or a prompt that failed to state one — so it is logged as a fault
+naming what overshot, and the model's rationale is replaced rather than shown next to
+a number it did not argue for:
+
+```
+policy for payments overshot limits it was shown (proposed 9 against a stated
+ceiling of 4) — cut to 4. Fix the policy; the prompt stated every one of them.
+```
+
+Availability is the one exception that reports no fault: the fleet genuinely can empty
+between the brief and the answer, and nobody wrote that badly.
 
 The one thing settled before the prose is whether the caller may ask at all. That
 needs no interpretation, so an unauthorised caller is refused without spending a
 token.
 
-The model sees the prose, the caller's declared fields, and what was attested about
-them. It does **not** see fleet state — mixing entitlement and availability would make
-the same plea weigh differently depending on who else was running, and an
-unreproducible decision cannot be snapshot-tested. There is a test that greps the
-assembled prompt for fleet vocabulary and fails if any of it appears.
+The model sees the prose, the caller's declared fields, what was attested about them,
+the money, and the fleet — **as counts and prices, never identities**. It is told how
+many machines could do the work, how many are free, and what the free ones cost per
+minute. It is never told which machines, or who is holding the rest, because it does
+not need either to answer "how many" — and what it was never given, it cannot
+disclose.
+
+That the same plea can now get different answers at different moments is the intended
+behaviour, not a regression: whether six machines is reasonable genuinely depends on
+whether six are free. It does mean a policy test has to pin the fleet as part of its
+fixture, the same way it pins the plea.
+
+The caller is a separate matter. Utilisation over time tells another organisation your
+release cadence and how often you have incidents, so the model is instructed to say
+"the fleet is busy" and never how busy. That instruction is a request to a model, not
+a guarantee from cm — the hard guarantees are elsewhere and unchanged: a Pong carries
+nothing, and the roster is admin-only.
 
 The fenced block is excluded from what the model reads: it has already been applied,
 and showing it again invites reinterpretation of a decision that was not the model's
@@ -79,7 +127,7 @@ Configured entirely by environment, because the key is the one value here that m
 not end up in a repository beside `policy.md`:
 
 ```sh
-CM_MODEL_KEY=…     # unset means no model; the controller still works
+CM_MODEL_KEY=…     # required: a controller will not start without one
 CM_MODEL=claude-sonnet-5
 CM_MODEL_URL=https://api.anthropic.com/v1/messages
 ```

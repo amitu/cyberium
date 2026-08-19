@@ -339,43 +339,55 @@ written to answer, and a number arrived at without reading it would be a default
 wearing the organisation's name.
 
 ```yaml
-standing_limit: 2      # the answer when the prose *cannot* be weighed
+standing_limit: 2      # what this org calls an ordinary request
 max_limit: 4           # the most any interpretation may grant. Absent means it
                        # may lower a number but never raise one.
 ```
 
-Both are bounds on the answer, not stages before it. `max_limit` is a ceiling a
-human wrote and the model never exceeds; `standing_limit` is what this organisation
-stands behind with nothing interpreted — which is exactly the right answer when
-nothing can be, and nothing more than that:
+Neither is a stage before the model, and **both are shown to it** — the ceiling as a
+hard bound on the answer, the standing limit as calibration for what ordinary looks
+like here. So is the tenant's ceiling, the budget, what has been spent, and
+how many machines are free right now. It is given every constraint the controller
+would enforce, so it can honour them and explain itself in the same breath. A model
+that answers six and is silently cut to two has told the caller a story about a
+decision that did not happen.
 
-- **The answer is clamped** to `max_limit` and to what was actually asked for. Told
-  to hand out 99 against a `max_limit` of 4, it hands out 4. The model argues; it
-  never becomes the gate.
+- **The answer is clamped** to the tightest ceiling that applies and to what was
+  actually asked for. Told to hand out 99 against a ceiling of 4, it hands out 4.
+  The model argues; it never becomes the gate.
 - **A refusal is always honoured.** Clamping is one-directional, and down is safe.
-- **Unreachable is not permission.** No key, a timeout, an API having a bad day —
-  the standing limit answers and says so in the rationale. A fleet that stopped
-  working because a model was down would be worse than one with no prose at all.
-  With no key at all `cm` still allocates; it just says the prose went unread.
+- **The clamps are a sanity net, not the logic.** Every one of them was in the
+  prompt, so a clamp that bites means the policy argued past its own numbers — it is
+  logged as a fault naming what overshot, not treated as the ordinary way an answer
+  gets made.
+- **There is no unweighed mode.** No key, a timeout, an API having a bad day: the
+  request fails, and says nothing was decided rather than that anything was refused.
+  Substituting a number here would hand out machines on cm's authority instead of
+  the organisation's, invisibly, at the moment the component that reads the policy
+  stopped working. A missing key is fatal at startup, so an operator learns it from
+  a deploy log rather than from somebody's CI output.
 
 Only one thing is decided before the prose: whether this caller may ask at all.
 That needs no interpretation, so an unauthorised caller is refused without spending
 a token.
 
-The model never sees fleet state. Mixing entitlement with availability would make
-the same plea weigh differently depending on who else happened to be running, and
-an unreproducible decision cannot be tested — so a scenario greps the assembled
-prompt for fleet vocabulary and fails if it finds any. Both numbers are logged,
-what the model said and what it was bounded to, because "why did I get 4" has to
-be answerable.
+The fleet reaches the model as **counts and prices, never identities** — how many
+could do the work, how many are free, what the free ones cost per minute. Which
+machines, and who holds the rest, it is never told, because none of that helps
+answer "how many". A policy test therefore pins the fleet as part of its fixture,
+the same way it pins the plea.
+
+Both numbers are logged, what the model said and what it was given, because "why did
+I get 4" has to be answerable.
 
 ```sh
-CM_MODEL_KEY=…   # unset means no model, and the controller still works
+CM_MODEL_KEY=…   # required: no key, no controller
 ```
 
-Because the prompt carries no fleet state, a tenant's policy prompt is byte-identical
-from one plea to the next, so it is sent marked cacheable. The property that keeps
-decisions reproducible is the same one that makes them cheap to repeat.
+The prompt is split by what moves. The policy, the rules and this org's limits go in
+the system block, byte-identical from plea to plea and marked cacheable; the fleet,
+the spend and the plea itself go in the message. Putting the fleet in the cached half
+would change the prefix on every allocation, which is the same as having no cache.
 
 **A folder per tenant, and two files with different owners:**
 

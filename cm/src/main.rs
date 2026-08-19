@@ -338,7 +338,7 @@ struct Control {
     admins: admin::Admins,
     /// Weighs the prose half of a tenant's policy. `Unwired` when no model is
     /// configured, which is a working controller rather than a broken one.
-    adviser: Box<dyn adviser::Adviser>,
+    adviser: adviser::Claude,
     fleet: Mutex<Fleet>,
     /// A channel per registered worker, for pushing orders down its open stream.
     orders: Mutex<std::collections::BTreeMap<String, tokio::sync::mpsc::Sender<Aadesh>>>,
@@ -385,11 +385,11 @@ async fn controller() -> Result<()> {
         );
     }
 
-    let adviser: Box<dyn adviser::Adviser> = match adviser::Claude::from_env() {
-        Some(claude) => Box::new(claude),
-        None => Box::new(adviser::Unwired),
-    };
-    println!("prose weighed by: {}", adviser.describe());
+    // Fatal, and fatal here rather than on the first caller's request. A controller
+    // that came up without a model is one that cannot read anybody's policy, and the
+    // place to learn that is a deploy log, not somebody's CI output.
+    let adviser = adviser::Claude::from_env()?;
+    println!("policy weighed by: {}", adviser.describe());
 
     let secret = keys(&home).secret(&id52::decode(&config.key)?)?;
     let endpoint = sirji::bind(secret.clone()).await?;
@@ -482,29 +482,82 @@ impl Control {
         alias: &str,
         nivedana: &Nivedana,
     ) -> std::result::Result<(u32, Option<String>), Verdict> {
-        let mut tenants = self.tenants.lock().await;
-        let Some(tenant) = tenants.for_caller(alias) else {
-            // Named, but not onboarded. Distinguished from a policy refusal because
-            // the fix is completely different — somebody has to run `cm tenant add`.
-            return Err(Verdict::Deny {
-                rationale: format!("{alias} is not a tenant of this controller"),
-            });
+        // Everything the decision needs, gathered before anything slow happens — and
+        // every lock released before the model call. A 30s network round trip under
+        // the tenants or fleet mutex would serialise every plea in the fleet behind
+        // one caller's request.
+        let (tenant_name, prose, lifetime, host_ceiling, terms, standing, ceiling, wanted) = {
+            let mut tenants = self.tenants.lock().await;
+            let Some(tenant) = tenants.for_caller(alias) else {
+                // Named, but not onboarded. Distinguished from a policy refusal
+                // because the fix is completely different — somebody has to run
+                // `cm tenant add`.
+                return Err(Verdict::Deny {
+                    rationale: format!("{alias} is not a tenant of this controller"),
+                });
+            };
+
+            // Authorisation is deterministic; the number is not. How many machines a
+            // plea deserves is the question the policy was written to answer, so it is
+            // read for every request rather than only the large ones.
+            let (wanted, standing, ceiling) = match tenant.policy.weigh(alias, nivedana) {
+                Ruling::Deny { rationale } => return Err(Verdict::Deny { rationale }),
+                Ruling::Consider { wanted, standing, ceiling } => (wanted, standing, ceiling),
+            };
+            (
+                tenant.alias.clone(),
+                tenant.policy.prose(),
+                tenant.policy.reservation_secs(),
+                tenant.ceiling(),
+                tenant.budget(),
+                standing,
+                ceiling,
+                wanted,
+            )
         };
 
-        // Authorisation is deterministic; the number is not. How many machines a
-        // plea deserves is the question the policy was written to answer, so it is
-        // read for every request rather than only the large ones — a cheap path that
-        // answered small pleas without reading it would make an organisation's own
-        // policy an exception handler.
-        let (wanted, standing, ceiling) = match tenant.policy.weigh(alias, nivedana) {
-            Ruling::Deny { rationale } => return Err(Verdict::Deny { rationale }),
-            Ruling::Consider { wanted, standing, ceiling } => (wanted, standing, ceiling),
+        let dir = tenant::Tenants::dir_in(&self.config.root).join(&tenant_name);
+        let now = fleet::now();
+        let (brief, money) = {
+            let fleet = self.fleet.lock().await;
+            let brief = fleet.brief(&nivedana.capabilities);
+            let money = terms.map(|(budget, window_secs)| adviser::Money {
+                budget,
+                spent: budget::spent(&dir, now, window_secs),
+                committed: fleet.committed(&tenant_name),
+                window_secs,
+            });
+            (brief, money)
         };
+
+        // Two answers that no policy can change, so no model is asked for them. Both
+        // are certain, and they are told apart on purpose: one means give up, the other
+        // means try again in a minute, and a caller with retry logic needs to know
+        // which. (An earlier ordering ran the budget check first and reported *both*
+        // of these as "budget spent", which sent people to look at their credits over
+        // hardware they did not have.)
+        if brief.capable == 0 {
+            return Err(Verdict::Deny {
+                rationale: format!(
+                    "no machine in the fleet can do {:?} — waiting will not change that",
+                    nivedana.capabilities
+                ),
+            });
+        }
+        if brief.free == 0 {
+            return Err(Verdict::Deny {
+                rationale: format!(
+                    "{} machine(s) here can do {:?}, and none are free right now — \
+                     this one is worth retrying",
+                    brief.capable, nivedana.capabilities
+                ),
+            });
+        }
 
         let advice = adviser::Advice {
-            prose: tenant.policy.prose(),
+            prose,
             attested: adviser::Attested {
-                tenant: tenant.alias.clone(),
+                tenant: tenant_name.clone(),
                 caller: alias.to_string(),
             },
             declared: adviser::Declared {
@@ -514,115 +567,87 @@ impl Control {
                 role: nivedana.role.clone(),
             },
             standing,
-            ceiling,
+            // The tightest ceiling that applies, not just the tenant's own. Springing
+            // the host's cap after the fact would make a model argue for a number it
+            // was never allowed to give, and the caller read a rationale for a
+            // decision that did not happen.
+            ceiling: ceiling.min(host_ceiling),
+            lifetime,
+            fleet: brief.clone(),
+            money: money.clone(),
         };
 
-        let (allowed, rationale) = match self.adviser.weigh(&advice).await {
-            Ok(opinion) if opinion.denies() => {
-                println!("the prose refused {alias}: {}", opinion.rationale);
-                return Err(Verdict::Deny { rationale: opinion.rationale });
-            }
-            Ok(opinion) => {
-                let bounded = opinion.bounded(&advice);
-                // Logged with both numbers: "why did I get 12" must be answerable,
-                // and a clamp that left no trace would make an organisation's own
-                // ceiling invisible.
-                println!(
-                    "the prose weighed {alias}: asked {wanted}, said {}, bounded to {bounded} (ceiling {ceiling}) — {}",
-                    opinion.count, opinion.rationale
-                );
-                // Say so only when the *ceiling* is what cut it. Answering above what
-                // was asked for is the model being loose, not the policy being
-                // strict, and blaming the policy for it would send somebody to edit
-                // a file that was never the constraint.
-                let rationale = if opinion.count > ceiling {
-                    format!(
-                        "{} — reduced to {bounded}, this policy's ceiling",
-                        opinion.rationale
-                    )
-                } else {
-                    opinion.rationale
-                };
-                (bounded, Some(rationale))
-            }
+        let opinion = match self.adviser.weigh(&advice).await {
+            Ok(opinion) => opinion,
             Err(e) => {
-                // Unreachable is not permission, and it is not a refusal either: the
-                // standing limit was always available, so fall back to it and say
-                // why. Never above what was asked for — the fallback is a ceiling
-                // here too, not a quota to fill.
-                eprintln!("could not weigh the prose for {alias}: {e:#}");
-                (
-                    standing.min(wanted),
-                    Some(format!(
-                        "the standing limit is {standing}; the reason could not be weighed ({e})"
-                    )),
-                )
+                // No fallback, on purpose. There is no number to substitute that any
+                // organisation asked for, and inventing one here would keep the fleet
+                // running while nobody's policy is being applied.
+                eprintln!("could not weigh policy for {alias}: {e:#}");
+                return Err(Verdict::Unweighed {
+                    rationale: format!("this request could not be weighed: {e}"),
+                });
             }
         };
 
-        // Fewer than asked for is *not* a short circuit. The tenant's ceiling, the
-        // budget and then the fleet each still get their say, and a number returned
-        // before they spoke could be one no machine is free to honour. Only nothing
-        // at all ends the decision here.
+        if opinion.denies() {
+            println!("policy refused {alias}: {}", opinion.rationale);
+            return Err(Verdict::Deny { rationale: opinion.rationale });
+        }
+
+        let said = opinion.count;
+        let mut allowed = opinion.bounded(&advice);
+        let mut rationale = opinion.rationale.clone();
+        println!(
+            "policy weighed {alias}: asked {wanted}, said {said}, giving {allowed} — {rationale}"
+        );
+
+        // The sanity net, applied in one pure place so it can be tested without a
+        // controller, a fleet or a network.
+        let (cut, faults) = sanity(
+            said,
+            allowed,
+            Limit {
+                ceiling: ceiling.min(host_ceiling),
+                free: brief.free,
+                host: host_ceiling,
+                affordable: money.as_ref().map(|m| {
+                    let rates: Vec<u32> =
+                        brief.rates.iter().copied().take(allowed as usize).collect();
+                    budget::Room { budget: m.budget, spent: m.spent, committed: m.committed }
+                        .affordable(&rates, lifetime)
+                }),
+            },
+        );
+        allowed = cut;
+
+        if !faults.is_empty() {
+            // Loudly. A policy that keeps overshooting is a policy nobody has noticed
+            // is wrong, because the clamp has been quietly making it look right.
+            eprintln!(
+                "policy for {tenant_name} overshot limits it was shown ({}) — cut to \
+                 {allowed}. Fix the policy; the prompt stated every one of them.",
+                faults.join("; ")
+            );
+            // The model's sentence argued for a number the caller is not getting, so
+            // it is not an explanation of the one they are.
+            rationale = format!("{allowed} machine(s): {}", faults.join("; "));
+        }
+
         if allowed == 0 {
+            // In cm's own words. The model's sentence argued for a number nobody is
+            // getting, and printing it beside a refusal produced denials that read
+            // "granted what was asked" — true of the argument, false of the outcome.
             return Err(Verdict::Deny {
-                rationale: rationale.unwrap_or_else(|| "no machines were granted".into()),
+                rationale: if faults.is_empty() {
+                    format!("this policy granted none of the {wanted} asked for")
+                } else {
+                    faults.join("; ")
+                },
             });
         }
 
-        // Say which limit bit them. "You get 10" without a reason invites somebody
-        // to go and edit a policy that was never the constraint.
-        let (allowed, capped) = tenant.clamp(allowed);
-        let rationale = capped.or(rationale);
-
-        // Third clamp: money. A ceiling of three machines says nothing about whether
-        // they run for a minute or a fortnight, and the fortnight is what somebody
-        // pays for.
-        if let Some((budget_credits, window)) = tenant.budget() {
-            let name = tenant.alias.clone();
-            let lifetime = tenant.policy.reservation_secs();
-            let wanted = nivedana.capabilities.clone();
-            drop(tenants);
-
-            let dir = tenant::Tenants::dir_in(&self.config.root).join(&name);
-            let now = fleet::now();
-            let (room, rates) = {
-                let fleet = self.fleet.lock().await;
-                // Price the machines that would *actually* be picked, in the order
-                // they would be picked. Machines are not interchangeable, and
-                // pricing them all at the cheapest over-permits.
-                let rates = fleet.rates_for(&wanted, allowed);
-                let room = budget::Room {
-                    budget: budget_credits,
-                    spent: budget::spent(&dir, now, window),
-                    committed: fleet.committed(&name),
-                };
-                (room, rates)
-            };
-
-            let affordable = room.affordable(&rates, lifetime);
-            if affordable == 0 {
-                return Err(Verdict::Deny {
-                    rationale: format!(
-                        "budget spent: {} of {budget_credits} credit(s) used or committed \
-                         in the last {window}s",
-                        room.spent + room.committed
-                    ),
-                });
-            }
-            if affordable < allowed {
-                return Ok((
-                    affordable,
-                    Some(format!(
-                        "{allowed} allowed, but {} credit(s) left of {budget_credits} \
-                         buys {affordable}",
-                        room.left()
-                    )),
-                ));
-            }
-        }
-
-        Ok((allowed, rationale))
+        Ok((allowed, Some(rationale)))
     }
 
     /// Write a closed reservation into its tenant's ledger.
@@ -906,6 +931,59 @@ impl Caller {
         }
         self
     }
+}
+
+/// Every bound that is re-checked after the model has answered.
+///
+/// All four were in the prompt. This exists for the case where the answer ignored one
+/// anyway — a policy that argues past its own ceiling, a model that misreads a
+/// number, a fleet that emptied between the brief and the answer.
+struct Limit {
+    /// The organisation's own `max_limit`.
+    ceiling: u32,
+    /// Machines free right now.
+    free: u32,
+    /// The host's cap on this tenant, whatever their policy says.
+    host: u32,
+    /// What the budget can buy, when there is one.
+    affordable: Option<u32>,
+}
+
+/// Cut an answer to what is actually possible, and say what had to be cut.
+///
+/// A returned fault is a **defect report**, not a normal outcome: every limit it names
+/// was stated in the prompt, availability included, so exceeding one means the policy
+/// argued past a number it was shown.
+///
+/// A fleet that empties *after* this is a different matter and reports nothing: the
+/// brief is a snapshot, `choose` re-checks what is free at the moment of allocation,
+/// and a busy afternoon is nobody's mistake.
+fn sanity(said: u32, bounded: u32, limit: Limit) -> (u32, Vec<String>) {
+    let mut faults = Vec::new();
+    let mut allowed = bounded;
+
+    if said > limit.ceiling {
+        faults.push(format!("proposed {said} against a stated ceiling of {}", limit.ceiling));
+    }
+    if said > limit.free {
+        faults.push(format!("proposed {said} with only {} machine(s) free", limit.free));
+    }
+    allowed = allowed.min(limit.free);
+
+    if allowed > limit.host {
+        faults.push(format!(
+            "proposed {allowed} against this tenant's host ceiling of {}",
+            limit.host
+        ));
+        allowed = limit.host;
+    }
+    if let Some(affordable) = limit.affordable
+        && affordable < allowed
+    {
+        faults.push(format!("proposed {allowed}, but the budget buys {affordable}"));
+        allowed = affordable;
+    }
+    (allowed, faults)
 }
 
 /// Policy decides entitlement; the fleet decides availability. Both must agree.
@@ -2286,6 +2364,7 @@ async fn ping(target: &str) -> Result<std::process::ExitCode> {
                 std::process::ExitCode::SUCCESS
             }
             Verdict::Deny { rationale } => bad("auth", rationale),
+            Verdict::Unweighed { rationale } => bad("controller", rationale),
             other => bad("auth", format!("unexpected answer: {other:?}")),
         };
 
@@ -2388,6 +2467,12 @@ async fn run(session: Session) -> Result<Results> {
                 return Ok(Vec::new());
             }
             Verdict::Deny { rationale } => bail!("denied: {rationale}"),
+            // Not a refusal. Nobody read the request, so the fix is the controller's,
+            // and saying "denied" would send the caller to argue with a policy that
+            // was never consulted.
+            Verdict::Unweighed { rationale } => {
+                bail!("undecided: {rationale}\n  nothing was refused — the controller could not weigh this. Tell whoever runs it.")
+            }
             other => bail!("expected a verdict on our plea, got {other:?}"),
         };
         println!("  expires in {expires_in}s unless released");
@@ -2715,6 +2800,73 @@ mod tests {
         assert_ne!(written[0], written[1]);
         assert_eq!(std::fs::read(&written[1]).unwrap(), b"shard 1");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn limit() -> Limit {
+        Limit { ceiling: 10, free: 8, host: 6, affordable: Some(5) }
+    }
+
+    #[test]
+    fn an_answer_inside_every_limit_is_left_alone_and_reports_nothing() {
+        // The ordinary case. A fault list that is never empty is a fault list nobody
+        // reads, so staying silent when there is nothing wrong is the whole point.
+        let (allowed, faults) = sanity(4, 4, limit());
+        assert_eq!(allowed, 4);
+        assert!(faults.is_empty(), "{faults:?}");
+    }
+
+    #[test]
+    fn overshooting_a_limit_that_was_in_the_prompt_is_reported_as_a_fault() {
+        // Every one of these was stated to the model. Hitting one is not the system
+        // working as designed — it means the policy argues past its own numbers, and
+        // somebody has to be told rather than have the clamp hide it.
+        let (allowed, faults) = sanity(99, 99, limit());
+        assert_eq!(allowed, 5, "cut to what the budget buys");
+        assert!(faults.iter().any(|f| f.contains("stated ceiling of 10")), "{faults:?}");
+        assert!(faults.iter().any(|f| f.contains("only 8 machine(s) free")), "{faults:?}");
+        assert!(faults.iter().any(|f| f.contains("host ceiling of 6")), "{faults:?}");
+        assert!(faults.iter().any(|f| f.contains("budget buys 5")), "{faults:?}");
+    }
+
+    #[test]
+    fn promising_machines_it_was_told_were_busy_is_a_fault_too() {
+        // The free count is in the prompt like every other limit, so proposing past it
+        // is the same class of defect as proposing past the ceiling — not the fleet
+        // having moved, which happens later and reports nothing.
+        let (allowed, faults) =
+            sanity(3, 3, Limit { ceiling: 10, free: 1, host: 6, affordable: None });
+        assert_eq!(allowed, 1);
+        assert!(faults.iter().any(|f| f.contains("only 1 machine(s) free")), "{faults:?}");
+        assert!(faults.iter().all(|f| !f.contains("host")), "{faults:?}");
+    }
+
+    #[test]
+    fn availability_wins_over_everything_policy_permits() {
+        // Granting machines that are not there is the one error a caller cannot work
+        // around: they would be handed a reservation the fleet cannot honour.
+        let (allowed, _) =
+            sanity(6, 6, Limit { ceiling: 100, free: 0, host: 100, affordable: Some(100) });
+        assert_eq!(allowed, 0);
+    }
+
+    #[test]
+    fn a_zero_from_the_model_is_explained_by_the_faults_not_the_model() {
+        // A "granted what you asked for" sentence printed beside a refusal is worse
+        // than no reason at all: it describes the argument, not the outcome.
+        let (allowed, faults) =
+            sanity(0, 0, Limit { ceiling: 10, free: 8, host: 6, affordable: Some(5) });
+        assert_eq!(allowed, 0);
+        assert!(faults.is_empty(), "nothing overshot — the model simply said none");
+    }
+
+    #[test]
+    fn a_tenant_with_no_budget_is_not_treated_as_having_none() {
+        // `None` means unmetered, and reading it as zero would refuse every request
+        // from every self-hosted tenant that never set a budget.
+        let (allowed, faults) =
+            sanity(6, 6, Limit { ceiling: 10, free: 8, host: 10, affordable: None });
+        assert_eq!(allowed, 6);
+        assert!(faults.is_empty(), "{faults:?}");
     }
 
     fn held(state: State) -> Held {

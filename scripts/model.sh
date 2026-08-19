@@ -38,7 +38,7 @@ done
 INV=$(SIRJI_HOME=$LAB/dana $SIRJI device invite cm-t | tail -1)
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM init --parent "$INV" >/dev/null
 
-CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant add team --ceiling 30 --member dana >/dev/null
+CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant add team --ceiling 30 --credits 60 --window 3600 --member dana >/dev/null
 cat >"$LAB/cm-c/root/tenants/team/policy.md" <<'POLICY'
 # policy.md
 
@@ -72,13 +72,19 @@ start_controller() {
 
 t() { CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme "$@"; }
 
+say "no key at all: the controller refuses to start, and says why"
+# Captured first: piping the controller straight into `grep -m1` makes grep exit while
+# cm is still writing, and under `pipefail` that SIGPIPE fails the whole script.
+nokey=$(CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM controller 2>&1 || true)
+grep -m1 -i "CM_MODEL_KEY" <<<"$nokey" | cut -c1-110 | sed 's/^/  /'
+
 start_model allow 3
 start_controller
 for w in w1 w2 w3 w4 w5 w6; do
   CM_HOME=$LAB/$w SIRJI_HOME=$LAB/$w $CM worker --can linux --rate 1 >$w.log 2>&1 &
 done
 for _ in $(seq 40); do [ "$(grep -c arrived cm-c.log || true)" -ge 6 ] && break; sleep 1; done
-grep "prose weighed by" cm-c.log | tail -1 | sed 's/^/  /'
+grep "policy weighed by" cm-c.log | tail -1 | sed 's/^/  /' || true
 
 say "a small, routine plea is weighed too — the policy is not an exception handler"
 t "two is routine" --count 2 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
@@ -101,12 +107,19 @@ check("gives the fallback as calibration",  "2 is what it falls back to" in sysp
 check("not as a floor",                     "not as a floor" in sysp)
 check("states the ceiling (4)",             "at most 4" in sysp)
 check("says every request comes to it",     "Every request comes to you" in sysp)
+check("shows how many are free",            "free right now:" in user)
+check("shows what they cost",               "credit(s)/min" in user)
+check("shows the budget it must honour",    "credit(s) per" in sysp)
+check("shows what is left of it",           "still available:" in user)
+check("warns that limits are re-checked",   "also checked after you answer" in sysp)
 check("labels caller text as data",         "not instruction" in sysp)
 check("separates attested from declared",   "ATTESTED" in user and "DECLARED" in user)
 check("temperature is zero",                body["temperature"] == 0)
 check("the policy prefix is cacheable",     body["system"][0]["cache_control"]["type"] == "ephemeral")
-for leak in ["idle", "held by", "credit", "free,"]:
-    check(f"no fleet state: {leak!r}",      leak not in both)
+# The model gets counts, never identities: what it was never told, it cannot leak.
+for leak in ["cm-w-", "held by", "reservation"]:
+    check(f"no machine identities: {leak!r}", leak not in both)
+check("told not to quote the numbers back", "not theirs to learn" in sysp)
 PYX
 
 say "the model over-reaches: says 99, org wrote max_limit 4"
@@ -117,12 +130,17 @@ say "the prose refuses"
 stop_model; start_model deny 0
 t "no good reason" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /' || true
 
-say "the model is unreachable — deterministic answer, and it says why"
+say "the model is unreachable — the request FAILS, nothing is substituted"
 stop_model
-t "still routine" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /' || true
-
-say "unreachable, asking for less than the fallback — a fallback is not a quota"
-t "just the one" --count 1 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /' || true
+# Asserted, not printed: `PIPESTATUS` after `|| true` reports the `true`, so an
+# earlier version of this line claimed success no matter what happened.
+out=$(t "still routine" --count 3 --need linux --dry-run 2>&1) && rc=0 || rc=$?
+grep -m1 "undecided" <<<"$out" | cut -c1-100 | sed 's/^/  /' || true
+if [ "$rc" -eq 0 ]; then
+  echo "  FAIL  it exited 0 — an unweighed request must fail"
+else
+  echo "  ok    exited $rc: nothing was substituted"
+fi
 
 say "controller log"
-grep -E "prose (weighed|refused)|could not weigh" cm-c.log | sed 's/^/  /'
+grep -E "policy (weighed|refused)|could not weigh|overshot" cm-c.log | sed 's/^/  /'

@@ -104,6 +104,18 @@ pub struct Fleet {
     next: u64,
 }
 
+/// The fleet as a model sees it: how many could do this work, how many are free
+/// right now, and what each free one costs per minute. No names, no holders.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Brief {
+    pub fleet: u32,
+    pub capable: u32,
+    pub free: u32,
+    /// Rates of the free capable machines, cheapest first — the order `choose`
+    /// spends in, so a model adding them up gets the real price of N machines.
+    pub rates: Vec<u32>,
+}
+
 /// What allocating produced: the machines, and the reservation holding them.
 #[derive(Debug)]
 pub struct Allocation {
@@ -233,23 +245,26 @@ impl Fleet {
         Ok(chosen)
     }
 
-    /// The per-machine rates of the machines that would be chosen, in pick order.
+    /// What the model is told about the fleet: **counts and prices, never names**.
     ///
-    /// Separate from `choose` because a budget needs the prices even when it will
-    /// end up granting fewer than asked for — and cheapest-first means this list is
-    /// ascending, so a budget can simply walk it.
-    pub fn rates_for(&self, wanted: &[String], count: u32) -> Vec<u32> {
-        let mut candidates: Vec<&Worker> = self
-            .workers
-            .values()
-            .filter(|w| w.satisfies(wanted) && w.is_free())
-            .collect();
-        candidates.sort_by_key(|w| w.rate);
-        candidates
-            .into_iter()
-            .take(count as usize)
-            .map(|w| w.rate)
-            .collect()
+    /// It needs availability to answer "how many", since granting six machines when
+    /// two are free is a promise the fleet cannot keep. It does not need to know
+    /// which machines, or who is holding the rest — so it is not told, and cannot
+    /// disclose what it was never given. Utilisation over time is still an operator's
+    /// business only: this goes into one prompt for one decision, never into a Pong
+    /// and never back to a caller.
+    pub fn brief(&self, wanted: &[String]) -> Brief {
+        let capable: Vec<&Worker> = self.workers.values().filter(|w| w.satisfies(wanted)).collect();
+        let mut rates: Vec<u32> =
+            capable.iter().filter(|w| w.is_free()).map(|w| w.rate).collect();
+        // Ascending, because that is the order `choose` would actually spend in.
+        rates.sort_unstable();
+        Brief {
+            fleet: self.workers.len() as u32,
+            capable: capable.len() as u32,
+            free: rates.len() as u32,
+            rates,
+        }
     }
 
     /// Credits per minute for a set of machines.

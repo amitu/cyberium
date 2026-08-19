@@ -106,22 +106,12 @@ impl Tenant {
 }
 
 impl Tenant {
-    /// How many machines this tenant may have, given what their policy allowed.
+    /// The host's hard cap on this tenant, whatever their own policy says.
     ///
-    /// Returns the number and, when it was cut, why — so a caller reading "you get
-    /// 10" is told it was the ceiling rather than left to guess at their own policy.
-    pub fn clamp(&self, allowed: u32) -> (u32, Option<String>) {
-        if allowed <= self.terms.ceiling {
-            (allowed, None)
-        } else {
-            (
-                self.terms.ceiling,
-                Some(format!(
-                    "policy allowed {allowed}, capped at this tenant's ceiling of {}",
-                    self.terms.ceiling
-                )),
-            )
-        }
+    /// Shown to the model, and re-checked after it answers. Cutting an over-large
+    /// answer down to it lives with the other post-checks, in `sanity`.
+    pub fn ceiling(&self) -> u32 {
+        self.terms.ceiling
     }
 }
 
@@ -365,11 +355,9 @@ mod tests {
         let mut tenants = Tenants::load(&root).unwrap();
         let tenant = tenants.for_caller("acme").unwrap();
 
-        assert_eq!(tenant.clamp(3), (3, None), "under the ceiling, untouched");
-        let (count, why) = tenant.clamp(50);
-        assert_eq!(count, 4);
-        // The caller is told which limit bit them, since it is not their own.
-        assert!(why.unwrap().contains("ceiling of 4"));
+        // The host's number, not the tenant's. What cuts an over-large answer down to
+        // it lives with the other post-checks in `sanity`, which is tested there.
+        assert_eq!(tenant.ceiling(), 4);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -383,7 +371,7 @@ mod tests {
         let mut tenants = Tenants::load(&root).unwrap();
         let tenant = tenants.for_caller("acme").unwrap();
         assert_eq!(tenant.terms.ceiling, Terms::default().ceiling);
-        assert_eq!(tenant.clamp(9999).0, Terms::default().ceiling);
+        assert_eq!(tenant.ceiling(), Terms::default().ceiling);
         std::fs::remove_dir_all(&root).ok();
     }
 

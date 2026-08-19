@@ -1,9 +1,9 @@
 # Budgets, and the unit they are counted in
 
-> **Status: built**, in its deterministic form. Worker rates, cost on close, the
-> per-tenant ledger, the two rolling-window budgets and the clamp all run. What is
-> **not** built: currency conversion, prose budgets (they need the model), and the
-> named-calendar windows described below — the rolling window is what works today.
+> **Status: built.** Worker rates, cost on close, the per-tenant ledger, the two
+> rolling-window budgets, the post-check, and the budget going *into* the model's
+> prompt all run. What is **not** built: currency conversion and the named-calendar
+> windows described below — the rolling window is what works today.
 
 Allocation without a budget is only half an allocator. A ceiling of three machines
 says nothing about whether those three ran for a minute or a fortnight, and the
@@ -176,19 +176,25 @@ Cost: a tz database dependency, once the model half exists. Worth it, and narrow
 than the alternative — a schema of per-team timezone fields, DST flags and fiscal
 calendars that would never stop growing.
 
-### The deterministic half needs no calendar at all
+### The fenced budget needs no calendar at all
 
-The cheap gate cannot wait for a model, so budgets in the fenced block are a
-**rolling window in seconds**:
+Budgets in the fenced block are a **rolling window in seconds**:
 
 ```yaml
 daily_budget: 4000
 budget_window: 86400        # rolling, from now
 ```
 
-A rolling 24 hours needs no timezone, no DST and no tz database — which is why the
-deterministic path can enforce a budget today and stay correct. A named calendar is
-what you graduate to when a team needs their day to start at 08:00.
+A rolling 24 hours needs no timezone, no DST and no tz database, which is why this is
+what got built first and stays correct. A named calendar is what you graduate to when a
+team needs their day to start at 08:00.
+
+The budget reaches the model as well as the post-check: how many credits the window
+allows, what has been spent, what open grants have committed, and the rate of each free
+machine. So a model can be asked "can this wait until tomorrow?" and answer it, rather
+than proposing a number that a clamp then quietly reduces. The deterministic check
+still runs afterwards — but if it ever bites, the policy argued past a figure it was
+shown, and that is logged as a fault to fix.
 
 ### The ledger
 

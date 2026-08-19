@@ -119,6 +119,18 @@ pub enum Verdict {
     Counter { count: u32, rationale: String },
     /// Refused, with a reason the caller can act on.
     Deny { rationale: String },
+
+    /// Nothing was decided: the policy could not be weighed at all.
+    ///
+    /// Distinct from `Deny` because the caller has not been refused — nobody read
+    /// their request. Retrying is reasonable, and an operator needs to fix something.
+    ///
+    /// The alternative was to substitute a number and grant it. That is worse than
+    /// failing: it hands out machines on cm's authority rather than the
+    /// organisation's, and it does so invisibly, at exactly the moment the component
+    /// that reads the policy has stopped working. A fleet that keeps running while
+    /// nobody's rules are being applied is not a working fleet.
+    Unweighed { rationale: String },
     /// Acknowledged — the answer to a release.
     Ok,
     /// What a rehearsal would have got, as things stand right now.
