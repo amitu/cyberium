@@ -491,67 +491,84 @@ impl Control {
             });
         };
 
-        let (allowed, rationale) = match tenant.policy.weigh(alias, nivedana) {
+        // Authorisation is deterministic; the number is not. How many machines a
+        // plea deserves is the question the policy was written to answer, so it is
+        // read for every request rather than only the large ones — a cheap path that
+        // answered small pleas without reading it would make an organisation's own
+        // policy an exception handler.
+        let (wanted, standing, ceiling) = match tenant.policy.weigh(alias, nivedana) {
             Ruling::Deny { rationale } => return Err(Verdict::Deny { rationale }),
-            Ruling::Counter { count, rationale } => {
-                return Err(Verdict::Counter { count, rationale });
-            }
-            Ruling::Allow { count, rationale } => (count, rationale),
+            Ruling::Consider { wanted, standing, ceiling } => (wanted, standing, ceiling),
+        };
 
-            // The deterministic half has no answer, so the prose gets a say.
-            Ruling::Consider { wanted, standing, max } => {
-                let advice = adviser::Advice {
-                    prose: tenant.policy.prose(),
-                    attested: adviser::Attested {
-                        tenant: tenant.alias.clone(),
-                        caller: alias.to_string(),
-                    },
-                    declared: adviser::Declared {
-                        why: nivedana.why.clone(),
-                        count: wanted,
-                        capabilities: nivedana.capabilities.clone(),
-                        role: nivedana.role.clone(),
-                    },
-                    standing,
-                    max,
+        let advice = adviser::Advice {
+            prose: tenant.policy.prose(),
+            attested: adviser::Attested {
+                tenant: tenant.alias.clone(),
+                caller: alias.to_string(),
+            },
+            declared: adviser::Declared {
+                why: nivedana.why.clone(),
+                count: wanted,
+                capabilities: nivedana.capabilities.clone(),
+                role: nivedana.role.clone(),
+            },
+            standing,
+            ceiling,
+        };
+
+        let (allowed, rationale) = match self.adviser.weigh(&advice).await {
+            Ok(opinion) if opinion.denies() => {
+                println!("the prose refused {alias}: {}", opinion.rationale);
+                return Err(Verdict::Deny { rationale: opinion.rationale });
+            }
+            Ok(opinion) => {
+                let bounded = opinion.bounded(&advice);
+                // Logged with both numbers: "why did I get 12" must be answerable,
+                // and a clamp that left no trace would make an organisation's own
+                // ceiling invisible.
+                println!(
+                    "the prose weighed {alias}: asked {wanted}, said {}, bounded to {bounded} (ceiling {ceiling}) — {}",
+                    opinion.count, opinion.rationale
+                );
+                // Say so only when the *ceiling* is what cut it. Answering above what
+                // was asked for is the model being loose, not the policy being
+                // strict, and blaming the policy for it would send somebody to edit
+                // a file that was never the constraint.
+                let rationale = if opinion.count > ceiling {
+                    format!(
+                        "{} — reduced to {bounded}, this policy's ceiling",
+                        opinion.rationale
+                    )
+                } else {
+                    opinion.rationale
                 };
-                match self.adviser.weigh(&advice).await {
-                    Ok(opinion) if opinion.denies() => {
-                        println!("the prose refused {alias}: {}", opinion.rationale);
-                        return Err(Verdict::Deny { rationale: opinion.rationale });
-                    }
-                    Ok(opinion) => {
-                        let bounded = opinion.bounded(&advice);
-                        // Logged with both numbers: "why did I get 12" must be
-                        // answerable, and a clamp that left no trace would make an
-                        // organisation's own ceiling invisible.
-                        println!(
-                            "the prose weighed {alias}: asked {wanted}, said {}, bounded to {bounded} (max {max}) — {}",
-                            opinion.count, opinion.rationale
-                        );
-                        if bounded < wanted {
-                            return Err(Verdict::Counter {
-                                count: bounded,
-                                rationale: opinion.rationale,
-                            });
-                        }
-                        (bounded, Some(opinion.rationale))
-                    }
-                    Err(e) => {
-                        // Unreachable is not permission, and it is not a refusal
-                        // either: the deterministic answer was always available, so
-                        // fall back to it and say why.
-                        eprintln!("could not weigh the prose for {alias}: {e:#}");
-                        return Err(Verdict::Counter {
-                            count: standing,
-                            rationale: format!(
-                                "the standing limit is {standing}; the reason could not be weighed ({e})"
-                            ),
-                        });
-                    }
-                }
+                (bounded, Some(rationale))
+            }
+            Err(e) => {
+                // Unreachable is not permission, and it is not a refusal either: the
+                // standing limit was always available, so fall back to it and say
+                // why. Never above what was asked for — the fallback is a ceiling
+                // here too, not a quota to fill.
+                eprintln!("could not weigh the prose for {alias}: {e:#}");
+                (
+                    standing.min(wanted),
+                    Some(format!(
+                        "the standing limit is {standing}; the reason could not be weighed ({e})"
+                    )),
+                )
             }
         };
+
+        // Fewer than asked for is *not* a short circuit. The tenant's ceiling, the
+        // budget and then the fleet each still get their say, and a number returned
+        // before they spoke could be one no machine is free to honour. Only nothing
+        // at all ends the decision here.
+        if allowed == 0 {
+            return Err(Verdict::Deny {
+                rationale: rationale.unwrap_or_else(|| "no machines were granted".into()),
+            });
+        }
 
         // Say which limit bit them. "You get 10" without a reason invites somebody
         // to go and edit a policy that was never the constraint.

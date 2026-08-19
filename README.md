@@ -323,29 +323,44 @@ If a request asserts a production incident and names an incident tracker URL,
 allow up to 5x the standing limit for one hour, then re-evaluate.
 ```
 
-The fenced block is read **deterministically** and decides who may even ask — an
-unauthorised caller is refused before any model is consulted, so the cheap gate
-stays cheap. Everything after it is prose, to be weighed by a model against the
+The fenced block is read **deterministically** and settles who may even ask — an
+unauthorised caller is refused before any model is consulted, so a security decision
+never waits on a token. Everything after it is prose, weighed by a model against the
 reason the caller actually gave.
 
 Policy decides *entitlement*; it never picks machines. What is free, and which of
 them can do the work, is the fleet's business — keeping those apart is what lets
 policy stay a text file.
 
-**The model is asked only when the deterministic half runs out of answer**, and
-only within a number a human wrote:
+**Every plea is weighed against the prose** — one model call, and the number it
+returns *is* the allocation. Not a fast path that answers the easy ones and a model
+for the rest: how many machines a request deserves is the question the policy was
+written to answer, and a number arrived at without reading it would be a default
+wearing the organisation's name.
 
 ```yaml
-standing_limit: 2      # granted without argument
-max_limit: 4           # the most the *prose* may grant. Absent means it may not.
+standing_limit: 2      # the answer when the prose *cannot* be weighed
+max_limit: 4           # the most any interpretation may grant. Absent means it
+                       # may lower a number but never raise one.
 ```
 
-Below the standing limit no model is consulted at all — the common case never
-leaves the machine. Above it the prose gets a say, bounded three ways that hold
-whatever comes back: the answer is clamped to `max_limit` and to what was actually
-asked for, a refusal is always honoured, and a model that times out falls back to
-the standing limit and says so. A fleet that stopped working because an API was
-down would be worse than one with no prose at all.
+Both are bounds on the answer, not stages before it. `max_limit` is a ceiling a
+human wrote and the model never exceeds; `standing_limit` is what this organisation
+stands behind with nothing interpreted — which is exactly the right answer when
+nothing can be, and nothing more than that:
+
+- **The answer is clamped** to `max_limit` and to what was actually asked for. Told
+  to hand out 99 against a `max_limit` of 4, it hands out 4. The model argues; it
+  never becomes the gate.
+- **A refusal is always honoured.** Clamping is one-directional, and down is safe.
+- **Unreachable is not permission.** No key, a timeout, an API having a bad day —
+  the standing limit answers and says so in the rationale. A fleet that stopped
+  working because a model was down would be worse than one with no prose at all.
+  With no key at all `cm` still allocates; it just says the prose went unread.
+
+Only one thing is decided before the prose: whether this caller may ask at all.
+That needs no interpretation, so an unauthorised caller is refused without spending
+a token.
 
 The model never sees fleet state. Mixing entitlement with availability would make
 the same plea weigh differently depending on who else happened to be running, and
@@ -357,6 +372,10 @@ be answerable.
 ```sh
 CM_MODEL_KEY=…   # unset means no model, and the controller still works
 ```
+
+Because the prompt carries no fleet state, a tenant's policy prompt is byte-identical
+from one plea to the next, so it is sent marked cacheable. The property that keeps
+decisions reproducible is the same one that makes them cheap to repeat.
 
 **A folder per tenant, and two files with different owners:**
 

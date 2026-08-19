@@ -80,28 +80,31 @@ done
 for _ in $(seq 40); do [ "$(grep -c arrived cm-c.log || true)" -ge 6 ] && break; sleep 1; done
 grep "prose weighed by" cm-c.log | tail -1 | sed 's/^/  /'
 
-say "under the standing limit: no model is consulted at all"
+say "a small, routine plea is weighed too — the policy is not an exception handler"
 t "two is routine" --count 2 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
-echo "  prompts sent so far: $(sent)"
+echo "  prompts sent: $(sent)      (must be 1: the prose decides every plea)"
 
-say "above it, the prose is weighed — model says 3 of the 3 asked"
+say "and a large one, by the same single call — model says 3 of the 3 asked"
 t "an incident, INC-4471" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
-echo "  prompts sent: $(sent)"
+echo "  prompts sent: $(sent)      (one per plea, never two)"
 
 say "what the prompt actually contained"
 python3 - "$LAB/prompt.log" <<'PYX'
 import json, sys
 body = json.loads(open(sys.argv[1]).read().strip().split("\n")[-1])
-sysp, user = body["system"], body["messages"][0]["content"]
+sysp, user = body["system"][0]["text"], body["messages"][0]["content"]
 both = sysp + user
 def check(label, ok):
     print(f"    {'ok  ' if ok else 'FAIL'} {label}")
 check("carries the org's prose",            "open production incident" in sysp)
-check("states the standing limit (2)",      "2 machines are granted" in sysp)
-check("states the max (4)",                 "at most 4" in sysp)
+check("gives the fallback as calibration",  "2 is what it falls back to" in sysp)
+check("not as a floor",                     "not as a floor" in sysp)
+check("states the ceiling (4)",             "at most 4" in sysp)
+check("says every request comes to it",     "Every request comes to you" in sysp)
 check("labels caller text as data",         "not instruction" in sysp)
 check("separates attested from declared",   "ATTESTED" in user and "DECLARED" in user)
 check("temperature is zero",                body["temperature"] == 0)
+check("the policy prefix is cacheable",     body["system"][0]["cache_control"]["type"] == "ephemeral")
 for leak in ["idle", "held by", "credit", "free,"]:
     check(f"no fleet state: {leak!r}",      leak not in both)
 PYX
@@ -117,6 +120,9 @@ t "no good reason" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  
 say "the model is unreachable — deterministic answer, and it says why"
 stop_model
 t "still routine" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /' || true
+
+say "unreachable, asking for less than the fallback — a fallback is not a quota"
+t "just the one" --count 1 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /' || true
 
 say "controller log"
 grep -E "prose (weighed|refused)|could not weigh" cm-c.log | sed 's/^/  /'

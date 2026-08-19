@@ -4,14 +4,16 @@
 //! rule that lives in two places eventually disagrees with itself.
 //!
 //! It has two halves on purpose. The fenced `grants` block is read
-//! **deterministically** and decides who may even ask — an unauthorised caller is
-//! refused without a model ever being consulted, so the cheap gate stays cheap.
-//! Everything else is prose, weighed by a model against the requester's actual
-//! reason.
+//! **deterministically** and settles the one question that needs no interpretation:
+//! who may ask at all. An unauthorised caller is refused without a model ever being
+//! consulted.
 //!
-//! The model half is not yet wired: this reads the grants and applies the standing
-//! limit. That is deliberate sequencing — the transport, the identity and the
-//! refusal paths are worth proving before anything non-deterministic joins in.
+//! Everything else is prose, and the prose is where the number comes from — every
+//! plea, not only the large ones. The block's limits bound that answer rather than
+//! pre-empting it: `max_limit` is a ceiling interpretation may not exceed, and
+//! `standing_limit` is what this org stands behind when the prose cannot be weighed
+//! at all. Answering the ordinary case from the block alone would leave a policy
+//! that only spoke about exceptions.
 
 use std::path::{Path, PathBuf};
 
@@ -29,8 +31,9 @@ pub fn path_in(root: &Path) -> PathBuf {
 const STARTER: &str = r#"# policy.md
 
 Who may ask, and for how much. The fenced block below is read deterministically —
-a caller outside `requesters` is refused before any model is consulted. Everything
-after it is prose, weighed against the reason the caller gave.
+a caller outside `requesters` is refused before any model is consulted, and no
+answer ever exceeds the limits set here. Everything after it is prose, and the prose
+is what decides how many machines a request deserves.
 
 ```yaml
 requesters:
@@ -56,30 +59,26 @@ For everything else, apply the standing budget.
 /// What policy permits. Not a verdict: a verdict also depends on what is free.
 #[derive(Debug, Clone)]
 pub enum Ruling {
-    Allow {
-        count: u32,
-        rationale: Option<String>,
-    },
-    Counter {
-        count: u32,
-        rationale: String,
-    },
     Deny {
         rationale: String,
     },
-    /// The deterministic half has no answer: the prose must decide.
+    /// The plea reached the prose, which is where the number comes from.
     ///
     /// Returned rather than resolved here so `policy.rs` stays synchronous and pure.
     /// The model call needs a runtime, a network, a key and a timeout, and all four
     /// already live at the controller — putting them here would make every test of
     /// the cheap gate drag them along.
     Consider {
-        /// What the caller asked for.
+        /// What the caller asked for. An upper bound on the answer: nobody is given
+        /// machines they did not ask for.
         wanted: u32,
-        /// What they get without argument.
+        /// The answer when the prose cannot be weighed — no model configured, or the
+        /// call failed. Not a floor, and not a fast path: the deterministic number
+        /// this organisation is willing to stand behind with nothing interpreted.
         standing: u32,
-        /// The most the prose may grant. **Never** exceeded, whatever the model says.
-        max: u32,
+        /// The most any interpretation may grant. **Never** exceeded, whatever the
+        /// model says.
+        ceiling: u32,
     },
 }
 
@@ -153,40 +152,28 @@ impl Policy {
     /// those apart is what lets policy stay a text file.
     pub fn weigh(&self, asker: &str, nivedana: &Nivedana) -> Ruling {
         if !self.may_ask(asker) {
-            // The deterministic gate: refused without spending a token.
+            // The one thing that needs no interpretation: whether this caller may
+            // ask at all. Refused without spending a token.
             return Ruling::Deny {
                 rationale: format!("{asker} is not in the requesters list"),
             };
         }
 
-        let wanted = nivedana.count.unwrap_or(1);
-        if wanted <= self.grants.standing_limit {
-            return Ruling::Allow {
-                count: wanted,
-                rationale: Some(format!(
-                    "within the standing limit of {}",
-                    self.grants.standing_limit
-                )),
-            };
-        }
-
-        // Above the standing limit, the prose gets a say — but only up to a number
-        // this organisation wrote down. With no `max_limit`, prose cannot expand
-        // entitlement and the answer stays deterministic.
-        match self.grants.max_limit {
-            Some(max) if max > self.grants.standing_limit => Ruling::Consider {
-                wanted,
-                standing: self.grants.standing_limit,
-                max,
-            },
-            _ => Ruling::Counter {
-                count: self.grants.standing_limit,
-                rationale: format!(
-                    "the standing limit is {}, and this policy sets no max_limit, so \
-                     the prose cannot raise it",
-                    self.grants.standing_limit
-                ),
-            },
+        // Everything else is the prose's to decide. How many machines a plea deserves
+        // is exactly the question the policy was written to answer, so a number
+        // arrived at without reading it would not be this organisation's answer — it
+        // would be a default wearing its name.
+        //
+        // A `max_limit` below the standing limit is a contradiction in the file, not
+        // a tighter rule: the standing limit is the firmer promise, so it wins.
+        let standing = self.grants.standing_limit;
+        Ruling::Consider {
+            wanted: nivedana.count.unwrap_or(1),
+            standing,
+            // Absent `max_limit`, interpretation can lower a number but never raise
+            // one. That is the default on purpose: a model should only be able to
+            // exceed the standing limit where somebody wrote down how far.
+            ceiling: self.grants.max_limit.unwrap_or(standing).max(standing),
         }
     }
 
@@ -328,7 +315,7 @@ mod tests {
     fn the_starter_policy_parses() {
         let p = policy(STARTER);
         assert!(p.may_ask("anyone-at-all"));
-        assert!(matches!(p.weigh("dana", &plea(Some(3))), Ruling::Allow { .. }));
+        assert!(matches!(p.weigh("dana", &plea(Some(3))), Ruling::Consider { .. }));
     }
 
     #[test]
@@ -342,11 +329,15 @@ mod tests {
     }
 
     #[test]
-    fn over_the_limit_is_countered_not_denied() {
+    fn asking_for_a_lot_is_a_question_for_the_prose_not_a_refusal() {
+        // The deterministic half does not counter, because it does not have a number
+        // to counter with — 4 is what this org falls back to, not what it decided.
         let p = policy("```yaml\nrequesters:\n  - everyone\nstanding_limit: 4\n```");
         match p.weigh("dana", &plea(Some(50))) {
-            Ruling::Counter { count, .. } => assert_eq!(count, 4),
-            other => panic!("expected a counter, got {other:?}"),
+            Ruling::Consider { wanted, standing, ceiling } => {
+                assert_eq!((wanted, standing, ceiling), (50, 4, 4));
+            }
+            other => panic!("expected Consider, got {other:?}"),
         }
     }
 
@@ -354,7 +345,7 @@ mod tests {
     fn a_missing_grants_block_still_works() {
         let p = policy("# policy.md\n\nJust prose, no fenced block.\n");
         assert!(p.may_ask("dana"));
-        assert!(matches!(p.weigh("dana", &plea(Some(1))), Ruling::Allow { .. }));
+        assert!(matches!(p.weigh("dana", &plea(Some(1))), Ruling::Consider { .. }));
     }
 
     #[test]
@@ -367,37 +358,41 @@ mod tests {
 
     #[test]
     fn prose_cannot_expand_entitlement_unless_the_org_said_so() {
-        // The safe default: with no max_limit, a model has no room to raise anything,
-        // and the answer stays deterministic. Opting in is the organisation's act.
+        // The prose is still read and still decides — it simply cannot go above the
+        // standing limit. Interpretation may lower a number; raising one takes an
+        // explicit `max_limit`, and opting in is the organisation's act.
         let p = policy("```yaml\nstanding_limit: 4\n```");
         match p.weigh("dana", &plea(Some(50))) {
-            Ruling::Counter { count, rationale } => {
-                assert_eq!(count, 4);
-                assert!(rationale.contains("no max_limit"), "{rationale}");
-            }
-            other => panic!("expected a counter, got {other:?}"),
+            Ruling::Consider { standing, ceiling, .. } => assert_eq!((standing, ceiling), (4, 4)),
+            other => panic!("expected Consider, got {other:?}"),
         }
     }
 
     #[test]
-    fn above_the_standing_limit_the_prose_gets_a_say() {
+    fn the_prose_decides_every_plea_not_only_the_large_ones() {
+        // The whole proposition is that a policy written in English is what allocates
+        // machines. A cheap path that answered small pleas without reading it would
+        // make the policy an exception handler.
         let p = policy("```yaml\nstanding_limit: 4\nmax_limit: 20\n```");
-        match p.weigh("dana", &plea(Some(12))) {
-            Ruling::Consider { wanted, standing, max } => {
-                assert_eq!((wanted, standing, max), (12, 4, 20));
+        for asked in [1, 3, 4, 12, 50] {
+            match p.weigh("dana", &plea(Some(asked))) {
+                Ruling::Consider { wanted, standing, ceiling } => {
+                    assert_eq!((wanted, standing, ceiling), (asked, 4, 20));
+                }
+                other => panic!("expected Consider for {asked}, got {other:?}"),
             }
-            other => panic!("expected Consider, got {other:?}"),
         }
-        // And below it, no model is consulted — the cheap gate stays cheap.
-        assert!(matches!(p.weigh("dana", &plea(Some(3))), Ruling::Allow { .. }));
     }
 
     #[test]
     fn a_max_below_the_standing_limit_is_ignored_not_obeyed() {
-        // It would otherwise *lower* what is already granted without argument, which
-        // is not what a maximum means.
+        // It would otherwise *lower* the number this org already stands behind with
+        // nothing interpreted, which is not what a maximum means.
         let p = policy("```yaml\nstanding_limit: 10\nmax_limit: 5\n```");
-        assert!(matches!(p.weigh("dana", &plea(Some(50))), Ruling::Counter { count: 10, .. }));
+        match p.weigh("dana", &plea(Some(50))) {
+            Ruling::Consider { standing, ceiling, .. } => assert_eq!((standing, ceiling), (10, 10)),
+            other => panic!("expected Consider, got {other:?}"),
+        }
     }
 
     #[test]
@@ -421,8 +416,8 @@ mod tests {
     fn no_count_asks_for_one() {
         let p = policy(STARTER);
         match p.weigh("dana", &plea(None)) {
-            Ruling::Allow { count, .. } => assert_eq!(count, 1),
-            other => panic!("expected an allow, got {other:?}"),
+            Ruling::Consider { wanted, .. } => assert_eq!(wanted, 1),
+            other => panic!("expected Consider, got {other:?}"),
         }
     }
 }

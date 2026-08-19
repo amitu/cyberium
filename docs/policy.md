@@ -28,27 +28,42 @@ The fenced block is read **deterministically**. A caller outside `requesters` is
 refused without a model ever being consulted, so the cheap gate stays cheap and a
 security decision never waits on a token.
 
-Everything after it is prose, weighed by a model against the reason a caller gave —
-but only when the deterministic half has no answer, and only within a number the
-organisation wrote down.
+Everything after it is prose, and the prose is where the number comes from. **One
+model call per plea, small or large**, whose answer *is* the allocation.
+
+The alternative — settle a number deterministically, call the model only when that
+number is not enough — was built first and was wrong. It makes interpretation an
+escalation path: the policy stops being what allocates machines and becomes an
+exception handler for unusual requests. Worse, the question "is this within the
+limit?" cannot be asked before the prose is read, because what the limit *is* for a
+given plea is one of the things the prose decides.
 
 ```yaml
-standing_limit: 2      # granted without argument, no model consulted
-max_limit: 4           # the most the *prose* may grant. Absent means it may not.
+standing_limit: 2      # the answer when the prose cannot be weighed
+max_limit: 4           # the most any interpretation may grant. Absent means it may
+                       # lower a number but never raise one.
 ```
 
-Under the standing limit, **no model is consulted at all** — verified by counting the
-prompts sent, which is zero. Above it, the prose gets a say, and three rules hold
+Neither is a stage before the model; both are bounds on its answer. Three rules hold
 regardless of what any model returns:
 
 1. **It can only be persuaded within a range a human wrote.** The answer is clamped
    to `max_limit`, and to what the caller actually asked for. The model argues; it
-   never becomes the gate. With no `max_limit`, prose cannot expand entitlement — the
-   default, so opting in is deliberate.
+   never becomes the gate. With no `max_limit`, interpretation can still refuse or
+   trim but cannot expand entitlement — the default, so opting in is deliberate.
 2. **A refusal is always honoured.** Clamping is one-directional; down is safe.
-3. **Unreachable is not permission.** A model that times out or errors falls back to
-   the standing limit and says so in the rationale. A fleet that stopped working
+3. **Unreachable is not permission.** No key, a timeout, an error — the standing
+   limit answers and says so in the rationale, and never grants more than was asked
+   for, because a fallback is not a quota to fill. A fleet that stopped working
    because an API was down would be worse than one with no prose at all.
+
+`standing_limit` is sent to the model too, as calibration: this is the figure the
+organisation falls back to, explicitly *not* a floor or a target. A model told only
+a ceiling and nothing about what is ordinary here would drift toward the ceiling.
+
+The one thing settled before the prose is whether the caller may ask at all. That
+needs no interpretation, so an unauthorised caller is refused without spending a
+token.
 
 The model sees the prose, the caller's declared fields, and what was attested about
 them. It does **not** see fleet state — mixing entitlement and availability would make
@@ -72,6 +87,11 @@ CM_MODEL_URL=https://api.anthropic.com/v1/messages
 Every weighing is logged with **both numbers** — what the model said and what it was
 bounded to — because "why did I get 4" must be answerable, and a clamp that left no
 trace would make an organisation's own ceiling invisible.
+
+A call per plea is the cost of the proposition, and the no-fleet-state rule is what
+makes it bearable: one tenant's policy prompt is byte-identical from plea to plea, so
+it is sent marked cacheable. Reproducible and cheap turn out to be the same
+property.
 
 The governing line, from the original design: **security is deterministic; policy is
 semantic.** You cannot spend a model call deciding whether to accept a connection.
