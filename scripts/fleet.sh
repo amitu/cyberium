@@ -51,17 +51,20 @@ INV=$(SIRJI_HOME=$LAB/dana $SIRJI device invite cm-t | tail -1)
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM init --parent "$INV" | sed 's/^/  cm-t: /'
 
 # --- run the fleet --------------------------------------------------------
-say "onboard dana as a tenant of this controller"
+say "onboard the payments team as a tenant, with dana in it"
 # The alias must be what acme's own sirji calls them, because that is what a
 # verified ticket carries and what picks their policy. `--ceiling` is acme's to
 # set; dana never sees it, and it is what stops dana's own policy.md from being
 # dana's own quota.
-CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant add dana --ceiling 3 \
-  --note "the demo tenant" 2>&1 | sed 's/^/  /'
+# The tenant is a *team*, and dana is a member of it. Self-hosted that is the usual
+# shape — one policy and one budget for several people — and it is why a tenant's
+# name need not be any caller's alias.
+CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant add payments --ceiling 3 \
+  --member dana --note "the demo team" 2>&1 | sed 's/^/  /'
 
 # Short reservations so a timeout is watchable in one run. This half of the
 # configuration is dana's own.
-cat >"$LAB/cm-c/root/tenants/dana/policy.md" <<'POLICY'
+cat >"$LAB/cm-c/root/tenants/payments/policy.md" <<'POLICY'
 # policy.md
 
 ```yaml

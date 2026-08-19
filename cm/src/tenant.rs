@@ -37,6 +37,15 @@ pub struct Terms {
     /// The most machines this tenant may hold at once, whatever their own policy
     /// says. The outer clamp — in a hosted deployment this is what they bought.
     pub ceiling: u32,
+    /// Which caller aliases belong to this tenant. Empty means just the tenant's
+    /// own name, which is the common case.
+    ///
+    /// Here because a tenant is not always one caller: self-hosted, a tenant is
+    /// usually a *team*, and a team has several people. Host-owned for the obvious
+    /// reason — a tenant that could name its own members could claim somebody
+    /// else's callers, and with them somebody else's budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
     /// Free-form, for whoever has to work out later why this tenant exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -46,15 +55,27 @@ impl Default for Terms {
     fn default() -> Self {
         // Deliberately modest. A ceiling that has to be raised on purpose is better
         // than one nobody noticed was effectively infinite.
-        Self { ceiling: 10, note: None }
+        Self { ceiling: 10, members: Vec::new(), note: None }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Tenant {
+    /// The tenant's own name — its folder. Not necessarily any caller's alias.
     pub alias: String,
     pub terms: Terms,
     pub policy: Policy,
+}
+
+impl Tenant {
+    /// The caller aliases that count as this tenant.
+    pub fn members(&self) -> Vec<&str> {
+        if self.terms.members.is_empty() {
+            vec![self.alias.as_str()]
+        } else {
+            self.terms.members.iter().map(String::as_str).collect()
+        }
+    }
 }
 
 impl Tenant {
@@ -82,6 +103,9 @@ impl Tenant {
 pub struct Tenants {
     dir: PathBuf,
     loaded: BTreeMap<String, Tenant>,
+    /// caller alias → tenant name. Several aliases may point at one tenant, which
+    /// is what makes a tenant able to be a team.
+    by_member: BTreeMap<String, String>,
 }
 
 impl Tenants {
@@ -115,41 +139,83 @@ impl Tenants {
             }
         }
 
-        Ok(Self { dir, loaded })
+        let by_member = index(&loaded)?;
+        Ok(Self { dir, loaded, by_member })
     }
 
-    pub fn aliases(&self) -> impl Iterator<Item = &String> {
+    /// Tenant names — the folders. **Not** caller aliases.
+    pub fn names(&self) -> impl Iterator<Item = &String> {
         self.loaded.keys()
+    }
+
+    pub fn all(&self) -> impl Iterator<Item = &Tenant> {
+        self.loaded.values()
+    }
+
+    /// A tenant by its **own name**, for administration.
+    ///
+    /// Distinct from `for_caller`, and the two are easy to confuse — a tenant's name
+    /// need not be any caller's alias, which is the whole point of `members`. Getting
+    /// this wrong made `cm tenant add` unable to read back what it had just written.
+    pub fn by_name(&self, name: &str) -> Option<&Tenant> {
+        self.loaded.get(name)
     }
 
     pub fn len(&self) -> usize {
         self.loaded.len()
     }
 
-    /// The tenant a caller belongs to, re-read from disk if it has changed.
+    /// The tenant this **caller alias** belongs to, re-read from disk if it changed.
     ///
-    /// Re-reading means `cm tenant add` and a policy edit take effect without a
-    /// restart. A re-read that fails keeps the last known-good copy and complains,
-    /// because a typo in a file should not take an organisation offline mid-run.
-    pub fn get(&mut self, alias: &str) -> Option<&Tenant> {
-        if !self.loaded.contains_key(alias) && self.dir.join(alias).is_dir() {
-            // Added since startup.
-            match read(&self.dir.join(alias), alias) {
-                Ok(tenant) => {
-                    println!("tenant {alias} appeared");
-                    self.loaded.insert(alias.to_string(), tenant);
-                }
-                Err(e) => eprintln!("tenant {alias} is unusable: {e:#}"),
-            }
-        } else if self.loaded.contains_key(alias) {
-            match read(&self.dir.join(alias), alias) {
-                Ok(fresh) => {
-                    self.loaded.insert(alias.to_string(), fresh);
-                }
-                Err(e) => eprintln!("keeping the last good policy for {alias}: {e:#}"),
-            }
+    /// Re-reading means `cm tenant add`, a membership change and a policy edit all
+    /// take effect without a restart. A re-read that fails keeps the last known-good
+    /// copy and complains, because a typo in a file should not take a team offline
+    /// mid-run.
+    pub fn for_caller(&mut self, caller: &str) -> Option<&Tenant> {
+        // An alias we have never seen may belong to a tenant added since startup, or
+        // to a membership line edited since. Only a rescan can tell, and it is one
+        // readdir on a path taken by unknown callers alone.
+        if !self.by_member.contains_key(caller) {
+            self.rescan();
         }
-        self.loaded.get(alias)
+
+        let name = self.by_member.get(caller)?.clone();
+        match read(&self.dir.join(&name), &name) {
+            Ok(fresh) => {
+                self.loaded.insert(name.clone(), fresh);
+                // Membership may have moved with that read.
+                if let Ok(fresh_index) = index(&self.loaded) {
+                    self.by_member = fresh_index;
+                }
+            }
+            Err(e) => eprintln!("keeping the last good policy for {name}: {e:#}"),
+        }
+
+        // Re-check: a membership edit may have removed this caller.
+        let name = self.by_member.get(caller)?;
+        self.loaded.get(name)
+    }
+
+    fn rescan(&mut self) {
+        match Self::load(
+            self.dir
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        ) {
+            Ok(fresh) => {
+                let appeared: Vec<&String> = fresh
+                    .loaded
+                    .keys()
+                    .filter(|k| !self.loaded.contains_key(*k))
+                    .collect();
+                if !appeared.is_empty() {
+                    println!("tenant(s) appeared: {appeared:?}");
+                }
+                self.loaded = fresh.loaded;
+                self.by_member = fresh.by_member;
+            }
+            Err(e) => eprintln!("cannot re-read tenants: {e:#}"),
+        }
     }
 
     /// Create a tenant, with a starter policy they can edit.
@@ -177,6 +243,27 @@ impl Tenants {
         Policy::load(&dir)?;
         Ok(dir)
     }
+}
+
+/// caller alias → tenant name, refusing ambiguity.
+///
+/// Two tenants claiming one caller is not a thing to resolve by picking a winner:
+/// whoever's budget it lands against would be arbitrary, and nobody would know which.
+fn index(loaded: &BTreeMap<String, Tenant>) -> Result<BTreeMap<String, String>> {
+    let mut by_member: BTreeMap<String, String> = BTreeMap::new();
+    for tenant in loaded.values() {
+        for member in tenant.members() {
+            if let Some(other) = by_member.get(member) {
+                bail!(
+                    "both {other:?} and {:?} claim the caller {member:?} — \
+                     whose budget would that spend?",
+                    tenant.alias
+                );
+            }
+            by_member.insert(member.to_string(), tenant.alias.clone());
+        }
+    }
+    Ok(by_member)
 }
 
 fn read(dir: &Path, alias: &str) -> Result<Tenant> {
@@ -222,7 +309,7 @@ mod tests {
         assert!(dir.join("policy.md").exists(), "a starter policy, or every plea refuses");
 
         let tenants = Tenants::load(&root).unwrap();
-        assert_eq!(tenants.aliases().collect::<Vec<_>>(), vec!["acme"]);
+        assert_eq!(tenants.names().collect::<Vec<_>>(), vec!["acme"]);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -247,9 +334,9 @@ mod tests {
     #[test]
     fn the_ceiling_cuts_what_policy_allowed() {
         let root = temp();
-        Tenants::add(&root, "acme", Terms { ceiling: 4, note: None }).unwrap();
+        Tenants::add(&root, "acme", Terms { ceiling: 4, ..Terms::default() }).unwrap();
         let mut tenants = Tenants::load(&root).unwrap();
-        let tenant = tenants.get("acme").unwrap();
+        let tenant = tenants.for_caller("acme").unwrap();
 
         assert_eq!(tenant.clamp(3), (3, None), "under the ceiling, untouched");
         let (count, why) = tenant.clamp(50);
@@ -267,9 +354,78 @@ mod tests {
         Policy::load(&dir).unwrap();
 
         let mut tenants = Tenants::load(&root).unwrap();
-        let tenant = tenants.get("acme").unwrap();
+        let tenant = tenants.for_caller("acme").unwrap();
         assert_eq!(tenant.terms.ceiling, Terms::default().ceiling);
         assert_eq!(tenant.clamp(9999).0, Terms::default().ceiling);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_tenants_name_is_not_a_caller_lookup() {
+        // The two lookups are different, and confusing them made `cm tenant add`
+        // unable to read back what it had just written. A team's name is nobody's
+        // alias unless somebody listed it.
+        let root = temp();
+        Tenants::add(
+            &root,
+            "payments",
+            Terms { ceiling: 5, members: vec!["dana".into()], note: None },
+        )
+        .unwrap();
+        let mut tenants = Tenants::load(&root).unwrap();
+
+        assert!(tenants.by_name("payments").is_some(), "administration finds it");
+        assert!(tenants.for_caller("payments").is_none(), "no caller is called that");
+        assert!(tenants.for_caller("dana").is_some(), "its member is");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_tenant_can_be_a_team() {
+        // The self-hosted shape: a tenant is a team, and a team has several people.
+        let root = temp();
+        Tenants::add(
+            &root,
+            "payments",
+            Terms {
+                ceiling: 5,
+                members: vec!["dana".into(), "kiran".into()],
+                note: None,
+            },
+        )
+        .unwrap();
+        let mut tenants = Tenants::load(&root).unwrap();
+
+        assert_eq!(tenants.for_caller("dana").unwrap().alias, "payments");
+        assert_eq!(tenants.for_caller("kiran").unwrap().alias, "payments");
+        // Both spend the same budget, which is the point of grouping them.
+        assert_eq!(tenants.for_caller("kiran").unwrap().terms.ceiling, 5);
+        // And the tenant's own name is not a caller unless it was listed.
+        assert!(tenants.for_caller("payments").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn no_members_means_the_tenants_own_name() {
+        let root = temp();
+        Tenants::add(&root, "acme", Terms::default()).unwrap();
+        let mut tenants = Tenants::load(&root).unwrap();
+        assert_eq!(tenants.for_caller("acme").unwrap().alias, "acme");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn two_tenants_cannot_claim_one_caller() {
+        // Picking a winner would put somebody's spend on somebody else's budget,
+        // arbitrarily, and nobody would know which.
+        let root = temp();
+        Tenants::add(&root, "payments", Terms { ceiling: 5, members: vec!["dana".into()], note: None }).unwrap();
+        Tenants::add(&root, "platform", Terms { ceiling: 5, members: vec!["dana".into()], note: None }).unwrap();
+
+        let err = Tenants::load(&root).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("dana"), "{text}");
+        assert!(text.contains("whose budget"), "{text}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -278,7 +434,7 @@ mod tests {
         let root = temp();
         Tenants::add(&root, "acme", Terms::default()).unwrap();
         let mut tenants = Tenants::load(&root).unwrap();
-        assert!(tenants.get("somebody-else").is_none());
+        assert!(tenants.for_caller("somebody-else").is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -289,7 +445,7 @@ mod tests {
         assert_eq!(tenants.len(), 0);
 
         Tenants::add(&root, "late", Terms::default()).unwrap();
-        assert!(tenants.get("late").is_some(), "no restart should be needed");
+        assert!(tenants.for_caller("late").is_some(), "no restart should be needed");
         std::fs::remove_dir_all(&root).ok();
     }
 }

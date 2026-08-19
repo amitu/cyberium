@@ -54,10 +54,10 @@ can still come back as `Counter { 12 }` because the world moved.
 | `policy.md` | the organisation | how that is divided between repos, teams, incidents |
 | the fleet | reality | which machines are free right now |
 
-**Only the middle one exists today**, because a single-tenant controller has no host
-above it. It matters for the hosted case: without an outer ceiling, an organisation
-authoring its own `policy.md` would be authoring its own quota, and `standing_limit:
-10000` is a valid file.
+The middle two are built: `policy.md` per tenant, under a `ceiling` in `tenant.toml`
+that the tenant cannot write. The plan tier above them belongs to a hosted product
+and does not exist. Budgets, which is what a ceiling cannot express, are designed in
+[budget.md](budget.md) and not built.
 
 ## Tenancy: a folder each
 
@@ -75,6 +75,11 @@ authoring its own `policy.md` would be authoring its own quota, and `standing_li
 cm tenant add dana --ceiling 3 --note "the demo tenant"
 cm tenant list
 ```
+
+**Tenants always** — hosted *and* self-hosted. Self-hosted, a tenant is usually a
+team rather than an organisation, and that is the point: one model, one set of rules,
+one place spend is counted. A deployment that skipped tenants for being "just us"
+would need a second answer to every question the first one already answers.
 
 **The tenant key is the verified alias from the caller's ticket**, and that is what
 makes this work without any new machinery. The alias is minted by the controller's
@@ -97,23 +102,55 @@ Three consequences worth knowing:
   re-read when they next ask, and a re-read that fails keeps the last known-good copy
   and complains rather than taking an organisation offline mid-run.
 
+### A tenant can be a team
+
+```toml
+# tenants/payments/tenant.toml — the host's file
+ceiling = 5
+members = ["dana", "kiran"]
+```
+
+With no `members`, a tenant's own name is its only member, which is the common case.
+Listed, several callers share one ceiling, one policy and one budget — which is what
+makes a team a useful unit rather than a label.
+
+Host-owned for an obvious reason: a tenant that could name its own members could claim
+somebody else's callers, and with them somebody else's budget. And **two tenants
+claiming one caller is refused at load**, loudly, rather than resolved by picking a
+winner — whoever's budget that spend landed against would be arbitrary, and nobody
+would know which.
+
+### Callers are peers; siblings are infrastructure
+
+This closes a question that was open yesterday. A sibling device's ticket carries no
+alias, so there is nothing to key a policy on — which sounded like a gap for
+self-hosted deployments where developers might be devices of the org's own sirji.
+
+The resolution is a rule rather than a mechanism:
+
+> **A caller is always a peer. A sibling device is always infrastructure** — a worker
+> or an admin — and never allocates.
+
+So a developer has their own sirji, paired with the organisation's, and arrives with
+an alias like anybody else. That is already how the demo works, so it costs nothing,
+and it means the same shape holds hosted and self-hosted. It also suits the substrate:
+a developer's machines being *theirs* is rather the point.
+
 ### Still open
 
-- **A caller from our own organisation has no tenant.** A sibling device's ticket
-  carries no alias — that is exactly how introspection tells operators from peers —
-  so there is nothing to key a policy on. Own-org devices can look inside but not
-  allocate. Fine for a hosted controller; wrong for a self-hosted one where the
-  developers *are* devices of the org's sirji, and unresolved.
 - A bundle should be `policy.md` + `nivedanas/` + `policy-tests/` versioned together;
   today it is a folder with one file that matters.
 - Nothing revokes or suspends a tenant beyond deleting the folder.
+- Members are matched exactly; there is no pattern like `*@acme` for onboarding a
+  whole organisation at once.
 
 ## Getting a policy onto a controller
 
-Today: put the file where `--root` points, and start the controller. Changing it
-means restarting.
+Today: `cm tenant add`, then edit the `policy.md` it wrote. No restart — the
+controller re-reads a tenant's folder when they next ask.
 
-Designed, and the shape matters more than the commands:
+Designed, for the case where the tenant is a different organisation and should not
+need a shell on the controller:
 
 ```
 <org>/cyberium repo

@@ -339,11 +339,17 @@ worth proving before anything non-deterministic joins in.
 **A folder per tenant, and two files with different owners:**
 
 ```sh
-$ cm tenant add dana --ceiling 3
-tenant `dana` at …/tenants/dana
-  they edit …/tenants/dana/policy.md
-  you own  …/tenants/dana/tenant.toml
+$ cm tenant add payments --ceiling 3 --member dana --member kiran
+tenant `payments` at …/tenants/payments
+  ceiling 3 machine(s)
+  members  dana, kiran
+  they edit …/tenants/payments/policy.md
+  you own  …/tenants/payments/tenant.toml
 ```
+
+**Always tenants — self-hosted too**, where a tenant is usually a *team* rather than
+an organisation. One model either way, and one place spend is counted. With no
+`--member`, a tenant's own name is its only member, which is the common case.
 
 A tenant writes `policy.md`; the host writes `tenant.toml`. Without that split, an
 organisation authoring its own policy would be authoring its own quota —

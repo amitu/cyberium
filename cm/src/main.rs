@@ -59,12 +59,13 @@ cm — cost-aware allocation of test machines
   cm admin reservations [--controller <name>]
         look inside a running controller, as an admin device.
 
-  cm tenant add <alias> [--ceiling N] [--note <text>]
+  cm tenant add <name> [--ceiling N] [--member <alias>]... [--note <text>]
   cm tenant list
-        onboard whoever this controller serves. <alias> must be the name our own
-        sirji knows them by — that is what a verified ticket carries, and what
-        picks their policy. They write policy.md; you write tenant.toml, which
-        is what stops an organisation setting its own quota.
+        onboard whoever this controller serves — always, self-hosted too, where
+        a tenant is usually a team. Members are the caller aliases our own sirji
+        knows them by; with none given, the tenant's own name is its only member.
+        They write policy.md; you write tenant.toml, which is what stops a
+        tenant setting its own quota or claiming somebody else's callers.
 
   cm worker [--controller <name>] [--slots N] [--can <cap>]...
         offer this machine to the controller
@@ -352,7 +353,7 @@ async fn controller() -> Result<()> {
         println!(
             "{} tenant(s): {}",
             tenants.len(),
-            tenants.aliases().cloned().collect::<Vec<_>>().join(", ")
+            tenants.names().cloned().collect::<Vec<_>>().join(", ")
         );
     }
 
@@ -457,7 +458,7 @@ impl Control {
         nivedana: &Nivedana,
     ) -> std::result::Result<(u32, Option<String>), Verdict> {
         let mut tenants = self.tenants.lock().await;
-        let Some(tenant) = tenants.get(alias) else {
+        let Some(tenant) = tenants.for_caller(alias) else {
             // Named, but not onboarded. Distinguished from a policy refusal because
             // the fix is completely different — somebody has to run `cm tenant add`.
             return Err(Verdict::Deny {
@@ -484,7 +485,7 @@ impl Control {
         self.tenants
             .lock()
             .await
-            .get(alias)
+            .for_caller(alias)
             .map(|t| t.policy.reservation_secs())
             .unwrap_or(fleet::RESERVATION_SECS)
     }
@@ -1796,6 +1797,13 @@ fn tenant_add(alias: &str, args: &[&str]) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--ceiling wants a number"))?;
                 i += 2;
             }
+            "--member" => {
+                match args.get(i + 1) {
+                    Some(who) => terms.members.push((*who).to_string()),
+                    None => bail!("--member wants a caller alias"),
+                }
+                i += 2;
+            }
             "--note" => {
                 terms.note = args.get(i + 1).map(|v| (*v).to_string());
                 i += 2;
@@ -1809,13 +1817,14 @@ fn tenant_add(alias: &str, args: &[&str]) -> Result<()> {
 
     // Read it straight back rather than describing what we just wrote: if it does
     // not load, the operator finds out now rather than when the tenant first asks.
-    let mut tenants = tenant::Tenants::load(&config.root)?;
+    let tenants = tenant::Tenants::load(&config.root)?;
     let written = tenants
-        .get(alias)
+        .by_name(alias)
         .ok_or_else(|| anyhow::anyhow!("wrote {} but could not read it back", dir.display()))?;
 
     println!("tenant `{alias}` at {}", dir.display());
     println!("  ceiling {} machine(s)", written.terms.ceiling);
+    println!("  members  {}", written.members().join(", "));
     println!("  they edit {}", written.policy.path.display());
     println!("  you own  {}", dir.join(tenant::FILE).display());
     // No restart: the controller re-reads a tenant's folder when they next ask.
@@ -1833,15 +1842,14 @@ fn tenant_list() -> Result<()> {
         );
         return Ok(());
     }
-    let mut loaded = tenants;
-    let aliases: Vec<String> = loaded.aliases().cloned().collect();
-    for alias in aliases {
-        if let Some(t) = loaded.get(&alias) {
+    for t in tenants.all() {
+        {
             println!(
-                "  {:<16} ceiling {:<5} grants last {}s{}",
+                "  {:<16} ceiling {:<5} grants last {:<6} members {}{}",
                 t.alias,
                 t.terms.ceiling,
-                t.policy.reservation_secs(),
+                format!("{}s", t.policy.reservation_secs()),
+                t.members().join(","),
                 t.terms
                     .note
                     .as_ref()
