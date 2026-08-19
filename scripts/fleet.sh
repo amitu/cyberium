@@ -97,13 +97,13 @@ sleep 2
 # machine owner's, not the caller's: nothing a caller sends can skip them, and a
 # `--post` that failed takes the machine out of the fleet rather than lending out a
 # box that may still hold the last tenant's work.
-CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM worker --slots 1 --can linux --rate 1 \
+CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM worker --can linux --rate 1 \
   --pre 'echo "[hygiene] scrubbing before the next tenant"' \
   --post 'echo "[hygiene] taking back what was left"' >cm-w-1.log 2>&1 &
-CM_HOME=$LAB/cm-w-2 SIRJI_HOME=$LAB/cm-w-2 $CM worker --slots 1 --can linux --rate 2 >cm-w-2.log 2>&1 &
+CM_HOME=$LAB/cm-w-2 SIRJI_HOME=$LAB/cm-w-2 $CM worker --can linux --rate 2 >cm-w-2.log 2>&1 &
 # The gpu box costs eight times the cheap one, so `--need linux` must never pick it
 # while an ordinary machine is idle.
-CM_HOME=$LAB/cm-w-3 SIRJI_HOME=$LAB/cm-w-3 $CM worker --slots 2 --can linux --can gpu --rate 8 >cm-w-3.log 2>&1 &
+CM_HOME=$LAB/cm-w-3 SIRJI_HOME=$LAB/cm-w-3 $CM worker --can linux --can gpu --rate 8 >cm-w-3.log 2>&1 &
 for _ in $(seq 30); do
   [ "$(grep -c arrived cm-c.log || true)" -ge 3 ] && break
   sleep 1

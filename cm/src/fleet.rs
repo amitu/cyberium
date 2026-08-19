@@ -29,19 +29,25 @@ pub struct Worker {
     pub name: String,
     pub key: String,
     pub hints: Vec<String>,
-    pub slots: u32,
     pub capabilities: Vec<String>,
     /// Credits per minute while held. Announced by the machine, because the machine
     /// is the thing that knows what it is — the same reasoning as capabilities, and
     /// a second list kept centrally is a second list to get wrong.
     pub rate: u32,
-    /// Reservations currently holding a slot here. Length is how busy it is.
-    pub held_by: Vec<String>,
+    /// The reservation holding it, if any.
+    ///
+    /// **One at a time.** A worker used to advertise several concurrent slots, and
+    /// that was the wrong place to put concurrency: run more `cm worker` processes
+    /// instead, and let the operating system provide the limits and isolation it is
+    /// already good at. It also removed two problems — what a rate means when two
+    /// tenants share a machine, and the fact that a machine hosting two tenants at
+    /// once has no moment *between* tenants to be cleaned in.
+    pub held_by: Option<String>,
 }
 
 impl Worker {
-    pub fn free_slots(&self) -> u32 {
-        self.slots.saturating_sub(self.held_by.len() as u32)
+    pub fn is_free(&self) -> bool {
+        self.held_by.is_none()
     }
 
     /// Can this machine do everything the plea asked for?
@@ -172,7 +178,7 @@ impl Fleet {
     /// introspection instead.
     pub fn summary(&self) -> (u32, u32, Vec<String>) {
         let machines = self.workers.len() as u32;
-        let free = self.workers.values().filter(|w| w.free_slots() > 0).count() as u32;
+        let free = self.workers.values().filter(|w| w.is_free()).count() as u32;
         let capabilities: BTreeSet<String> = self
             .workers
             .values()
@@ -209,7 +215,7 @@ impl Fleet {
         let mut candidates: Vec<&Worker> = self
             .workers
             .values()
-            .filter(|w| w.satisfies(wanted) && w.free_slots() > 0)
+            .filter(|w| w.satisfies(wanted) && w.is_free())
             .collect();
         candidates.sort_by_key(|w| w.rate);
 
@@ -236,7 +242,7 @@ impl Fleet {
         let mut candidates: Vec<&Worker> = self
             .workers
             .values()
-            .filter(|w| w.satisfies(wanted) && w.free_slots() > 0)
+            .filter(|w| w.satisfies(wanted) && w.is_free())
             .collect();
         candidates.sort_by_key(|w| w.rate);
         candidates
@@ -292,7 +298,7 @@ impl Fleet {
 
         for name in &chosen {
             if let Some(w) = self.workers.get_mut(name) {
-                w.held_by.push(id.clone());
+                w.held_by = Some(id.clone());
             }
         }
         self.reservations.insert(
@@ -361,7 +367,7 @@ impl Fleet {
         let reservation = self.reservations.remove(id)?;
         for name in &reservation.workers {
             if let Some(w) = self.workers.get_mut(name) {
-                w.held_by.retain(|held| held != id);
+                w.held_by = None;
             }
         }
         let at = now();
@@ -377,19 +383,18 @@ impl Fleet {
 mod tests {
     use super::*;
 
-    fn worker(name: &str, slots: u32, caps: &[&str]) -> Worker {
-        priced(name, slots, caps, 1)
+    fn worker(name: &str, caps: &[&str]) -> Worker {
+        priced(name, caps, 1)
     }
 
-    fn priced(name: &str, slots: u32, caps: &[&str], rate: u32) -> Worker {
+    fn priced(name: &str, caps: &[&str], rate: u32) -> Worker {
         Worker {
             name: name.into(),
             key: format!("key-{name}"),
             hints: vec![],
-            slots,
             capabilities: caps.iter().map(|c| (*c).to_string()).collect(),
             rate,
-            held_by: vec![],
+            held_by: None,
         }
     }
 
@@ -403,9 +408,9 @@ mod tests {
 
     fn fleet() -> Fleet {
         let mut f = Fleet::default();
-        f.arrive(worker("linux-1", 1, &["linux"]));
-        f.arrive(worker("linux-2", 1, &["linux"]));
-        f.arrive(worker("gpu-1", 1, &["linux", "gpu"]));
+        f.arrive(worker("linux-1", &["linux"]));
+        f.arrive(worker("linux-2", &["linux"]));
+        f.arrive(worker("gpu-1", &["linux", "gpu"]));
         f
     }
 
@@ -466,7 +471,7 @@ mod tests {
         let err = f.release(&a.reservation, "someone-else").unwrap_err();
         assert!(err.contains("not granted to you"), "{err}");
         // And the machine is still held.
-        assert_eq!(f.workers().find(|w| w.name == "gpu-1").unwrap().free_slots(), 0);
+        assert!(!f.workers().find(|w| w.name == "gpu-1").unwrap().is_free());
     }
 
     #[test]
@@ -554,9 +559,9 @@ mod tests {
         // accidentally indifferent to price: asking for linux could spend a GPU box's
         // rate while an ordinary one sat idle.
         let mut f = Fleet::default();
-        f.arrive(priced("expensive", 1, &["linux", "gpu"], 8));
-        f.arrive(priced("cheap", 1, &["linux"], 1));
-        f.arrive(priced("middling", 1, &["linux"], 3));
+        f.arrive(priced("expensive", &["linux", "gpu"], 8));
+        f.arrive(priced("cheap", &["linux"], 1));
+        f.arrive(priced("middling", &["linux"], 3));
 
         assert_eq!(f.choose(&["linux".into()], 1).unwrap(), vec!["cheap".to_string()]);
         assert_eq!(
@@ -570,8 +575,8 @@ mod tests {
     #[test]
     fn a_grant_is_priced_when_it_is_made() {
         let mut f = Fleet::default();
-        f.arrive(priced("a", 1, &["linux"], 3));
-        f.arrive(priced("b", 1, &["linux"], 5));
+        f.arrive(priced("a", &["linux"], 3));
+        f.arrive(priced("b", &["linux"], 5));
         let a = f.allocate(&plea(&["linux"]), 2, "k", "dana", "payments", 600).unwrap();
 
         let r = f.reservations().next().unwrap();
@@ -590,13 +595,13 @@ mod tests {
     #[test]
     fn closing_reports_the_cost_and_releases_the_machines() {
         let mut f = Fleet::default();
-        f.arrive(priced("a", 1, &["linux"], 4));
+        f.arrive(priced("a", &["linux"], 4));
         let a = f.allocate(&plea(&["linux"]), 1, "k", "dana", "payments", 600).unwrap();
 
         let closed = f.release(&a.reservation, "k").unwrap();
         assert_eq!(closed.credits, 4, "one minute minimum at 4/min");
         assert_eq!(closed.tenant(), "payments");
-        assert_eq!(f.workers().next().unwrap().free_slots(), 1);
+        assert!(f.workers().next().unwrap().is_free());
     }
 
     #[test]
@@ -604,8 +609,8 @@ mod tests {
         // The hole a spend-only budget leaves: a hundred runs started at once while
         // comfortably under it, discovered afterwards.
         let mut f = Fleet::default();
-        f.arrive(priced("a", 1, &["linux"], 2));
-        f.arrive(priced("b", 1, &["linux"], 2));
+        f.arrive(priced("a", &["linux"], 2));
+        f.arrive(priced("b", &["linux"], 2));
         assert_eq!(f.committed("payments"), 0);
 
         f.allocate(&plea(&["linux"]), 2, "k", "dana", "payments", 600).unwrap();
@@ -620,7 +625,7 @@ mod tests {
         // Per grant, because it comes from the tenant's policy and there is a policy
         // per tenant — the fleet could not own one number if it wanted to.
         let mut f = Fleet::default();
-        f.arrive(worker("linux-1", 1, &["linux"]));
+        f.arrive(worker("linux-1", &["linux"]));
         let a = f.allocate(&plea(&["linux"]), 1, "a", "dana", "dana", 30).unwrap();
         assert_eq!(a.expires_in, 30);
         assert_eq!(a.limits.max_seconds, 30);
@@ -632,11 +637,18 @@ mod tests {
     }
 
     #[test]
-    fn slots_allow_more_than_one_reservation_per_machine() {
+    fn one_machine_serves_one_reservation() {
+        // Concurrency belongs to the operating system: run more `cm worker`
+        // processes. A machine advertising several slots made a rate ambiguous —
+        // whose minute is being charged? — and left no moment between tenants for
+        // the operator's cleanup to run in.
         let mut f = Fleet::default();
-        f.arrive(worker("big", 3, &["linux"]));
+        f.arrive(worker("big", &["linux"]));
         assert!(f.allocate(&plea(&["linux"]), 1, "a", "dana", "dana", RESERVATION_SECS).is_ok());
-        assert!(f.allocate(&plea(&["linux"]), 1, "b", "kiran", "kiran", RESERVATION_SECS).is_ok());
-        assert_eq!(f.workers().next().unwrap().free_slots(), 1);
+        assert!(
+            f.allocate(&plea(&["linux"]), 1, "b", "kiran", "kiran", RESERVATION_SECS).is_err(),
+            "it is taken"
+        );
+        assert!(!f.workers().next().unwrap().is_free());
     }
 }

@@ -39,12 +39,17 @@ have deliberately stayed plain English while only the wire protocol is Sanskrit.
 **A worker announces its own rate.** It is the thing that knows what it is:
 
 ```sh
-cm worker --slots 1 --can linux --rate 1
-cm worker --slots 2 --can linux --can gpu --rate 8
+cm worker --can linux --rate 1
+cm worker --can linux --can gpu --rate 8
 ```
 
-Credits per minute while held. A worker that says nothing costs one, because a machine
-of unknown cost must not be free.
+Credits per minute while held, and **unambiguous because a worker serves one tenancy
+at a time**: there is exactly one reservation paying for it. A worker that says nothing
+costs one, because a machine of unknown cost must not be free.
+
+That ambiguity is why concurrent slots went away. A machine advertising two of them
+left "whose minute is this" without an answer — bill each tenant the full rate and the
+machine is counted twice; split it and a tenant's cost depends on who else turned up.
 
 And selection is **cheapest first**, which this made necessary rather than merely
 nice: picking in name order left a cost-aware allocator accidentally indifferent to

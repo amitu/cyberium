@@ -64,10 +64,11 @@ Three roles, all sirji **devices**, none holding any identity state:
   organisation has a relationship with can resolve `cm-c@<org>` and reach it. It
   owns the whole picture: which machines are here, what they can do, who has them,
   and when to take them back.
-- **`cm worker`** offers capacity, with a list of capabilities. It finds the
-  controller through their shared parent, registers, and holds the connection —
-  that connection *is* its availability. No heartbeat: QUIC already reports a peer
-  going away.
+- **`cm worker`** offers **one machine-tenancy** at a time, with a list of
+  capabilities and a price. It finds the controller through their shared parent,
+  registers, and holds the connection — that connection *is* its availability. No
+  heartbeat: QUIC already reports a peer going away. Want concurrency? Run more of
+  them, and let the OS supply the limits and isolation it is already good at.
 - **`cm test`** is a device of the developer's own sirji. It asks its own sirji to
   resolve the controller, which returns a signed ticket, then dials the controller
   directly and presents it. Granted machines it talks to **directly** — the
@@ -153,7 +154,7 @@ Plain strings, and deliberately so. The org invents its own vocabulary — `linu
 to match on it.
 
 ```sh
-cm worker --slots 2 --can linux --can gpu
+cm worker --can linux --can gpu
 cm test cm-c@acme "training smoke test" --need gpu
 ```
 
@@ -224,10 +225,10 @@ is a list the host writes, never something a device acquires by connecting.
 
 ```sh
 $ cm admin fleet
-3 machine(s), 2 with a free slot, can ["gpu", "linux"]
-  cm-w-1       0/1 free  can ["linux"]         held by r4
-  cm-w-2       1/1 free  can ["linux"]         idle
-  cm-w-3       2/2 free  can ["linux", "gpu"]  idle
+3 machine(s), 2 free, can ["gpu", "linux"]
+  cm-w-1         1 credit(s)/min  can ["linux"]         held by r4
+  cm-w-2         2 credit(s)/min  can ["linux"]         idle
+  cm-w-3         8 credit(s)/min  can ["linux", "gpu"]  idle
 
 $ cm admin reservations
   r4     dana         1 machine(s), 583s left
@@ -256,7 +257,7 @@ A machine is lent to one caller after another, so somebody has to be responsible
 what is left between them:
 
 ```sh
-cm worker --slots 1 --can linux \
+cm worker --can linux \
   --pre  'scripts/scrub.sh' \
   --post 'scripts/scrub.sh && docker system prune -f'
 ```
@@ -284,11 +285,11 @@ failed may still hold the last tenant's source, credentials or state; being shor
 machine is much cheaper than lending that one out. What happens next is for whatever
 supervises the process to decide.
 
-Hygiene is machine-wide, so it cannot be combined with `--slots > 1`: a machine
-hosting two tenants at once has no moment *between* tenants to clean in, and cleaning
-up after one would delete the other's work mid-run. cm refuses that combination
-rather than do something plausible and wrong — an operator who wants both wants one
-worker per concurrent tenancy.
+Hygiene is machine-wide, which is safe because **a worker serves one tenancy at a
+time.** There is always a moment between tenants to clean in. Concurrency comes from
+running more `cm worker` processes, which is also where the operating system's own
+limits and isolation live — cgroups, users, containers — rather than something cm
+should be reimplementing.
 
 Neither script is a substitute for the workspace lifecycle: checkouts are already
 deleted when the reservation ends. These are for everything cm cannot know about —
@@ -371,8 +372,8 @@ A ceiling of three machines says nothing about whether they ran for a minute or 
 fortnight, and the fortnight is what somebody pays for.
 
 ```sh
-$ cm worker --slots 3 --can linux --rate 1          # each machine announces
-$ cm worker --slots 3 --can linux --can gpu --rate 10   # what it costs
+$ cm worker --can linux --rate 1          # each machine announces
+$ cm worker --can linux --can gpu --rate 10   # what it costs
 
 $ cm tenant add team --credits 40 --window 3600 --member dana
 $ cm admin spend
@@ -429,7 +430,7 @@ CM_HOME=/tmp/ctrl cm controller &
 
 WINV=$(SIRJI_HOME=/tmp/acme sirji device invite cm-w-1 | tail -1)
 CM_HOME=/tmp/w1 cm init --parent "$WINV"
-CM_HOME=/tmp/w1 cm worker --slots 1 --can linux &
+CM_HOME=/tmp/w1 cm worker --can linux &
 
 # the developer enrols a tester, and asks
 TINV=$(SIRJI_HOME=/tmp/dev sirji device invite cm-t | tail -1)

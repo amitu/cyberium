@@ -172,8 +172,6 @@ pub struct WorkerHandle {
 pub struct Register {
     /// What the worker calls itself, so a caller can be told something meaningful.
     pub name: String,
-    /// How many jobs it will take at once.
-    pub slots: u32,
     /// What it can do. Matched against what a plea asks for.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,

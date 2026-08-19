@@ -70,10 +70,12 @@ cm — cost-aware allocation of test machines
         They write policy.md; you write tenant.toml, which is what stops a
         tenant setting its own quota or claiming somebody else's callers.
 
-  cm worker [--controller <name>] [--slots N] [--can <cap>]... [--rate N]
-        offer this machine to the controller. --rate is what it costs in
-        credits per minute while held; the machine announces its own, because
-        the machine is what knows. Unstated means 1, never free.
+  cm worker [--controller <name>] [--can <cap>]... [--rate N]
+        offer this machine to the controller. One tenancy at a time — for
+        concurrency run more of these, and let the OS provide the limits and
+        isolation. --rate is what it costs in credits per minute while held;
+        the machine announces its own, because the machine is what knows.
+        Unstated means 1, never free.
         --pre <cmd>   make the machine fit before each tenancy
         --post <cmd>  take back what the last tenant left
         Both belong to whoever runs the machine: a caller cannot supply them,
@@ -609,20 +611,16 @@ impl Control {
             proto::Look::Fleet => {
                 let (machines, free, capabilities) = fleet.summary();
                 lines.push(format!(
-                    "{machines} machine(s), {free} with a free slot, can {capabilities:?}"
+                    "{machines} machine(s), {free} free, can {capabilities:?}"
                 ));
                 for w in fleet.workers() {
-                    let held = if w.held_by.is_empty() {
-                        "idle".to_string()
-                    } else {
-                        format!("held by {}", w.held_by.join(", "))
+                    let held = match &w.held_by {
+                        None => "idle".to_string(),
+                        Some(id) => format!("held by {id}"),
                     };
                     lines.push(format!(
-                        "  {:<12} {}/{} free  can {:?}  {held}",
-                        w.name,
-                        w.free_slots(),
-                        w.slots,
-                        w.capabilities
+                        "  {:<12} {:>3} credit(s)/min  can {:?}  {held}",
+                        w.name, w.rate, w.capabilities
                     ));
                 }
             }
@@ -957,8 +955,8 @@ async fn serve_worker(
 ) -> Result<()> {
     let name = register.name.clone();
     println!(
-        "worker {name} arrived: {} slot(s), {} credit(s)/min, can {:?}",
-        register.slots, register.rate.max(1), register.capabilities
+        "worker {name} arrived: {} credit(s)/min, can {:?}",
+        register.rate.max(1), register.capabilities
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Aadesh>(16);
@@ -967,11 +965,10 @@ async fn serve_worker(
         name: name.clone(),
         key,
         hints: register.hints,
-        slots: register.slots.max(1),
         capabilities: register.capabilities,
         // A machine of unknown cost must not be free, so silence means one.
         rate: register.rate.max(1),
-        held_by: Vec::new(),
+        held_by: None,
     });
 
     // Push orders down the registration stream for as long as it is open. When it
@@ -1050,7 +1047,6 @@ const PREPARE_PATIENCE_SECS: u64 = HYGIENE_SECS;
 
 async fn worker(args: &[&str]) -> Result<()> {
     let mut controller_name = "cm-c".to_string();
-    let mut slots = 1u32;
     let mut capabilities: Vec<String> = Vec::new();
     let mut rate = 1u32;
     let mut hygiene = Hygiene::default();
@@ -1070,10 +1066,6 @@ async fn worker(args: &[&str]) -> Result<()> {
                 controller_name = args.get(i + 1).unwrap_or(&"cm-c").to_string();
                 i += 2;
             }
-            "--slots" => {
-                slots = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
-                i += 2;
-            }
             "--rate" => {
                 // What this machine costs, in credits per minute while held. The
                 // machine announces it because the machine is what knows.
@@ -1090,18 +1082,6 @@ async fn worker(args: &[&str]) -> Result<()> {
         }
     }
 
-    // Hygiene is machine-wide, and a machine hosting two tenants at once has no
-    // "between tenants" to be scrubbed in: cleaning up after one would delete the
-    // other's work mid-run. Refuse the combination rather than do something plausible
-    // and wrong — an operator who wants both wants two workers.
-    if slots > 1 && (hygiene.pre.is_some() || hygiene.post.is_some()) {
-        bail!(
-            "--pre/--post clean the whole machine, so they cannot be used with \
-             --slots {slots}: there is no moment between tenants to clean in. \
-             Run one worker per concurrent tenancy instead."
-        );
-    }
-
     let home = home()?;
     sirji::Settings::load(&home)?.activate();
     let config = load_config(&home)?;
@@ -1110,8 +1090,8 @@ async fn worker(args: &[&str]) -> Result<()> {
     // We listen, because a caller granted this machine dials it directly.
     let endpoint = sirji::bind(secret).await?;
     println!(
-        "worker `{}` listening as {} — {} slot(s), {rate} credit(s)/min, can {:?}",
-        config.name, config.key, slots, capabilities
+        "worker `{}` listening as {} — {rate} credit(s)/min, can {:?}",
+        config.name, config.key, capabilities
     );
 
     let assigned: Assigned = Arc::new(Mutex::new(Default::default()));
@@ -1138,7 +1118,6 @@ async fn worker(args: &[&str]) -> Result<()> {
                     &config,
                     &home,
                     &controller_name,
-                    slots,
                     &capabilities,
                     rate,
                     &hints,
@@ -1179,7 +1158,6 @@ async fn offer(
     config: &Config,
     home: &std::path::Path,
     controller_name: &str,
-    slots: u32,
     capabilities: &[String],
     rate: u32,
     hints: &[String],
@@ -1212,7 +1190,6 @@ async fn offer(
         &mut send,
         &Register {
             name: config.name.clone(),
-            slots,
             capabilities: capabilities.to_vec(),
             rate,
             hints: hints.to_vec(),
