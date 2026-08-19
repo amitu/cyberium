@@ -2,9 +2,9 @@
 
 Where the organisation's rules live, how they get there, and who may change them.
 
-> **Status.** The file, its two halves, the deterministic gate, **one policy per
-> tenant** and **the host's ceiling** are built and running. `nivedanas/`, the model
-> call, `cm test-policy` and `cm upload-policy` are designed and **not built**.
+> **Status.** The file, its two halves, the deterministic gate, one policy per tenant,
+> the host's ceiling, budgets and **the model call** are built and running.
+> `nivedanas/`, `cm test-policy` and `cm upload-policy` are designed and **not built**.
 
 ## The file has two halves on purpose
 
@@ -28,10 +28,50 @@ The fenced block is read **deterministically**. A caller outside `requesters` is
 refused without a model ever being consulted, so the cheap gate stays cheap and a
 security decision never waits on a token.
 
-Everything after it is prose, to be weighed by a model against the reason a caller
-gave. That half is loaded today and not yet reasoned over — the controller applies
-the grants and the standing limit and says so in its rationale rather than
-pretending.
+Everything after it is prose, weighed by a model against the reason a caller gave —
+but only when the deterministic half has no answer, and only within a number the
+organisation wrote down.
+
+```yaml
+standing_limit: 2      # granted without argument, no model consulted
+max_limit: 4           # the most the *prose* may grant. Absent means it may not.
+```
+
+Under the standing limit, **no model is consulted at all** — verified by counting the
+prompts sent, which is zero. Above it, the prose gets a say, and three rules hold
+regardless of what any model returns:
+
+1. **It can only be persuaded within a range a human wrote.** The answer is clamped
+   to `max_limit`, and to what the caller actually asked for. The model argues; it
+   never becomes the gate. With no `max_limit`, prose cannot expand entitlement — the
+   default, so opting in is deliberate.
+2. **A refusal is always honoured.** Clamping is one-directional; down is safe.
+3. **Unreachable is not permission.** A model that times out or errors falls back to
+   the standing limit and says so in the rationale. A fleet that stopped working
+   because an API was down would be worse than one with no prose at all.
+
+The model sees the prose, the caller's declared fields, and what was attested about
+them. It does **not** see fleet state — mixing entitlement and availability would make
+the same plea weigh differently depending on who else was running, and an
+unreproducible decision cannot be snapshot-tested. There is a test that greps the
+assembled prompt for fleet vocabulary and fails if any of it appears.
+
+The fenced block is excluded from what the model reads: it has already been applied,
+and showing it again invites reinterpretation of a decision that was not the model's
+to make.
+
+Configured entirely by environment, because the key is the one value here that must
+not end up in a repository beside `policy.md`:
+
+```sh
+CM_MODEL_KEY=…     # unset means no model; the controller still works
+CM_MODEL=claude-sonnet-5
+CM_MODEL_URL=https://api.anthropic.com/v1/messages
+```
+
+Every weighing is logged with **both numbers** — what the model said and what it was
+bounded to — because "why did I get 4" must be answerable, and a clamp that left no
+trace would make an organisation's own ceiling invisible.
 
 The governing line, from the original design: **security is deterministic; policy is
 semantic.** You cannot spend a model call deciding whether to accept a connection.

@@ -21,6 +21,9 @@ anyhow = "1"
 # rather than reaching through sirji's re-exports: artifacts travelling as base64 is
 # cm's own concern, not something the substrate should have an opinion about.
 data-encoding = "2"
+# Already in the tree beneath iroh. Named directly because the model call is cm's
+# own business; rustls rather than the system TLS stack, to match what sirji does.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [

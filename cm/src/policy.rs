@@ -67,6 +67,20 @@ pub enum Ruling {
     Deny {
         rationale: String,
     },
+    /// The deterministic half has no answer: the prose must decide.
+    ///
+    /// Returned rather than resolved here so `policy.rs` stays synchronous and pure.
+    /// The model call needs a runtime, a network, a key and a timeout, and all four
+    /// already live at the controller — putting them here would make every test of
+    /// the cheap gate drag them along.
+    Consider {
+        /// What the caller asked for.
+        wanted: u32,
+        /// What they get without argument.
+        standing: u32,
+        /// The most the prose may grant. **Never** exceeded, whatever the model says.
+        max: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +103,12 @@ struct Grants {
     /// How long a grant survives unreleased. An org rule, not a constant: it has to
     /// sit above the longest suite anyone runs here.
     reservation_seconds: u64,
+    /// The most the **prose** may grant, above the standing limit.
+    ///
+    /// Absent means prose cannot expand entitlement at all, and that is the default
+    /// on purpose: a model should only be able to raise a number an organisation has
+    /// explicitly written down. Opt in, in your own file, to your own ceiling.
+    max_limit: Option<u32>,
     /// Credits this tenant allows itself per rolling window. Inside whatever the host
     /// allows, never beyond it.
     daily_budget: Option<u64>,
@@ -103,6 +123,7 @@ impl Default for Grants {
             requesters: vec!["everyone".into()],
             standing_limit: 10,
             reservation_seconds: 600,
+            max_limit: None,
             daily_budget: None,
             budget_window: None,
         }
@@ -149,14 +170,38 @@ impl Policy {
             };
         }
 
-        Ruling::Counter {
-            count: self.grants.standing_limit,
-            rationale: format!(
-                "the standing limit is {}; weighing the reason against the prose \
-                 needs the model call, which is not wired yet",
-                self.grants.standing_limit
-            ),
+        // Above the standing limit, the prose gets a say — but only up to a number
+        // this organisation wrote down. With no `max_limit`, prose cannot expand
+        // entitlement and the answer stays deterministic.
+        match self.grants.max_limit {
+            Some(max) if max > self.grants.standing_limit => Ruling::Consider {
+                wanted,
+                standing: self.grants.standing_limit,
+                max,
+            },
+            _ => Ruling::Counter {
+                count: self.grants.standing_limit,
+                rationale: format!(
+                    "the standing limit is {}, and this policy sets no max_limit, so \
+                     the prose cannot raise it",
+                    self.grants.standing_limit
+                ),
+            },
         }
+    }
+
+    /// The prose half — everything outside the fenced block.
+    ///
+    /// What a model is asked to weigh. The fenced block is deliberately excluded: it
+    /// has already been applied deterministically, and showing it again invites the
+    /// model to reinterpret a decision that was not its to make.
+    pub fn prose(&self) -> String {
+        match fenced_block(&self.text, "yaml") {
+            Some(block) => self.text.replace(block, "").replace("```yaml", "").replace("```", ""),
+            None => self.text.clone(),
+        }
+        .trim()
+        .to_string()
     }
 
     /// How long a grant survives unreleased.
@@ -228,6 +273,11 @@ fn parse_grants(text: &str) -> Result<Grants> {
                 "budget_window" => {
                     grants.budget_window = Some(value.parse().with_context(|| {
                         format!("budget_window: {value:?} is not a number of seconds")
+                    })?);
+                }
+                "max_limit" => {
+                    grants.max_limit = Some(value.parse().with_context(|| {
+                        format!("max_limit: {value:?} is not a number")
                     })?);
                 }
                 "reservation_seconds" => {
@@ -313,6 +363,52 @@ mod tests {
         assert_eq!(p.reservation_secs(), 7200);
         // And an org that says nothing gets the default rather than no timeout.
         assert_eq!(policy("no block here").reservation_secs(), 600);
+    }
+
+    #[test]
+    fn prose_cannot_expand_entitlement_unless_the_org_said_so() {
+        // The safe default: with no max_limit, a model has no room to raise anything,
+        // and the answer stays deterministic. Opting in is the organisation's act.
+        let p = policy("```yaml\nstanding_limit: 4\n```");
+        match p.weigh("dana", &plea(Some(50))) {
+            Ruling::Counter { count, rationale } => {
+                assert_eq!(count, 4);
+                assert!(rationale.contains("no max_limit"), "{rationale}");
+            }
+            other => panic!("expected a counter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn above_the_standing_limit_the_prose_gets_a_say() {
+        let p = policy("```yaml\nstanding_limit: 4\nmax_limit: 20\n```");
+        match p.weigh("dana", &plea(Some(12))) {
+            Ruling::Consider { wanted, standing, max } => {
+                assert_eq!((wanted, standing, max), (12, 4, 20));
+            }
+            other => panic!("expected Consider, got {other:?}"),
+        }
+        // And below it, no model is consulted — the cheap gate stays cheap.
+        assert!(matches!(p.weigh("dana", &plea(Some(3))), Ruling::Allow { .. }));
+    }
+
+    #[test]
+    fn a_max_below_the_standing_limit_is_ignored_not_obeyed() {
+        // It would otherwise *lower* what is already granted without argument, which
+        // is not what a maximum means.
+        let p = policy("```yaml\nstanding_limit: 10\nmax_limit: 5\n```");
+        assert!(matches!(p.weigh("dana", &plea(Some(50))), Ruling::Counter { count: 10, .. }));
+    }
+
+    #[test]
+    fn the_prose_half_excludes_the_fenced_block() {
+        // The block has already been applied deterministically. Showing it to a model
+        // invites it to reinterpret a decision that was never its to make.
+        let p = policy(STARTER);
+        let prose = p.prose();
+        assert!(!prose.contains("standing_limit:"), "{prose}");
+        assert!(!prose.contains("requesters:"), "{prose}");
+        assert!(prose.contains("Circumstantial override"), "{prose}");
     }
 
     #[test]

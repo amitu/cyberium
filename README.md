@@ -332,10 +332,31 @@ Policy decides *entitlement*; it never picks machines. What is free, and which o
 them can do the work, is the fleet's business — keeping those apart is what lets
 policy stay a text file.
 
-**The model half is not wired yet.** Today the controller applies the grants and
-the standing limit; the prose is read and carried but not yet reasoned over. That
-sequencing is deliberate — the transport, the identity and the refusal paths are
-worth proving before anything non-deterministic joins in.
+**The model is asked only when the deterministic half runs out of answer**, and
+only within a number a human wrote:
+
+```yaml
+standing_limit: 2      # granted without argument
+max_limit: 4           # the most the *prose* may grant. Absent means it may not.
+```
+
+Below the standing limit no model is consulted at all — the common case never
+leaves the machine. Above it the prose gets a say, bounded three ways that hold
+whatever comes back: the answer is clamped to `max_limit` and to what was actually
+asked for, a refusal is always honoured, and a model that times out falls back to
+the standing limit and says so. A fleet that stopped working because an API was
+down would be worse than one with no prose at all.
+
+The model never sees fleet state. Mixing entitlement with availability would make
+the same plea weigh differently depending on who else happened to be running, and
+an unreproducible decision cannot be tested — so a scenario greps the assembled
+prompt for fleet vocabulary and fails if it finds any. Both numbers are logged,
+what the model said and what it was bounded to, because "why did I get 4" has to
+be answerable.
+
+```sh
+CM_MODEL_KEY=…   # unset means no model, and the controller still works
+```
 
 **A folder per tenant, and two files with different owners:**
 
@@ -453,11 +474,14 @@ SIRJI=/path/to/sirji scripts/fleet.sh
 Early, and running end to end: enrolment, resolution, ticket, capability-matched
 allocation, machines fetching the code themselves into isolated checkouts, real
 commands with their output streamed back live, artifacts returned as bytes, release,
-and reclaim after a caller walks away. Verified against a real 1,900-test Playwright
+reclaim after a caller walks away, per-tenant policy, credit budgets, and the model
+call for `policy.md`'s prose half. Verified against a real 1,900-test Playwright
 suite, sharded across a fleet and merged into one report.
 
-Next: the model call for `policy.md`'s prose half — the last stubbed part — and
-caching the install step, which is now the slowest thing in a run.
+Next: `nivedanas/` — named pleas, so a policy is weighed against a phrase the
+organisation wrote rather than free text a caller typed — then `cm test-policy`, so
+a policy change can be reviewed like code. And caching the install step, which is
+now the slowest thing in a run.
 
 ## License
 

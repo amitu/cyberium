@@ -16,6 +16,7 @@
 //! fleet lives in exactly one place.
 
 mod admin;
+mod adviser;
 mod budget;
 mod fleet;
 mod policy;
@@ -335,6 +336,9 @@ struct Control {
     /// re-read: adding an admin is rare, deliberate, and worth a restart, and a list
     /// that reloads itself is a list a stray file write can extend.
     admins: admin::Admins,
+    /// Weighs the prose half of a tenant's policy. `Unwired` when no model is
+    /// configured, which is a working controller rather than a broken one.
+    adviser: Box<dyn adviser::Adviser>,
     fleet: Mutex<Fleet>,
     /// A channel per registered worker, for pushing orders down its open stream.
     orders: Mutex<std::collections::BTreeMap<String, tokio::sync::mpsc::Sender<Aadesh>>>,
@@ -381,6 +385,12 @@ async fn controller() -> Result<()> {
         );
     }
 
+    let adviser: Box<dyn adviser::Adviser> = match adviser::Claude::from_env() {
+        Some(claude) => Box::new(claude),
+        None => Box::new(adviser::Unwired),
+    };
+    println!("prose weighed by: {}", adviser.describe());
+
     let secret = keys(&home).secret(&id52::decode(&config.key)?)?;
     let endpoint = sirji::bind(secret.clone()).await?;
 
@@ -389,6 +399,7 @@ async fn controller() -> Result<()> {
         config: config.clone(),
         tenants: Mutex::new(tenants),
         admins,
+        adviser,
         orders: Mutex::new(Default::default()),
         // Tickets admitting a caller to a worker are signed by us, and verified by
         // the worker against the controller key it registered with. The mechanism
@@ -486,12 +497,66 @@ impl Control {
                 return Err(Verdict::Counter { count, rationale });
             }
             Ruling::Allow { count, rationale } => (count, rationale),
+
+            // The deterministic half has no answer, so the prose gets a say.
+            Ruling::Consider { wanted, standing, max } => {
+                let advice = adviser::Advice {
+                    prose: tenant.policy.prose(),
+                    attested: adviser::Attested {
+                        tenant: tenant.alias.clone(),
+                        caller: alias.to_string(),
+                    },
+                    declared: adviser::Declared {
+                        why: nivedana.why.clone(),
+                        count: wanted,
+                        capabilities: nivedana.capabilities.clone(),
+                        role: nivedana.role.clone(),
+                    },
+                    standing,
+                    max,
+                };
+                match self.adviser.weigh(&advice).await {
+                    Ok(opinion) if opinion.denies() => {
+                        println!("the prose refused {alias}: {}", opinion.rationale);
+                        return Err(Verdict::Deny { rationale: opinion.rationale });
+                    }
+                    Ok(opinion) => {
+                        let bounded = opinion.bounded(&advice);
+                        // Logged with both numbers: "why did I get 12" must be
+                        // answerable, and a clamp that left no trace would make an
+                        // organisation's own ceiling invisible.
+                        println!(
+                            "the prose weighed {alias}: asked {wanted}, said {}, bounded to {bounded} (max {max}) — {}",
+                            opinion.count, opinion.rationale
+                        );
+                        if bounded < wanted {
+                            return Err(Verdict::Counter {
+                                count: bounded,
+                                rationale: opinion.rationale,
+                            });
+                        }
+                        (bounded, Some(opinion.rationale))
+                    }
+                    Err(e) => {
+                        // Unreachable is not permission, and it is not a refusal
+                        // either: the deterministic answer was always available, so
+                        // fall back to it and say why.
+                        eprintln!("could not weigh the prose for {alias}: {e:#}");
+                        return Err(Verdict::Counter {
+                            count: standing,
+                            rationale: format!(
+                                "the standing limit is {standing}; the reason could not be weighed ({e})"
+                            ),
+                        });
+                    }
+                }
+            }
         };
 
         // Say which limit bit them. "You get 10" without a reason invites somebody
         // to go and edit a policy that was never the constraint.
         let (allowed, capped) = tenant.clamp(allowed);
-        let mut rationale = capped.or(rationale);
+        let rationale = capped.or(rationale);
 
         // Third clamp: money. A ceiling of three machines says nothing about whether
         // they run for a minute or a fortnight, and the fortnight is what somebody
@@ -818,11 +883,9 @@ impl Caller {
     /// Admin membership is decided by **key**, against a list the host wrote by
     /// hand — never by being a sibling, and never by anything the caller says.
     fn with_admin(mut self, admins: &admin::Admins, key: &str) -> Self {
-        if self.sibling {
-            if let Some(found) = admins.by_key(key) {
-                self.alias = found.name.clone();
-                self.admin = Some(found.name.clone());
-            }
+        if let Some(found) = admins.by_key(key).filter(|_| self.sibling) {
+            self.alias = found.name.clone();
+            self.admin = Some(found.name.clone());
         }
         self
     }
