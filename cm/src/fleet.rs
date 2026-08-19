@@ -415,7 +415,7 @@ mod tests {
 
     fn plea(caps: &[&str]) -> Nivedana {
         Nivedana {
-            why: "because".into(),
+            why: Some("because".into()),
             capabilities: caps.iter().map(|c| (*c).to_string()).collect(),
             ..Default::default()
         }

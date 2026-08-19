@@ -102,8 +102,7 @@ mod tests {
 
     #[test]
     fn nobody_is_an_admin_by_default() {
-        let root = std::env::temp_dir().join(format!("cm-admin-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::testing::scratch("admin");
         let admins = Admins::load(&root).unwrap();
         // The file being absent must not mean "everyone", which is the failure mode
         // this whole class exists to prevent.
@@ -142,8 +141,7 @@ mod tests {
 
     #[test]
     fn it_round_trips() {
-        let root = std::env::temp_dir().join(format!("cm-admin-rt-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::testing::scratch("admin-rt");
         let mut admins = Admins::default();
         let k = key(6);
         admins.add(Admin { name: "ops".into(), key: k.clone(), note: Some("laptop".into()) }).unwrap();

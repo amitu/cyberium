@@ -74,6 +74,9 @@ pub struct Tenant {
     pub alias: String,
     pub terms: Terms,
     pub policy: Policy,
+    /// The pleas this tenant will hear. Empty means it wrote none, and free text is
+    /// still accepted from it.
+    pub nivedanas: crate::nivedana::Nivedanas,
 }
 
 impl Tenant {
@@ -298,6 +301,7 @@ fn read(dir: &Path, alias: &str) -> Result<Tenant> {
         alias: alias.to_string(),
         terms,
         policy: Policy::load(dir)?,
+        nivedanas: crate::nivedana::Nivedanas::load(dir)?,
     })
 }
 
@@ -306,14 +310,7 @@ mod tests {
     use super::*;
 
     fn temp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cm-tenant-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::testing::scratch("tenant");
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -416,10 +416,41 @@ The tenant is chosen by **the verified alias in the caller's ticket** — minted
 controller's own sirji, not asserted by the caller — so this needed no accounts and
 no new credential. Adding a tenant or editing a policy needs no restart.
 
-What is not built: `nivedanas/`, the model call, `cm test-policy`, `cm upload-policy`,
-and the credential story. Three design notes carry those, each opening with what does
-and does not exist: [docs/policy.md](docs/policy.md), [docs/budget.md](docs/budget.md)
-and [docs/auth.md](docs/auth.md).
+What is not built: `cm policy-test`, `cm upload-policy`, and the credential story.
+Three design notes carry those, each opening with what does and does not exist:
+[docs/policy.md](docs/policy.md), [docs/budget.md](docs/budget.md) and
+[docs/auth.md](docs/auth.md).
+
+## Named pleas
+
+The reason a caller gives is the one part of the prompt they write, and every
+allocation is weighed — so an organisation can write the reasons down instead. Any
+`.md` file in a tenant's `nivedanas/`; each heading is an alias, the prose under it is
+what the model reads:
+
+```markdown
+## Nightly regression
+
+The scheduled full-suite run. Routine and never urgent — it has all night. Prefer the
+cheapest machines and stay at the standing limit.
+```
+
+```sh
+cm t cm-c@acme --plea nightly-regression --count 2 --need linux
+CM_PLEA=production-incident CM_CONTEXT='{"incident":"INC-4471"}' npm test
+```
+
+The **whole catalogue** goes in the cached half of the prompt; the message carries only
+which alias was picked. So the words being weighed are the organisation's, the caller's
+contribution is an index into a list, and there is no caller prose to inject. A policy
+can name a plea and be understood, because the model has seen them all.
+
+**Writing one plea turns free text off for that tenant** — the file is the opt-in, with
+no flag to forget. Free text and unknown aliases are then refused *before any model
+call*, each refusal listing what the tenant will actually hear. Anything a caller still
+needs to add travels as `--context` JSON, in the data section, where a policy can
+require a field without any of it becoming instructions. A tenant that has written no
+pleas keeps working exactly as before, free text included.
 
 ## Budgets
 
@@ -508,14 +539,13 @@ SIRJI=/path/to/sirji scripts/fleet.sh
 Early, and running end to end: enrolment, resolution, ticket, capability-matched
 allocation, machines fetching the code themselves into isolated checkouts, real
 commands with their output streamed back live, artifacts returned as bytes, release,
-reclaim after a caller walks away, per-tenant policy, credit budgets, and the model
-call for `policy.md`'s prose half. Verified against a real 1,900-test Playwright
-suite, sharded across a fleet and merged into one report.
+reclaim after a caller walks away, per-tenant policy, credit budgets, the model call
+for `policy.md`'s prose half, and named pleas. Verified against a real 1,900-test
+Playwright suite, sharded across a fleet and merged into one report.
 
-Next: `nivedanas/` — named pleas, so a policy is weighed against a phrase the
-organisation wrote rather than free text a caller typed — then `cm test-policy`, so
-a policy change can be reviewed like code. And caching the install step, which is
-now the slowest thing in a run.
+Next: `cm policy-test`, so a change to a policy or a plea can be reviewed like code —
+snapshots of what a given plea against a given fleet should be granted. And caching
+the install step, which is now the slowest thing in a run.
 
 ## License
 

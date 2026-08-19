@@ -306,7 +306,7 @@ mod tests {
 
     fn plea(count: Option<u32>) -> Nivedana {
         Nivedana {
-            why: "because".into(),
+            why: Some("because".into()),
             count,
             ..Default::default()
         }

@@ -3,8 +3,8 @@
 Where the organisation's rules live, how they get there, and who may change them.
 
 > **Status.** The file, its two halves, the deterministic gate, one policy per tenant,
-> the host's ceiling, budgets and **the model call** are built and running.
-> `nivedanas/`, `cm test-policy` and `cm upload-policy` are designed and **not built**.
+> the host's ceiling, budgets, the model call and **`nivedanas/`** are built and
+> running. `cm policy-test` and `cm upload-policy` are designed and **not built**.
 
 ## The file has two halves on purpose
 
@@ -329,3 +329,79 @@ Two things to design in from the start:
   red build.
 - **The real value is catching the day the model changes under you.** Your wording
   did not move; the decisions did. Nothing else in the system would tell you.
+
+
+## `nivedanas/` — the pleas an organisation will hear
+
+A nivedana (निवेदन, a plea) is the reason a caller wants machines. As free text it is
+the one part of the prompt written by whoever is asking — and now that every plea is
+weighed, that untrusted string is on the input path of every allocation. It is labelled
+as data, and the answer is clamped whatever the model says, but neither is a guarantee
+about what a well-crafted paragraph might talk a model into.
+
+So an organisation can write the pleas down instead. Any `.md` file in the tenant's
+`nivedanas/` directory; each heading is an alias, and the prose under it is what the
+model reads:
+
+```markdown
+## Nightly regression
+
+The scheduled full-suite run. Routine, predictable and never urgent — it has all night.
+Prefer the cheapest machines and stay at the standing limit.
+
+## Production incident
+
+An engineer is bisecting a live outage. Worth the maximum and worth the money, but only
+if the context names an incident.
+```
+
+A caller names one:
+
+```sh
+cm t cm-c@acme --plea nightly-regression --count 2 --need linux
+CM_PLEA=production-incident CM_CONTEXT='{"incident":"INC-4471"}' npm test
+```
+
+**The whole catalogue goes into the cached half of the prompt, and the message carries
+only which alias was picked.** So the words the model weighs are the organisation's, and
+the caller's entire contribution is an index into an org-authored list. Three things
+follow:
+
+- There is no prose to inject, because there is no caller prose at all.
+- A policy can name a plea and be understood, because the model has seen them all.
+- The prompt prefix stays byte-identical between requests, so it stays cacheable — the
+  catalogue is stable per tenant even though the choice is not.
+
+**Writing one plea turns free text off for that tenant.** Not a flag — the file *is* the
+opt-in, and there is nothing to forget to set. After that, free text is refused, an
+unknown alias is refused, and both refusals list what the tenant will actually hear.
+Both happen deterministically, **before any model call**: an alias that is not in the
+catalogue is not a question of interpretation, and refusing early keeps the caller's
+string off the model's input path entirely rather than sending it and hoping.
+
+Lookup is forgiving where it costs nothing: `## Nightly regression` answers to
+`nightly-regression`, `"Nightly Regression"` or `nightly_regression`, because a plea
+nobody can spell is a plea nobody uses. Nothing is renamed — the heading is still shown
+as written, and what reaches the prompt is the catalogue's own key, so a policy naming a
+plea and a request picking it always agree.
+
+Free text *alongside* a named plea is refused rather than dropped. Dropping it would
+weigh the request against different words than the caller believes they sent.
+
+### Context: the part callers still write
+
+Anything a caller genuinely needs to add travels as JSON:
+
+```sh
+CM_CONTEXT='{"incident":"INC-4471","branch":"release-9","queue_depth":41}'
+```
+
+Arbitrary on purpose. A schema here would become a list of every field any organisation
+might ever want, and the policy is already where meaning lives — so a policy can say
+"only if the context names an incident" and mean exactly that. It rides in the data
+section with the rest of the caller's own input, so a policy may *require* a field
+without any of it becoming something the model is told to obey.
+
+A tenant that has written no pleas keeps working exactly as before, free text included.
+That is the zero-config path, and it stays: an organisation that has not thought about
+this yet should not be blocked by it.

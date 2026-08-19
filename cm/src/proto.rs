@@ -80,9 +80,29 @@ pub struct Sight {
 /// The plea.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Nivedana {
-    /// Free-form English — the developer's actual reason, and the input the
-    /// policy's prose is weighed against.
-    pub why: String,
+    /// Which of the organisation's own pleas this is, by alias.
+    ///
+    /// Preferred over `why`, and required once a tenant has written any down: what the
+    /// model then weighs is the organisation's words, and the caller's contribution is
+    /// an index into a list rather than prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plea: Option<String>,
+    /// Free-form English — the developer's own reason.
+    ///
+    /// Only heard from tenants with no `nivedanas/` of their own. It is the one part of
+    /// a prompt written by the person asking, which is why an organisation can turn it
+    /// off simply by writing down the pleas it will hear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// Anything else the caller wants the policy to see: `{"incident": "INC-4471"}`,
+    /// a branch name, a queue depth, whatever this organisation's rules need.
+    ///
+    /// Arbitrary on purpose. A schema here would become a list of every field any
+    /// organisation might ever want, and the policy is already the place where meaning
+    /// lives. It travels as data, never as instruction — a policy may *require* a
+    /// field without any of it becoming something the model is told to obey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
     /// How many machines they think they need.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,

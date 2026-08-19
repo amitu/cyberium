@@ -162,14 +162,7 @@ mod tests {
     use super::*;
 
     fn temp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cm-budget-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::testing::scratch("budget");
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

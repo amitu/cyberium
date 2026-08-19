@@ -19,9 +19,12 @@ mod admin;
 mod adviser;
 mod budget;
 mod fleet;
+mod nivedana;
 mod policy;
 mod proto;
 mod tenant;
+#[cfg(test)]
+mod testing;
 
 use std::sync::Arc;
 
@@ -138,7 +141,13 @@ fn main() -> Result<std::process::ExitCode> {
         // `why` is positional but optional: a ping asks for nothing, so making
         // somebody justify one would be a small daily absurdity.
         ["test", target, rest @ ..] if rest.contains(&"--ping") => rt()?.block_on(ping(target)),
-        ["test", target, why, rest @ ..] => rt()?.block_on(test(target, why, rest)),
+        // The reason is optional: a caller naming one of the organisation's own pleas
+        // has nothing of their own to say, and a tenant with a catalogue would refuse
+        // the text anyway. A leading `--flag` is an argument, not a reason.
+        ["test", target, why, rest @ ..] if !why.starts_with("--") => {
+            rt()?.block_on(test(target, Some(why), rest))
+        }
+        ["test", target, rest @ ..] => rt()?.block_on(test(target, None, rest)),
         _ => {
             eprintln!("{USAGE}");
             bail!("unrecognised command: {}", args.join(" "));
@@ -487,13 +496,33 @@ impl Control {
         // every lock released before the model call. A 30s network round trip under
         // the tenants or fleet mutex would serialise every plea in the fleet behind
         // one caller's request.
-        let (tenant_name, prose, lifetime, host_ceiling, terms, standing, ceiling, wanted) = {
+        let (
+            tenant_name,
+            prose,
+            catalogue,
+            chosen,
+            lifetime,
+            host_ceiling,
+            terms,
+            standing,
+            ceiling,
+            wanted,
+        ) = {
             let mut tenants = self.tenants.lock().await;
             let Some(tenant) = tenants.for_caller(alias) else {
                 // Named, but not onboarded. Distinguished from a policy refusal
                 // because the fix is completely different — somebody has to run
                 // `cm tenant add`.
                 return refused(format!("{alias} is not a tenant of this controller"));
+            };
+
+            // Which plea this is, checked against the ones this organisation wrote
+            // down. Deterministic, and before the model: an alias that is not in the
+            // catalogue is not a question of interpretation, and refusing here keeps
+            // the caller's string off the model's input path entirely.
+            let chosen = match resolve_plea(&tenant.nivedanas, nivedana) {
+                Ok(chosen) => chosen,
+                Err(rationale) => return refused(rationale),
             };
 
             // Authorisation is deterministic; the number is not. How many machines a
@@ -506,6 +535,8 @@ impl Control {
             (
                 tenant.alias.clone(),
                 tenant.policy.prose(),
+                tenant.nivedanas.catalogue(),
+                chosen,
                 tenant.policy.reservation_secs(),
                 tenant.ceiling(),
                 tenant.budget(),
@@ -551,12 +582,15 @@ impl Control {
 
         let advice = adviser::Advice {
             prose,
+            catalogue,
             attested: adviser::Attested {
                 tenant: tenant_name.clone(),
                 caller: alias.to_string(),
             },
             declared: adviser::Declared {
+                plea: chosen,
                 why: nivedana.why.clone(),
+                context: nivedana.context.clone(),
                 count: wanted,
                 capabilities: nivedana.capabilities.clone(),
                 role: nivedana.role.clone(),
@@ -943,6 +977,57 @@ impl Caller {
         }
         self
     }
+}
+
+/// Which of the organisation's pleas this request is, if it named one.
+///
+/// Returns the alias as the catalogue spells it, so what reaches the prompt is the
+/// organisation's own key rather than the caller's spelling of it.
+///
+/// Once a tenant has written any plea down, free text stops being heard from it. That
+/// is the whole point: it is how an organisation takes the one caller-written string
+/// off the input path of its own decisions, and writing the file is how it opts in —
+/// there is no flag to forget.
+fn resolve_plea(
+    known: &nivedana::Nivedanas,
+    asked: &Nivedana,
+) -> std::result::Result<Option<String>, String> {
+    let named = asked.plea.as_deref().map(str::trim).filter(|p| !p.is_empty());
+
+    if known.is_empty() {
+        // Nothing written down. A named plea cannot be honoured, and quietly ignoring
+        // it would weigh the request against something other than what was asked.
+        if let Some(name) = named {
+            return Err(format!(
+                "this tenant has no `{}/` — nothing here is called `{name}`",
+                nivedana::DIR
+            ));
+        }
+        return Ok(None);
+    }
+
+    let Some(name) = named else {
+        return Err(format!(
+            "this tenant answers named pleas only. Name one with `--plea`: {}",
+            known.aliases().join(", ")
+        ));
+    };
+    let Some(_) = known.get(name) else {
+        // The list, not just the news that they were wrong.
+        return Err(format!(
+            "no plea called `{name}` here. There is: {}",
+            known.aliases().join(", ")
+        ));
+    };
+    // Free text alongside a named plea is refused rather than dropped: dropping it
+    // would silently weigh the request against different words than the caller thinks.
+    if asked.why.as_deref().is_some_and(|w| !w.trim().is_empty()) {
+        return Err(format!(
+            "`{name}` is a named plea, so the free-text reason cannot also be heard — \
+             put anything extra in the context JSON, where policy can require it"
+        ));
+    }
+    Ok(Some(nivedana::alias_of(name)))
 }
 
 /// What policy and the fleet concluded: a number, or a verdict to send instead.
@@ -1915,12 +2000,28 @@ async fn run_command(
 // the tester
 // ---------------------------------------------------------------------------
 
-async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::ExitCode> {
+async fn test(
+    target: &str,
+    why: Option<&str>,
+    args: &[&str],
+) -> Result<std::process::ExitCode> {
+    // The positional reason is free text, so it is only heard by tenants that wrote no
+    // pleas of their own. `--plea` is the other way in, and the one CI should use.
     let mut nivedana = Nivedana {
-        why: why.to_string(),
+        why: why.map(str::to_string).filter(|w| !w.trim().is_empty()),
+        plea: std::env::var("CM_PLEA").ok().filter(|p| !p.trim().is_empty()),
         role: std::env::var("CM_T_ROLE").ok(),
         ..Default::default()
     };
+    // Whatever the caller's CI wants the policy to see. Parsed here rather than passed
+    // through as a string, so a job with a broken template is told so by the tool it
+    // ran instead of by a refusal it cannot read.
+    if let Some(raw) = std::env::var("CM_CONTEXT").ok().filter(|c| !c.trim().is_empty()) {
+        nivedana.context = Some(
+            serde_json::from_str(&raw)
+                .with_context(|| format!("CM_CONTEXT is not JSON: {raw:?}"))?,
+        );
+    }
     let mut job = Job {
         command: "echo hello".to_string(),
         workspace: None,
@@ -1997,6 +2098,18 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
             }
             "--role" => {
                 nivedana.role = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            "--plea" => {
+                nivedana.plea = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            "--context" => {
+                let raw = args.get(i + 1).copied().unwrap_or_default();
+                nivedana.context = Some(
+                    serde_json::from_str(raw)
+                        .with_context(|| format!("--context is not JSON: {raw:?}"))?,
+                );
                 i += 2;
             }
             "--run" => {
@@ -2803,7 +2916,7 @@ mod tests {
         // The path in an artifact came from another machine. Only its filename is
         // ours to trust: answering with `../../..` must not write outside the
         // directory the caller named.
-        let dir = std::env::temp_dir().join(format!("cm-test-{}", std::process::id()));
+        let dir = testing::scratch("artifacts");
         let shard = Shard {
             worker: "w".into(),
             index: 0,
@@ -2824,7 +2937,7 @@ mod tests {
     fn shards_are_kept_apart() {
         // Two machines running the same command produce the same filename. One
         // directory each, or the second silently overwrites the first's results.
-        let dir = std::env::temp_dir().join(format!("cm-test-two-{}", std::process::id()));
+        let dir = testing::scratch("artifacts-two");
         let shards: Vec<Shard> = (0..2)
             .map(|index| Shard {
                 worker: format!("w{index}"),
@@ -2841,6 +2954,88 @@ mod tests {
         assert_ne!(written[0], written[1]);
         assert_eq!(std::fs::read(&written[1]).unwrap(), b"shard 1");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn pleas(entries: &[(&str, &str)]) -> nivedana::Nivedanas {
+        let root = testing::scratch("plea");
+        std::fs::create_dir_all(root.join(nivedana::DIR)).unwrap();
+        let text: String =
+            entries.iter().map(|(h, b)| format!("## {h}\n\n{b}\n\n")).collect();
+        std::fs::write(root.join(nivedana::DIR).join("p.md"), text).unwrap();
+        let loaded = nivedana::Nivedanas::load(&root).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        loaded
+    }
+
+    fn asking(plea: Option<&str>, why: Option<&str>) -> Nivedana {
+        Nivedana {
+            plea: plea.map(str::to_string),
+            why: why.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn with_no_pleas_written_down_free_text_is_still_heard() {
+        // The zero-config path has to keep working: a tenant that never wrote a
+        // `nivedanas/` is not opting into anything.
+        let none = nivedana::Nivedanas::default();
+        assert_eq!(resolve_plea(&none, &asking(None, Some("an incident"))), Ok(None));
+    }
+
+    #[test]
+    fn naming_a_plea_that_does_not_exist_is_refused_not_ignored() {
+        // Ignoring it would weigh the request against something other than what was
+        // asked for, and the caller would never know which.
+        let none = nivedana::Nivedanas::default();
+        let e = resolve_plea(&none, &asking(Some("nightly"), None)).unwrap_err();
+        assert!(e.contains("nothing here is called `nightly`"), "{e}");
+
+        let known = pleas(&[("nightly regression", "Routine.")]);
+        let e = resolve_plea(&known, &asking(Some("noctural"), None)).unwrap_err();
+        assert!(e.contains("no plea called `noctural`"), "{e}");
+        // With the list, because somebody who guessed wrong needs the answer.
+        assert!(e.contains("nightly-regression"), "{e}");
+    }
+
+    #[test]
+    fn writing_pleas_down_stops_free_text_being_heard_at_all() {
+        // The security property: with a catalogue, the only caller-written string on
+        // the model's input path is an alias that was checked against a list.
+        let known = pleas(&[("nightly regression", "Routine.")]);
+        let e = resolve_plea(&known, &asking(None, Some("just trust me"))).unwrap_err();
+        assert!(e.contains("named pleas only"), "{e}");
+        assert!(e.contains("nightly-regression"), "the refusal names what they can ask for");
+    }
+
+    #[test]
+    fn free_text_alongside_a_named_plea_is_refused_rather_than_dropped() {
+        // Dropping it silently would weigh the request against different words than the
+        // caller believes they sent.
+        let known = pleas(&[("nightly regression", "Routine.")]);
+        let e = resolve_plea(&known, &asking(Some("nightly-regression"), Some("also urgent!")))
+            .unwrap_err();
+        assert!(e.contains("cannot also be heard"), "{e}");
+    }
+
+    #[test]
+    fn the_prompt_gets_the_catalogue_s_spelling_not_the_caller_s() {
+        // Whatever they typed, what reaches the model is the organisation's own key —
+        // so a policy that names a plea and a request that picked it agree.
+        let known = pleas(&[("Nightly Regression", "Routine.")]);
+        assert_eq!(
+            resolve_plea(&known, &asking(Some("NIGHTLY_regression"), None)),
+            Ok(Some("nightly-regression".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_empty_plea_argument_is_the_same_as_none() {
+        // `--plea "$CM_PLEA"` with the variable unset is a blank string, not a request
+        // to find a plea called "".
+        let known = pleas(&[("nightly", "Routine.")]);
+        let e = resolve_plea(&known, &asking(Some("  "), None)).unwrap_err();
+        assert!(e.contains("named pleas only"), "{e}");
     }
 
     fn limit() -> Limit {

@@ -72,6 +72,21 @@ start_controller() {
 
 t() { CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme "$@"; }
 
+# The pleas this tenant will hear. Writing any is what stops free text being heard,
+# so the scenario below can show both sides of that switch.
+mkdir -p "$LAB/cm-c/root/tenants/team/nivedanas"
+cat >"$LAB/cm-c/root/tenants/team/nivedanas/pleas.md" <<'PLEAS'
+## Nightly regression
+
+The scheduled full-suite run. Routine, predictable and never urgent — it has all night.
+Prefer the cheapest machines and stay at the standing limit.
+
+## Production incident
+
+An engineer is bisecting a live outage. Worth the maximum and worth the money, but only
+if the context names an incident.
+PLEAS
+
 say "no key at all: the controller refuses to start, and says why"
 # Captured first: piping the controller straight into `grep -m1` makes grep exit while
 # cm is still writing, and under `pipefail` that SIGPIPE fails the whole script.
@@ -86,12 +101,21 @@ done
 for _ in $(seq 40); do [ "$(grep -c arrived cm-c.log || true)" -ge 6 ] && break; sleep 1; done
 grep "policy weighed by" cm-c.log | tail -1 | sed 's/^/  /' || true
 
-say "a small, routine plea is weighed too — the policy is not an exception handler"
-t "two is routine" --count 2 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
-echo "  prompts sent: $(sent)      (must be 1: the prose decides every plea)"
+say "this tenant wrote pleas down, so free text is refused — and it lists them"
+t "just trust me" --count 2 --need linux --dry-run 2>&1 | tail -1 | cut -c1-108 | sed 's/^/  /' || true
+echo "  prompts sent: $(sent)      (must be 0: refused before the model)"
 
-say "and a large one, by the same single call — model says 3 of the 3 asked"
-t "an incident, INC-4471" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
+say "a plea nobody wrote is refused too, with the list"
+t --plea noctural --count 2 --need linux --dry-run 2>&1 | tail -1 | cut -c1-108 | sed 's/^/  /' || true
+echo "  prompts sent: $(sent)      (still 0)"
+
+say "naming one of the org's own pleas — spelled however you like"
+t --plea "Nightly_Regression" --count 2 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
+echo "  prompts sent: $(sent)      (1: this one reached the model)"
+
+say "and the same for a big one, with context JSON the policy can require"
+t --plea production-incident --context '{"incident":"INC-4471"}' \
+  --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
 echo "  prompts sent: $(sent)      (one per plea, never two)"
 
 say "what the prompt actually contained"
@@ -103,6 +127,11 @@ both = sysp + user
 def check(label, ok):
     print(f"    {'ok  ' if ok else 'FAIL'} {label}")
 check("carries the org's prose",            "open production incident" in sysp)
+check("carries the whole catalogue",        "### nightly-regression" in sysp and "### production-incident" in sysp)
+check("says the caller may only pick",      "never write their own" in sysp)
+check("the chosen plea is in the message",  "plea: production-incident" in user)
+check("the plea's prose is not re-sent",    "bisecting a live outage" not in user)
+check("context rides along as data",        "INC-4471" in user)
 check("gives the fallback as calibration",  "2 is what it falls back to" in sysp)
 check("not as a floor",                     "not as a floor" in sysp)
 check("states the ceiling (4)",             "at most 4" in sysp)
@@ -124,17 +153,17 @@ PYX
 
 say "the model over-reaches: says 99, org wrote max_limit 4"
 stop_model; start_model allow 99
-t "give me everything" --count 6 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
+t --plea production-incident --count 6 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
 
 say "the prose refuses"
 stop_model; start_model deny 0
-t "no good reason" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /' || true
+t --plea nightly-regression --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /' || true
 
 say "the model is unreachable — an error, not a verdict, and nothing is substituted"
 stop_model
 # Asserted, not printed: `PIPESTATUS` after `|| true` reports the `true`, so an
 # earlier version of this line claimed success no matter what happened.
-out=$(t "still routine" --count 3 --need linux --dry-run 2>&1) && rc=0 || rc=$?
+out=$(t --plea nightly-regression --count 3 --need linux --dry-run 2>&1) && rc=0 || rc=$?
 # Printed whole rather than grepped for: this is the message a CI log will show, and
 # a scenario that asserted a substring would keep passing while it got worse.
 printf '%s\n' "$out" | tail -4 | cut -c1-110 | sed 's/^/  /' 
