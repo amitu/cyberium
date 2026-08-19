@@ -130,12 +130,14 @@ say "the prose refuses"
 stop_model; start_model deny 0
 t "no good reason" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /' || true
 
-say "the model is unreachable — the request FAILS, nothing is substituted"
+say "the model is unreachable — an error, not a verdict, and nothing is substituted"
 stop_model
 # Asserted, not printed: `PIPESTATUS` after `|| true` reports the `true`, so an
 # earlier version of this line claimed success no matter what happened.
 out=$(t "still routine" --count 3 --need linux --dry-run 2>&1) && rc=0 || rc=$?
-grep -m1 "undecided" <<<"$out" | cut -c1-100 | sed 's/^/  /' || true
+# Printed whole rather than grepped for: this is the message a CI log will show, and
+# a scenario that asserted a substring would keep passing while it got worse.
+printf '%s\n' "$out" | tail -4 | cut -c1-110 | sed 's/^/  /' 
 if [ "$rc" -eq 0 ]; then
   echo "  FAIL  it exited 0 — an unweighed request must fail"
 else

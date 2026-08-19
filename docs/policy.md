@@ -67,8 +67,19 @@ toward the ceiling. It is not a fallback — see below.
 
 ### There is no unweighed mode
 
-No key, a timeout, an API having a bad day: **the request fails**, with a verdict that
-says nothing was decided rather than that anything was refused.
+No key, a timeout, an API having a bad day: **the request fails**, and it fails as an
+error rather than as an answer.
+
+That distinction is in the types, not just the wording. A controller replies with an
+`Answer`, which is either a `Decided(Verdict)` or a `Fault`. A verdict is a judgement
+somebody's policy produced; a fault is the absence of one. They are separate because a
+fault dressed as a verdict is how a broken controller comes to look like a strict one —
+and inside the controller the model's failure is a plain `Err` propagated with `?`, so
+nothing downstream *can* mistake it for a decision: it never becomes one.
+
+A fault also **ends the conversation**. A controller that could not weigh this plea
+cannot weigh the next one either, and serving further requests on the same connection
+would be pretending otherwise.
 
 An earlier version fell back to `standing_limit` here, and that was worse than
 failing. It hands out machines on cm's authority rather than the organisation's, and

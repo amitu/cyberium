@@ -29,7 +29,8 @@ use anyhow::{Context, Result, bail};
 use fleet::{Fleet, Shortfall, Worker};
 use policy::Ruling;
 use proto::{
-    Aadesh, Artifact, Limits, Nivedana, Outcome, Plea, Register, Upadesh, Verdict, WorkerHandle,
+    Aadesh, Answer, Artifact, Limits, Nivedana, Outcome, Plea, Register, Upadesh, Verdict,
+    WorkerHandle,
 };
 use sirji::id52;
 // `write_all` here is quinn's own inherent method on the stream, not the tokio
@@ -481,7 +482,7 @@ impl Control {
         &self,
         alias: &str,
         nivedana: &Nivedana,
-    ) -> std::result::Result<(u32, Option<String>), Verdict> {
+    ) -> Result<Entitled> {
         // Everything the decision needs, gathered before anything slow happens — and
         // every lock released before the model call. A 30s network round trip under
         // the tenants or fleet mutex would serialise every plea in the fleet behind
@@ -492,16 +493,14 @@ impl Control {
                 // Named, but not onboarded. Distinguished from a policy refusal
                 // because the fix is completely different — somebody has to run
                 // `cm tenant add`.
-                return Err(Verdict::Deny {
-                    rationale: format!("{alias} is not a tenant of this controller"),
-                });
+                return refused(format!("{alias} is not a tenant of this controller"));
             };
 
             // Authorisation is deterministic; the number is not. How many machines a
             // plea deserves is the question the policy was written to answer, so it is
             // read for every request rather than only the large ones.
             let (wanted, standing, ceiling) = match tenant.policy.weigh(alias, nivedana) {
-                Ruling::Deny { rationale } => return Err(Verdict::Deny { rationale }),
+                Ruling::Deny { rationale } => return refused(rationale),
                 Ruling::Consider { wanted, standing, ceiling } => (wanted, standing, ceiling),
             };
             (
@@ -537,21 +536,17 @@ impl Control {
         // of these as "budget spent", which sent people to look at their credits over
         // hardware they did not have.)
         if brief.capable == 0 {
-            return Err(Verdict::Deny {
-                rationale: format!(
-                    "no machine in the fleet can do {:?} — waiting will not change that",
-                    nivedana.capabilities
-                ),
-            });
+            return refused(format!(
+                "no machine in the fleet can do {:?} — waiting will not change that",
+                nivedana.capabilities
+            ));
         }
         if brief.free == 0 {
-            return Err(Verdict::Deny {
-                rationale: format!(
-                    "{} machine(s) here can do {:?}, and none are free right now — \
-                     this one is worth retrying",
-                    brief.capable, nivedana.capabilities
-                ),
-            });
+            return refused(format!(
+                "{} machine(s) here can do {:?}, and none are free right now — \
+                 this one is worth retrying",
+                brief.capable, nivedana.capabilities
+            ));
         }
 
         let advice = adviser::Advice {
@@ -577,22 +572,20 @@ impl Control {
             money: money.clone(),
         };
 
-        let opinion = match self.adviser.weigh(&advice).await {
-            Ok(opinion) => opinion,
-            Err(e) => {
-                // No fallback, on purpose. There is no number to substitute that any
-                // organisation asked for, and inventing one here would keep the fleet
-                // running while nobody's policy is being applied.
-                eprintln!("could not weigh policy for {alias}: {e:#}");
-                return Err(Verdict::Unweighed {
-                    rationale: format!("this request could not be weighed: {e}"),
-                });
-            }
-        };
+        // No fallback, on purpose, and no verdict either — this leaves as an error.
+        // There is no number to substitute that any organisation asked for, and
+        // inventing one would keep the fleet running while nobody's policy is applied.
+        // A `?` is the whole safeguard: nothing downstream can mistake a fault for a
+        // decision, because it never becomes one.
+        let opinion = self
+            .adviser
+            .weigh(&advice)
+            .await
+            .with_context(|| format!("weighing {alias}'s plea"))?;
 
         if opinion.denies() {
             println!("policy refused {alias}: {}", opinion.rationale);
-            return Err(Verdict::Deny { rationale: opinion.rationale });
+            return refused(opinion.rationale);
         }
 
         let said = opinion.count;
@@ -638,16 +631,14 @@ impl Control {
             // In cm's own words. The model's sentence argued for a number nobody is
             // getting, and printing it beside a refusal produced denials that read
             // "granted what was asked" — true of the argument, false of the outcome.
-            return Err(Verdict::Deny {
-                rationale: if faults.is_empty() {
-                    format!("this policy granted none of the {wanted} asked for")
-                } else {
-                    faults.join("; ")
-                },
+            return refused(if faults.is_empty() {
+                format!("this policy granted none of the {wanted} asked for")
+            } else {
+                faults.join("; ")
             });
         }
 
-        Ok((allowed, Some(rationale)))
+        Ok(Ok((allowed, Some(rationale))))
     }
 
     /// Write a closed reservation into its tenant's ledger.
@@ -821,7 +812,7 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
     let who = match admit(&control, &knock, &caller_key) {
         Ok(who) => who,
         Err(rationale) => {
-            write_line(&mut send, &Verdict::Deny { rationale }).await?;
+            write_line(&mut send, &Answer::Decided(Verdict::Deny { rationale })).await?;
             send.finish()?;
             conn.closed().await;
             return Ok(());
@@ -831,22 +822,24 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
 
     // A tester may plead more than once on one connection, and releases on it too.
     while let Some(plea) = read_line::<Plea>(&mut recv).await? {
-        let verdict = match plea {
+        // Each arm produces a decision *or* a fault. Only the pleas that need a policy
+        // read can fault; the rest are answered from state we already hold.
+        let decided: Result<Verdict> = match plea {
             Plea::Ping => {
                 println!("{alias} pinged us");
-                Verdict::Pong
+                Ok(Verdict::Pong)
             }
             Plea::Inspect { what } => match &who.admin {
                 Some(name) => {
                     println!("{name} looked at {what:?}");
-                    Verdict::Saw(control.look(what).await)
+                    Ok(Verdict::Saw(control.look(what).await))
                 }
                 // Said plainly rather than pretending the command does not exist.
                 // Being one of our own devices is not enough — a worker is one of
                 // those — so the message names what is actually required.
-                None => Verdict::Deny {
+                None => Ok(Verdict::Deny {
                     rationale: "not an admin of this controller — see `cm admin add`".into(),
-                },
+                }),
             },
             Plea::Nivedana(nivedana) => decide(&control, &alias, &caller, &nivedana).await,
             Plea::Rehearse(nivedana) => rehearse(&control, &alias, &nivedana).await,
@@ -861,13 +854,32 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
                         );
                         control.charge(&closed);
                         control.tell_freed(reservation.as_str(), closed.workers()).await;
-                        Verdict::Ok
+                        Ok(Verdict::Ok)
                     }
-                    Err(reason) => Verdict::Deny { rationale: reason },
+                    Err(reason) => Ok(Verdict::Deny { rationale: reason }),
                 }
             }
         };
-        write_line(&mut send, &verdict).await?;
+
+        match decided {
+            Ok(verdict) => write_line(&mut send, &Answer::Decided(verdict)).await?,
+            Err(fault) => {
+                // Stop. A controller that could not weigh this plea cannot weigh the
+                // next one either, and serving further requests on this connection
+                // would be pretending otherwise. The caller is told plainly first,
+                // because a silently dropped stream in CI output is indistinguishable
+                // from a network problem.
+                eprintln!("could not answer {alias}: {fault:#}");
+                write_line(&mut send, &Answer::Fault { fault: format!("{fault:#}") }).await?;
+                // Then wait for *them* to hang up. Returning here would drop the
+                // connection an instant after the write and take the frame with it —
+                // the caller saw "connection lost: closed by peer" and never learned
+                // why, which is the one thing this whole path exists to tell them.
+                send.finish()?;
+                conn.closed().await;
+                return Ok(());
+            }
+        }
     }
     send.finish()?;
     Ok(())
@@ -933,6 +945,18 @@ impl Caller {
     }
 }
 
+/// What policy and the fleet concluded: a number, or a verdict to send instead.
+///
+/// Wrapped in a `Result` by its callers, whose `Err` means something different again —
+/// that nothing was concluded at all. Three outcomes, and the type says which is which:
+/// `Ok(Ok(n))` you may have n, `Ok(Err(v))` here is why not, `Err(e)` nobody decided.
+type Entitled = std::result::Result<(u32, Option<String>), Verdict>;
+
+/// A refusal is a decision, so it is an `Ok` carrying a verdict.
+fn refused(rationale: String) -> Result<Entitled> {
+    Ok(Err(Verdict::Deny { rationale }))
+}
+
 /// Every bound that is re-checked after the model has answered.
 ///
 /// All four were in the prompt. This exists for the case where the answer ignored one
@@ -994,10 +1018,12 @@ fn sanity(said: u32, bounded: u32, limit: Limit) -> (u32, Vec<String>) {
 /// selection through `choose` — and stops before the commit. Sharing `choose` rather
 /// than estimating is the whole point: an approximation would eventually disagree
 /// with the real path, and be believed.
-async fn rehearse(control: &Control, alias: &str, nivedana: &Nivedana) -> Verdict {
-    let (allowed, rationale) = match control.entitlement(alias, nivedana).await {
+async fn rehearse(control: &Control, alias: &str, nivedana: &Nivedana) -> Result<Verdict> {
+    // `?` on the outer result: a plea nobody could weigh leaves as an error and never
+    // becomes a verdict. The inner one is a real decision, so it is returned as one.
+    let (allowed, rationale) = match control.entitlement(alias, nivedana).await? {
         Ok(pair) => pair,
-        Err(refusal) => return refusal,
+        Err(refusal) => return Ok(refusal),
     };
 
     let chosen = control
@@ -1007,7 +1033,7 @@ async fn rehearse(control: &Control, alias: &str, nivedana: &Nivedana) -> Verdic
         .choose(&nivedana.capabilities, allowed);
 
     println!("{alias} asked what they would get");
-    match chosen {
+    Ok(match chosen {
         Ok(workers) => Verdict::Would {
             count: workers.len() as u32,
             rationale: rationale.unwrap_or_else(|| "as things stand".into()),
@@ -1023,13 +1049,20 @@ async fn rehearse(control: &Control, alias: &str, nivedana: &Nivedana) -> Verdic
                 "you may have up to {allowed}, and {available} matching machine(s) are free right now"
             ),
         },
-    }
+    })
 }
 
-async fn decide(control: &Control, alias: &str, caller: &str, nivedana: &Nivedana) -> Verdict {
-    let (allowed, rationale) = match control.entitlement(alias, nivedana).await {
+async fn decide(
+    control: &Control,
+    alias: &str,
+    caller: &str,
+    nivedana: &Nivedana,
+) -> Result<Verdict> {
+    // `?` on the outer result: a plea nobody could weigh leaves as an error and never
+    // becomes a verdict. The inner one is a real decision, so it is returned as one.
+    let (allowed, rationale) = match control.entitlement(alias, nivedana).await? {
         Ok(pair) => pair,
-        Err(refusal) => return refusal,
+        Err(refusal) => return Ok(refusal),
     };
     let lifetime = control.lifetime_for(alias).await;
     // Who pays. Not the caller's alias: several callers may share one tenant.
@@ -1040,19 +1073,19 @@ async fn decide(control: &Control, alias: &str, caller: &str, nivedana: &Nivedan
         match guard.allocate(nivedana, allowed, caller, alias, &tenant_name, lifetime) {
             Ok(allocation) => allocation,
             Err(Shortfall::NoneCapable { wanted }) => {
-                return Verdict::Deny {
+                return Ok(Verdict::Deny {
                     rationale: format!(
                         "no machine in the fleet can do {wanted:?} — waiting will not change that"
                     ),
-                };
+                });
             }
             Err(Shortfall::Fewer { available }) => {
-                return Verdict::Counter {
+                return Ok(Verdict::Counter {
                     count: available,
                     rationale: format!(
                         "you may have up to {allowed}, but {available} matching machine(s) are free"
                     ),
-                };
+                });
             }
         }
     };
@@ -1096,12 +1129,12 @@ async fn decide(control: &Control, alias: &str, caller: &str, nivedana: &Nivedan
         workers.len(),
         allocation.reservation
     );
-    Verdict::Grant {
+    Ok(Verdict::Grant {
         reservation: allocation.reservation,
         workers,
         expires_in: allocation.expires_in,
         rationale,
-    }
+    })
 }
 
 async fn serve_worker(
@@ -2222,14 +2255,15 @@ async fn inspect(what: proto::Look, args: &[&str]) -> Result<()> {
     write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
     write_line(&mut send, &Plea::Inspect { what }).await?;
 
-    let outcome = match read_line::<Verdict>(&mut recv).await? {
-        Some(Verdict::Saw(sight)) => {
+    let outcome = match read_line::<Answer>(&mut recv).await? {
+        Some(Answer::Decided(Verdict::Saw(sight))) => {
             for line in sight.lines {
                 println!("{line}");
             }
             Ok(())
         }
-        Some(Verdict::Deny { rationale }) => Err(anyhow::anyhow!("{rationale}")),
+        Some(Answer::Decided(Verdict::Deny { rationale })) => Err(anyhow::anyhow!("{rationale}")),
+        Some(Answer::Fault { fault }) => Err(anyhow::anyhow!("the controller faulted: {fault}")),
         other => Err(anyhow::anyhow!("unexpected answer: {other:?}")),
     };
 
@@ -2349,9 +2383,11 @@ async fn ping(target: &str) -> Result<std::process::ExitCode> {
         write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
         write_line(&mut send, &Plea::Ping).await?;
 
-        let answer = read_line::<Verdict>(&mut recv).await;
-        let verdict = match answer {
-            Ok(Some(verdict)) => verdict,
+        let verdict = match read_line::<Answer>(&mut recv).await {
+            Ok(Some(Answer::Decided(verdict))) => verdict,
+            // A fault here is the controller's to fix, and naming it that way is the
+            // difference between "check your credentials" and "check your controller".
+            Ok(Some(Answer::Fault { fault })) => return Ok(bad("controller", fault)),
             Ok(None) => return Ok(bad("auth", "the controller hung up without answering")),
             Err(e) => return Ok(bad("auth", format!("{e:#}"))),
         };
@@ -2364,7 +2400,6 @@ async fn ping(target: &str) -> Result<std::process::ExitCode> {
                 std::process::ExitCode::SUCCESS
             }
             Verdict::Deny { rationale } => bad("auth", rationale),
-            Verdict::Unweighed { rationale } => bad("controller", rationale),
             other => bad("auth", format!("unexpected answer: {other:?}")),
         };
 
@@ -2443,9 +2478,19 @@ async fn run(session: Session) -> Result<Results> {
         };
         write_line(&mut send, &plea).await?;
 
-        let verdict: Verdict = read_line(&mut recv)
+        let verdict = match read_line::<Answer>(&mut recv)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("the controller said nothing"))?;
+            .ok_or_else(|| anyhow::anyhow!("the controller said nothing"))?
+        {
+            Answer::Decided(verdict) => verdict,
+            // Nothing was granted, refused or held. Not a refusal: nobody read the
+            // request, so the fix is the controller's, and saying "denied" would send
+            // the caller off to argue with a policy that was never consulted.
+            Answer::Fault { fault } => bail!(
+                "the controller could not weigh this request: {fault}\n  \
+                 nothing was refused, and nothing was allocated. Tell whoever runs it."
+            ),
+        };
 
         let (reservation, workers, expires_in) = match verdict {
             Verdict::Would { count, rationale } => {
@@ -2467,12 +2512,6 @@ async fn run(session: Session) -> Result<Results> {
                 return Ok(Vec::new());
             }
             Verdict::Deny { rationale } => bail!("denied: {rationale}"),
-            // Not a refusal. Nobody read the request, so the fix is the controller's,
-            // and saying "denied" would send the caller to argue with a policy that
-            // was never consulted.
-            Verdict::Unweighed { rationale } => {
-                bail!("undecided: {rationale}\n  nothing was refused — the controller could not weigh this. Tell whoever runs it.")
-            }
             other => bail!("expected a verdict on our plea, got {other:?}"),
         };
         println!("  expires in {expires_in}s unless released");
@@ -2510,9 +2549,11 @@ async fn run(session: Session) -> Result<Results> {
         // when capacity is most worth returning, and holding it hostage to an error
         // path is how a fleet fills up with machines nobody is using.
         write_line(&mut send, &Plea::Release { reservation: reservation.clone() }).await?;
-        match read_line::<Verdict>(&mut recv).await? {
-            Some(Verdict::Ok) => println!("released {reservation}"),
-            Some(Verdict::Deny { rationale }) => eprintln!("release refused: {rationale}"),
+        match read_line::<Answer>(&mut recv).await? {
+            Some(Answer::Decided(Verdict::Ok)) => println!("released {reservation}"),
+            Some(Answer::Decided(Verdict::Deny { rationale })) => {
+                eprintln!("release refused: {rationale}")
+            }
             _ => eprintln!("release unacknowledged"),
         }
         Ok(results)

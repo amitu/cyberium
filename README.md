@@ -361,11 +361,14 @@ decision that did not happen.
   logged as a fault naming what overshot, not treated as the ordinary way an answer
   gets made.
 - **There is no unweighed mode.** No key, a timeout, an API having a bad day: the
-  request fails, and says nothing was decided rather than that anything was refused.
-  Substituting a number here would hand out machines on cm's authority instead of
-  the organisation's, invisibly, at the moment the component that reads the policy
-  stopped working. A missing key is fatal at startup, so an operator learns it from
-  a deploy log rather than from somebody's CI output.
+  request fails as an *error*, not as an answer. A controller replies with an
+  `Answer`, which is either a `Decided(Verdict)` or a `Fault` — separate types,
+  because a fault dressed as a verdict is how a broken controller comes to look like
+  a strict one. A fault ends the conversation, too: one that could not weigh this
+  plea cannot weigh the next. Substituting a number instead would hand out machines
+  on cm's authority rather than the organisation's, invisibly, at the moment the
+  component that reads the policy stopped working. A missing key is fatal at
+  startup, so an operator learns it from a deploy log rather than somebody's CI.
 
 Only one thing is decided before the prose: whether this caller may ask at all.
 That needs no interpretation, so an unauthorised caller is refused without spending

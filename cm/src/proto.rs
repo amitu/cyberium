@@ -120,17 +120,6 @@ pub enum Verdict {
     /// Refused, with a reason the caller can act on.
     Deny { rationale: String },
 
-    /// Nothing was decided: the policy could not be weighed at all.
-    ///
-    /// Distinct from `Deny` because the caller has not been refused — nobody read
-    /// their request. Retrying is reasonable, and an operator needs to fix something.
-    ///
-    /// The alternative was to substitute a number and grant it. That is worse than
-    /// failing: it hands out machines on cm's authority rather than the
-    /// organisation's, and it does so invisibly, at exactly the moment the component
-    /// that reads the policy has stopped working. A fleet that keeps running while
-    /// nobody's rules are being applied is not a working fleet.
-    Unweighed { rationale: String },
     /// Acknowledged — the answer to a release.
     Ok,
     /// What a rehearsal would have got, as things stand right now.
@@ -162,6 +151,28 @@ pub enum Verdict {
 }
 
 /// Where a granted machine is, and the ticket that admits us to it.
+/// What a controller sends back to a plea.
+///
+/// A [`Verdict`] is a judgement somebody's policy produced. `Fault` is the absence of
+/// one — the controller could not weigh the plea at all, because the model was
+/// unreachable, misconfigured, or answered nonsense.
+///
+/// They are separated at the type level rather than being two arms of `Verdict`,
+/// because a fault dressed as a verdict is how a broken controller comes to look like
+/// a strict one. Nothing downstream can accidentally treat "we could not decide" as a
+/// decision: it is not in the enum of decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Answer {
+    /// The plea was weighed. This is the outcome.
+    Decided(Verdict),
+    /// The plea was not weighed, and nothing was granted, refused or held.
+    ///
+    /// The conversation ends here: a controller that cannot weigh one plea cannot
+    /// weigh the next one either, and serving further requests on the same connection
+    /// would be pretending otherwise.
+    Fault { fault: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerHandle {
     pub name: String,
