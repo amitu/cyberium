@@ -67,11 +67,17 @@ The same split, for the same reason:
 
 | limit | set by | in |
 |---|---|---|
-| `daily_credits` | the host, in `tenant.toml` | credits |
-| `daily_budget` | the tenant, in `policy.md` | credits, or a currency |
+| `credits` + `window` | the host, in `tenant.toml` | credits over a rolling number of seconds |
+| `daily_budget` | the tenant, in `policy.md` | credits or a currency, over a rolling window or a named calendar |
 
 A tenant divides what they have between teams and purposes; the host decides how
 much that is. Without the outer one, `daily_budget: 100000000` is a valid file.
+
+The host's limit is deliberately the **duller** of the two: a rolling window of
+seconds, with no calendar and so no timezone. It is a billing ceiling, and a billing
+ceiling that needed to know when a team's day starts would be answering a question it
+has no business asking. Calendars belong to the tenant, in prose, where they can be
+as particular as they like.
 
 ## Currency in policy.md, credits everywhere else
 
@@ -102,26 +108,81 @@ Prose may also mention money — *"a production incident may spend up to 5000 ru
 — and the model needs the same conversion table in its prompt to reason about it.
 That is org-authored text, so it carries the same trust as the rest of `policy.md`.
 
-## What has to be persistent
+## Unix time, and nothing else
 
-A daily budget is meaningless if it resets when the controller restarts. So spend is
-a **ledger on disk**, per tenant, appended as reservations close:
+**cm stores instants. It never stores days.**
 
-```text
-<root>/tenants/dana/spend/2026-08-19.log
+Every timestamp in the ledger is unix seconds. There is no timezone in cm's
+configuration, no date in a filename, and no bucketing at write time — because *what
+counts as a day is policy*, and policy changes. A ledger that had already been
+bucketed could not be re-read under a new rule; one made of instants can.
+
+That also keeps cm out of an argument it has no standing in. A day starts at 8am in
+New York for one team and at midnight UTC for another, one of them observes daylight
+saving and the other does not, and a third counts a fiscal month. None of that is
+infrastructure's business.
+
+### Who does which half
+
+Timezones are semantic, so prose handles them:
+
+```markdown
+team_ny works New York hours, daylight saving included, and their day starts at 08:00.
+The platform team is on UTC. Neither may spend more than 4000 credits in a day.
 ```
 
-Append-only, one line per closed reservation, with the reservation id, the machines,
-the minutes, the rate applied, and the resulting credits. That makes "why is our
-budget gone" answerable, which a running total never is.
+But **the model must not do calendar arithmetic.** "Is unix 1786968121 after 08:00 in
+New York today, given DST" is exactly the sort of question a model answers
+confidently and wrongly. So the work splits along the line the rest of the design
+already uses:
 
-Deliberately not a database. An operator should be able to read it, and a day's
-worth of allocations is small.
+| does | who |
+|---|---|
+| read the prose and name the rule | the model — `{ tz: "America/New_York", day_starts_at: "08:00" }` |
+| turn that into a unix range | deterministic code, against a real tz database |
+| sum the ledger over that range | deterministic code |
+
+**The model extracts structure; code does the arithmetic.** DST correctness then comes
+from the tz database rather than from a language model's confidence, which is the only
+version of this that is safe to bill against.
+
+Cost: a tz database dependency, once the model half exists. Worth it, and narrower
+than the alternative — a schema of per-team timezone fields, DST flags and fiscal
+calendars that would never stop growing.
+
+### The deterministic half needs no calendar at all
+
+The cheap gate cannot wait for a model, so budgets in the fenced block are a
+**rolling window in seconds**:
+
+```yaml
+daily_budget: 4000
+budget_window: 86400        # rolling, from now
+```
+
+A rolling 24 hours needs no timezone, no DST and no tz database — which is why the
+deterministic path can enforce a budget today and stay correct. A named calendar is
+what you graduate to when a team needs their day to start at 08:00.
+
+### The ledger
+
+One append-only file per tenant, one line per closed reservation:
+
+```text
+<root>/tenants/dana/spend.log
+  1786968121 r7 cm-w-1,cm-w-3 12m rate=9 credits=108
+```
+
+Read backwards until the timestamps leave the window, which serves both a rolling
+window and a named one. Deliberately not a database: an operator should be able to
+read it, and it is what makes "why is our budget gone" answerable — a running total
+never is.
+
+Sharding, if it is ever needed, must be by **size or count, never by date**. A date
+in a filename is a timezone decision smuggled into a filesystem layout.
 
 ## Open questions
 
-- **Which day?** A budget "per day" needs a timezone, and the tenant's is not the
-  host's. Probably declared per tenant, defaulting to UTC.
 - **What happens at the limit** — refuse, or counter with fewer machines and a
   shorter lifetime? Countering is kinder and more complicated, and the model is well
   placed to choose. It should probably be policy's decision, not the code's.
