@@ -40,7 +40,7 @@ SIRJI_HOME=$LAB/dana $SIRJI accept acme "$INV" | sed 's/^/  /'
 
 # --- devices of the org: one controller, three workers --------------------
 say "enrol org devices"
-for d in cm-c cm-w-1 cm-w-2 cm-w-3; do
+for d in cm-c cm-w-1 cm-w-2 cm-w-3 cm-ops; do
   INV=$(SIRJI_HOME=$LAB/acme $SIRJI device invite $d | tail -1)
   CM_HOME=$LAB/$d SIRJI_HOME=$LAB/$d $CM init --parent "$INV" --root "$LAB/$d/root" \
     | sed "s/^/  $d: /"
@@ -77,6 +77,14 @@ Anyone may ask for up to the standing limit without justification.
 POLICY
 
 CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant list 2>&1 | sed 's/^/  /'
+
+say "pair cm-ops as an admin — by key, on the controller itself"
+# Being one of acme's devices is not enough: every worker is one of those. An admin
+# is on a list the host writes by hand.
+OPS_KEY=$(CM_HOME=$LAB/cm-ops SIRJI_HOME=$LAB/cm-ops $CM whoami | awk '{print $2}')
+CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM admin add ops "$OPS_KEY" \
+  --note "the operator laptop" 2>&1 | sed 's/^/  /'
+CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM admin list 2>&1 | sed 's/^/  /'
 
 say "start controller and workers"
 CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM controller >cm-c.log 2>&1 &
@@ -166,12 +174,17 @@ sleep 16
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme \
   "wants the same gpu, after the timeout" --count 1 --need gpu --run 'echo ran' 2>&1 | sed 's/^/  /'
 
-say "the operator looks inside — cm-w-1 is acme's own device, so it may"
-CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM controller fleet 2>&1 | sed 's/^/  /'
-CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM controller reservations 2>&1 | sed 's/^/  /'
+say "the admin looks inside"
+CM_HOME=$LAB/cm-ops SIRJI_HOME=$LAB/cm-ops $CM admin fleet 2>&1 | sed 's/^/  /'
+CM_HOME=$LAB/cm-ops SIRJI_HOME=$LAB/cm-ops $CM admin reservations 2>&1 | sed 's/^/  /'
 
-say "dana is a peer, not one of acme's — the controller refuses"
-CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM controller fleet --controller cm-c@acme 2>&1 \
+say "cm-w-1 is one of acme's devices too, and still may not look"
+# The reason this class exists. A machine that offers capacity has no business
+# reading the roster, every live reservation, or anybody's budget.
+CM_HOME=$LAB/cm-w-1 SIRJI_HOME=$LAB/cm-w-1 $CM admin fleet 2>&1 | sed 's/^/  /' || true
+
+say "dana is a peer — refused for a different reason, and told so"
+CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM admin fleet --controller cm-c@acme 2>&1 \
   | sed 's/^/  /' || true
 
 say "the operator's hygiene scripts, around every tenancy on cm-w-1"

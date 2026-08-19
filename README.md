@@ -73,6 +73,10 @@ Three roles, all sirji **devices**, none holding any identity state:
   directly and presents it. Granted machines it talks to **directly** — the
   controller allocated, it is not a proxy.
 
+A fourth thing, not a role but a class: an **admin** device, paired by key, which is
+the only thing allowed to look at or change how the controller runs. Being one of the
+organisation's own devices is not enough — every worker is one of those.
+
 **Workers never talk to each other.** They have nothing to say: everything that
 needs a view of the whole fleet lives in exactly one place.
 
@@ -199,43 +203,52 @@ code is shared rather than approximated, because an estimate that drifts from th
 real path is worse than no estimate. It is a snapshot, not a promise: by the time you
 ask for real, the fleet has moved.
 
-## Looking inside, if it is yours to look inside
+## Admins: a third class of device
+
+Tenants ask for machines. Workers offer them. **Admins look at and change how the
+controller runs** — the roster, live reservations, tenants, limits, budgets.
+
+An admin is paired **by key**, on the controller, by hand:
 
 ```sh
-$ cm controller fleet
+$ cm whoami                      # on the operator's device
+cm-ops 00jrbfqkvpvkg1r8e2u78gjvd3t7ehch8hrnbn31n5ud8t4p8k40
+
+$ cm admin add ops 00jrbfqk…     # on the controller
+```
+
+Being one of the organisation's own devices is **not** enough, and that distinction
+is the point: every worker is one of those, and a machine that offers capacity has no
+business reading the roster, every live reservation, or anybody's budget. Membership
+is a list the host writes, never something a device acquires by connecting.
+
+```sh
+$ cm admin fleet
 3 machine(s), 2 with a free slot, can ["gpu", "linux"]
   cm-w-1       0/1 free  can ["linux"]         held by r4
   cm-w-2       1/1 free  can ["linux"]         idle
   cm-w-3       2/2 free  can ["linux", "gpu"]  idle
 
-$ cm controller reservations
-  r4     dana         1 machine(s), term 583s left
+$ cm admin reservations
+  r4     dana         1 machine(s), 583s left
 ```
 
-Run as **another device of the same organisation**. That is what earns the answer,
-and it needs no new credential: the controller resolves through the shared parent
-with `ResolveLocal`, and a ticket minted that way carries no alias — because there
-is no person behind a device. A peer's ticket always carries one, since an alias is
-how a `[[peer]]` is keyed and one without a name could not be looked up.
-
-So "no alias" means "one of ours", and a peer who genuinely asks — reaching the
-controller as `name@org`, ticket verified, everything in order — is refused by the
-controller itself:
+Two refusals, for two different reasons, and each says which:
 
 ```
-$ cm controller fleet --controller cm-c@acme     # run from another organisation
-Error: only this organisation's own devices may look inside
+$ cm admin fleet                                 # from a worker
+Error: not an admin of this controller — see `cm admin add`
+
+$ cm admin fleet --controller cm-c@acme          # from another organisation
+Error: not an admin of this controller — see `cm admin add`
 ```
 
 The command deliberately lets anyone ask. Refusing locally would put the decision in
-the wrong place, and produce a misleading error for a controller that is perfectly
+the wrong place and produce a misleading error for a controller that is perfectly
 reachable.
 
-That check is load-bearing rather than cosmetic, so it has a test whose job is to
-fail the day sirji ever mints an aliasless ticket for a peer.
-
-It also works when the controller is on a machine you cannot log into, which a local
-unix socket would not.
+Working over sirji rather than a local socket also means it works when the controller
+is on a machine the operator cannot log into.
 
 ## Machine hygiene
 
@@ -342,8 +355,15 @@ controller's own sirji, not asserted by the caller — so this needed no account
 no new credential. Adding a tenant or editing a policy needs no restart.
 
 What is not built: `nivedanas/`, the model call, `cm test-policy`, `cm upload-policy`,
-and the credential story in [docs/auth.md](docs/auth.md). See
-[docs/policy.md](docs/policy.md), which also lists what is still unresolved.
+**budgets**, and the credential story. Three design notes carry those, each opening
+with what does and does not exist: [docs/policy.md](docs/policy.md),
+[docs/budget.md](docs/budget.md) and [docs/auth.md](docs/auth.md).
+
+Budgets matter more than the ceiling does, and are the bigger gap: a ceiling of three
+machines says nothing about whether they ran for a minute or a fortnight, and the
+fortnight is what somebody pays for. `docs/budget.md` settles the unit — **a credit**,
+being one minute of the cheapest machine class, declared by each worker — and leaves
+the arithmetic to build.
 
 ## Try it
 

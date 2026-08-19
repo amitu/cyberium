@@ -15,10 +15,11 @@
 //! other — they have nothing to say, because everything needing a view of the whole
 //! fleet lives in exactly one place.
 
+mod admin;
 mod fleet;
 mod policy;
-mod tenant;
 mod proto;
+mod tenant;
 
 use std::sync::Arc;
 
@@ -44,17 +45,26 @@ cm — cost-aware allocation of test machines
   cm controller
         own the fleet: availability, allocation, timeouts
 
+  cm whoami
+        this device's name and key — what `cm admin add` wants
+
+  cm admin add <name> <id52> [--note <text>]
+  cm admin list
+        who may look at and change how this controller runs. Run on the
+        controller itself: membership is a list the host writes by hand, never
+        something a device acquires by connecting. Being one of our own devices
+        is not enough — a worker is one of those.
+
+  cm admin fleet [--controller <name>]
+  cm admin reservations [--controller <name>]
+        look inside a running controller, as an admin device.
+
   cm tenant add <alias> [--ceiling N] [--note <text>]
   cm tenant list
         onboard whoever this controller serves. <alias> must be the name our own
         sirji knows them by — that is what a verified ticket carries, and what
         picks their policy. They write policy.md; you write tenant.toml, which
         is what stops an organisation setting its own quota.
-
-  cm controller fleet [--controller <name>]
-  cm controller reservations [--controller <name>]
-        look inside a running controller. Only this organisation's own devices
-        may — a peer is refused, because what is here is nobody else's business.
 
   cm worker [--controller <name>] [--slots N] [--can <cap>]...
         offer this machine to the controller
@@ -102,10 +112,13 @@ fn main() -> Result<std::process::ExitCode> {
         ["controller"] => rt()?.block_on(controller()).map(|_| ok),
         ["tenant", "add", alias, rest @ ..] => tenant_add(alias, rest).map(|_| ok),
         ["tenant", "list"] => tenant_list().map(|_| ok),
-        ["controller", "fleet", rest @ ..] => {
+        ["whoami"] => whoami().map(|_| ok),
+        ["admin", "add", name, key, rest @ ..] => admin_add(name, key, rest).map(|_| ok),
+        ["admin", "list"] => admin_list().map(|_| ok),
+        ["admin", "fleet", rest @ ..] => {
             rt()?.block_on(inspect(proto::Look::Fleet, rest)).map(|_| ok)
         }
-        ["controller", "reservations", rest @ ..] => rt()?
+        ["admin", "reservations", rest @ ..] => rt()?
             .block_on(inspect(proto::Look::Reservations, rest))
             .map(|_| ok),
         ["worker", rest @ ..] => rt()?.block_on(worker(rest)).map(|_| ok),
@@ -157,6 +170,12 @@ fn config_path(home: &std::path::Path) -> std::path::PathBuf {
 
 fn load_config(home: &std::path::Path) -> Result<Config> {
     Ok(toml::from_str(&std::fs::read_to_string(config_path(home))?)?)
+}
+
+/// Is this text actually an id52? Used wherever a key arrives as a string from a
+/// human, so a typo is caught where it was typed rather than at the first dial.
+fn id52_check(key: &str) -> Result<()> {
+    id52::decode(key).map(|_| ()).with_context(|| format!("{key:?} is not an id52"))
 }
 
 fn keys(home: &std::path::Path) -> sirji::Keystore {
@@ -301,6 +320,10 @@ struct Control {
     /// ticket. Behind a lock because it re-reads from disk, so a policy edit or a
     /// new tenant takes effect without a restart.
     tenants: Mutex<tenant::Tenants>,
+    /// Who may look at and change how this controller runs. Read at startup and not
+    /// re-read: adding an admin is rare, deliberate, and worth a restart, and a list
+    /// that reloads itself is a list a stray file write can extend.
+    admins: admin::Admins,
     fleet: Mutex<Fleet>,
     /// A channel per registered worker, for pushing orders down its open stream.
     orders: Mutex<std::collections::BTreeMap<String, tokio::sync::mpsc::Sender<Aadesh>>>,
@@ -333,6 +356,20 @@ async fn controller() -> Result<()> {
         );
     }
 
+    let admins = admin::Admins::load(&config.root)?;
+    if admins.list.is_empty() {
+        println!(
+            "no admins in {} — nobody can look inside.\n  add one with `cm admin add <name> <id52>`",
+            admin::Admins::path_in(&config.root).display()
+        );
+    } else {
+        println!(
+            "{} admin(s): {}",
+            admins.list.len(),
+            admins.list.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+
     let secret = keys(&home).secret(&id52::decode(&config.key)?)?;
     let endpoint = sirji::bind(secret.clone()).await?;
 
@@ -340,6 +377,7 @@ async fn controller() -> Result<()> {
         fleet: Mutex::new(Fleet::default()),
         config: config.clone(),
         tenants: Mutex::new(tenants),
+        admins,
         orders: Mutex::new(Default::default()),
         // Tickets admitting a caller to a worker are signed by us, and verified by
         // the worker against the controller key it registered with. The mechanism
@@ -556,19 +594,18 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
                 println!("{alias} pinged us");
                 Verdict::Pong
             }
-            Plea::Inspect { what } => {
-                if who.operator {
-                    println!("{alias} looked at {what:?}");
+            Plea::Inspect { what } => match &who.admin {
+                Some(name) => {
+                    println!("{name} looked at {what:?}");
                     Verdict::Saw(control.look(what).await)
-                } else {
-                    // Said plainly rather than pretending the command does not
-                    // exist: an operator who typed it against the wrong controller
-                    // deserves to know why it refused.
-                    Verdict::Deny {
-                        rationale: "only this organisation's own devices may look inside".into(),
-                    }
                 }
-            }
+                // Said plainly rather than pretending the command does not exist.
+                // Being one of our own devices is not enough — a worker is one of
+                // those — so the message names what is actually required.
+                None => Verdict::Deny {
+                    rationale: "not an admin of this controller — see `cm admin add`".into(),
+                },
+            },
             Plea::Nivedana(nivedana) => decide(&control, &alias, &caller, &nivedana).await,
             Plea::Rehearse(nivedana) => rehearse(&control, &alias, &nivedana).await,
             Plea::Release { reservation } => {
@@ -606,15 +643,19 @@ fn admit(control: &Control, knock: &Knock, caller: &sirji::PublicKey) -> Result<
     if ticket.name != control.config.name {
         return Err(format!("that ticket is for `{}`", ticket.name));
     }
-    Ok(Caller::from(ticket.alias.clone()))
+    Ok(Caller::from(ticket.alias.clone()).with_admin(&control.admins, &id52::encode(caller)))
 }
 
-/// Who is on the other end, and whether they are one of ours.
+/// Who is on the other end, and what class of thing they are.
 struct Caller {
     /// For display and for policy. Peers have a name; a sibling device does not.
     alias: String,
     /// A device of our **own** sirji rather than somebody else's peer.
-    operator: bool,
+    sibling: bool,
+    /// On the admin list. Strictly narrower than `sibling`: a worker is a sibling
+    /// too, and a machine that offers capacity has no business reading the roster,
+    /// every reservation, or anybody's budget.
+    admin: Option<String>,
 }
 
 impl Caller {
@@ -632,9 +673,21 @@ impl Caller {
     /// this file is there to catch.
     fn from(alias: Option<String>) -> Self {
         match alias {
-            Some(alias) => Self { alias, operator: false },
-            None => Self { alias: "an unnamed peer".into(), operator: true },
+            Some(alias) => Self { alias, sibling: false, admin: None },
+            None => Self { alias: "an unnamed peer".into(), sibling: true, admin: None },
         }
+    }
+
+    /// Admin membership is decided by **key**, against a list the host wrote by
+    /// hand — never by being a sibling, and never by anything the caller says.
+    fn with_admin(mut self, admins: &admin::Admins, key: &str) -> Self {
+        if self.sibling {
+            if let Some(found) = admins.by_key(key) {
+                self.alias = found.name.clone();
+                self.admin = Some(found.name.clone());
+            }
+        }
+        self
     }
 }
 
@@ -1657,6 +1710,70 @@ async fn test(target: &str, why: &str, args: &[&str]) -> Result<std::process::Ex
     Ok(exit_with(&results))
 }
 
+/// This device's name and key.
+///
+/// Exists because the alternative was telling an operator to grep `cm.toml` for the
+/// key that `cm admin add` needs, and a config file is not an interface.
+fn whoami() -> Result<()> {
+    let home = home()?;
+    let config = load_config(&home)?;
+    println!("{} {}", config.name, config.key);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// admins
+// ---------------------------------------------------------------------------
+
+/// Add an admin device, by key.
+///
+/// Local on purpose, like `cm tenant add`: this decides who may change how the
+/// controller runs, so it is the host's act at the host's keyboard. The first admin
+/// has to be added this way; there is no bootstrap in which a device grants itself
+/// the power to grant power.
+fn admin_add(name: &str, key: &str, args: &[&str]) -> Result<()> {
+    let mut note = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--note" => {
+                note = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            other => bail!("unrecognised argument: {other}"),
+        }
+    }
+
+    let config = load_config(&home()?)?;
+    let mut admins = admin::Admins::load(&config.root)?;
+    admins.add(admin::Admin { name: name.to_string(), key: key.to_string(), note })?;
+    admins.save(&config.root)?;
+
+    println!("admin `{name}` added");
+    println!("  {key}");
+    // Not re-read while running, deliberately — see the field's comment.
+    println!("restart the controller for this to take effect.");
+    Ok(())
+}
+
+fn admin_list() -> Result<()> {
+    let config = load_config(&home()?)?;
+    let admins = admin::Admins::load(&config.root)?;
+    if admins.list.is_empty() {
+        println!("no admins in {}", admin::Admins::path_in(&config.root).display());
+        return Ok(());
+    }
+    for a in &admins.list {
+        println!(
+            "  {:<16} {}{}",
+            a.name,
+            a.key,
+            a.note.as_ref().map(|n| format!("  — {n}")).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // tenants
 // ---------------------------------------------------------------------------
@@ -2407,20 +2524,57 @@ mod tests {
         assert!(matches!(consider(None, "r9", "them"), Admission::Refuse(_)));
     }
 
+    fn a_key() -> String {
+        sirji::id52::encode(&sirji::SecretKey::generate().public())
+    }
+
     #[test]
-    fn only_our_own_devices_may_look_inside() {
-        // The whole check is "did the ticket carry an alias", and it is load-bearing
-        // rather than cosmetic — so pin it. Our parent mints an alias for every
-        // peer, because an alias is how a [[peer]] is keyed and one without a name
-        // could not be looked up; a sibling device has no person behind it and gets
-        // None. If sirji ever mints an aliasless ticket for a peer, this fails, and
-        // that is exactly when somebody needs to know.
-        assert!(Caller::from(None).operator, "a sibling device is one of ours");
-        assert!(
-            !Caller::from(Some("dana".into())).operator,
-            "a named peer is not"
-        );
+    fn a_peer_is_never_a_sibling() {
+        // Our parent mints an alias for every peer, because an alias is how a
+        // [[peer]] is keyed and one without a name could not be looked up; a sibling
+        // device has no person behind it and gets None. If sirji ever mints an
+        // aliasless ticket for a peer, this fails — which is exactly when somebody
+        // needs to know.
+        assert!(Caller::from(None).sibling, "a device of ours");
+        assert!(!Caller::from(Some("dana".into())).sibling, "a named peer is not");
         assert_eq!(Caller::from(Some("dana".into())).alias, "dana");
+    }
+
+    #[test]
+    fn being_one_of_ours_does_not_make_you_an_admin() {
+        // The flaw this class exists to fix: every worker is a sibling device, and a
+        // machine offering capacity must not be able to read the roster, every live
+        // reservation, or anybody's budget.
+        let mut admins = admin::Admins::default();
+        let ops = a_key();
+        let worker = a_key();
+        admins
+            .add(admin::Admin { name: "ops".into(), key: ops.clone(), note: None })
+            .unwrap();
+
+        assert_eq!(
+            Caller::from(None).with_admin(&admins, &ops).admin.as_deref(),
+            Some("ops")
+        );
+        assert!(
+            Caller::from(None).with_admin(&admins, &worker).admin.is_none(),
+            "a sibling not on the list is not an admin"
+        );
+    }
+
+    #[test]
+    fn a_peer_cannot_become_an_admin_by_sharing_a_key() {
+        // Belt and braces: even if a peer's key somehow appeared on the admin list,
+        // arriving with an alias means arriving as somebody else's peer, and that is
+        // not the door admins come through.
+        let mut admins = admin::Admins::default();
+        let key = a_key();
+        admins
+            .add(admin::Admin { name: "ops".into(), key: key.clone(), note: None })
+            .unwrap();
+        assert!(
+            Caller::from(Some("dana".into())).with_admin(&admins, &key).admin.is_none()
+        );
     }
 
     #[test]
