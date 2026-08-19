@@ -17,13 +17,11 @@
 //   CM_SHARDS       how many machines to ask for (default 4)
 //   CM_NEED         capabilities, comma separated: linux,node20
 //   CM_ENV          environment for the shards: GRPC_SERVER=off,APP_ENV=staging
-//   CM_WHY          free-text reason (default: this package's name). Only heard by
-//                   tenants that have written no pleas of their own.
-//   CM_PLEA         which of the organisation's own pleas this is, by alias. Required
-//                   instead of CM_WHY once the tenant has a `nivedanas/` — see
-//                   docs/policy.md. This is what CI should set.
-//   CM_CONTEXT      JSON the policy may inspect: {"incident":"INC-4471"}. Whatever
-//                   the organisation's own rules need; it travels as data.
+//   CM_WHY          a reason in your own words (default: this package's name)
+//   CM_SAY          anything else the tenant's own policy reads, as key=value pairs:
+//                   CM_SAY='plea=nightly-regression,incident=INC-4471,role=ci'
+//                   cm attaches no meaning to any of these — what each is worth is
+//                   written in the tenant's files. See docs/policy.md.
 //   CM_RUNNER       how to start Playwright (default `npx playwright test`)
 //   CM_HOME         which cm identity to use — see cm init
 //   CM_BIN          path to the cm binary, if it is somewhere unusual
@@ -218,16 +216,10 @@ async function onTheFleet(controller) {
     .join(" ")
     .trim();
 
-  // A named plea and a free-text reason are alternatives, not a pair: a controller
-  // whose tenant has a catalogue refuses the text, and one without a catalogue cannot
-  // honour the name. Sending both would be refused by every controller.
-  const plea = process.env.CM_PLEA?.trim();
   const args = [
     "test",
     controller,
-    // The reason is positional and omitted entirely when a plea is named — an empty
-    // argv slot would be a reason that happens to be blank, which is a different thing.
-    ...(plea ? [] : [process.env.CM_WHY ?? `${packageName()} suite`]),
+    process.env.CM_WHY ?? `${packageName()} suite`,
     "--count", String(shards),
     "--run", command,
     // Shards do not inherit this environment: a worker is another machine, and
@@ -251,8 +243,12 @@ async function onTheFleet(controller) {
   // Ask what the fleet would give and stop. Useful precisely when you do not yet
   // trust the configuration — it exercises the whole chain, credentials included,
   // without taking a machine from anyone to find out.
-  if (plea) args.push("--plea", plea);
-  if (process.env.CM_CONTEXT?.trim()) args.push("--context", process.env.CM_CONTEXT);
+  // Passed straight through as `--key value`. cm reads none of them, so neither do we:
+  // inventing our own vocabulary here is the same mistake one layer up.
+  for (const pair of list(process.env.CM_SAY)) {
+    const at = pair.indexOf("=");
+    if (at > 0) args.push(`--${pair.slice(0, at).trim()}`, pair.slice(at + 1).trim());
+  }
   if (process.env.CM_DRY_RUN) args.push("--dry-run");
 
   for (const capability of list(process.env.CM_NEED)) args.push("--need", capability);

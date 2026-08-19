@@ -421,36 +421,49 @@ Three design notes carry those, each opening with what does and does not exist:
 [docs/policy.md](docs/policy.md), [docs/budget.md](docs/budget.md) and
 [docs/auth.md](docs/auth.md).
 
-## Named pleas
+## The whole folder is the policy, and the caller just says things
 
-The reason a caller gives is the one part of the prompt they write, and every
-allocation is weighed — so an organisation can write the reasons down instead. Any
-`.md` file in a tenant's `nivedanas/`; each heading is an alias, the prose under it is
-what the model reads:
-
-```markdown
-## Nightly regression
-
-The scheduled full-suite run. Routine and never urgent — it has all night. Prefer the
-cheapest machines and stay at the standing limit.
-```
+A tenant's folder goes to the model as it is — a file tree, then every file's contents.
+cm parses none of it beyond the fenced block it enforces itself. And what a caller sends
+is keys and values that cm attaches no meaning to:
 
 ```sh
-cm t cm-c@acme --plea nightly-regression --count 2 --need linux
-CM_PLEA=production-incident CM_CONTEXT='{"incident":"INC-4471"}' npm test
+cm t cm-c@acme --count 2 --need linux --plea nightly-regression --incident INC-4471
+CM_SAY='plea=nightly-regression,incident=INC-4471' npm test
 ```
 
-The **whole catalogue** goes in the cached half of the prompt; the message carries only
-which alias was picked. So the words being weighed are the organisation's, the caller's
-contribution is an index into a list, and there is no caller prose to inject. A policy
-can name a plea and be understood, because the model has seen them all.
+`--plea` is not a feature. Neither is `--incident`. Any unknown `--key value` becomes a
+declaration, and what each is worth is written in the tenant's own files:
 
-**Writing one plea turns free text off for that tenant** — the file is the opt-in, with
-no flag to forget. Free text and unknown aliases are then refused *before any model
-call*, each refusal listing what the tenant will actually hear. Anything a caller still
-needs to add travels as `--context` JSON, in the data section, where a policy can
-require a field without any of it becoming instructions. A tenant that has written no
-pleas keeps working exactly as before, free text included.
+```markdown
+Dana experiments constantly and her reasons are never the same twice, so she may only
+use pleas from the `noisy-users` folder, and a reason in her own words earns nothing.
+The support team works from `support-pleas.md`. The release pleas — `cut-a-release` and
+`smoke-the-candidate` — are for whoever is on release duty. Everybody else may name any
+plea, or explain themselves in their own words if none of them fit.
+```
+
+Read that paragraph again for what it *does*: it groups pleas by folder, by file, and by
+naming two of them outright, and attaches a per-person rule to one group. Three earlier
+versions of this had a schema — prose-versus-fenced, then parsed markdown headings as a
+catalogue of aliases, then a `group:` field from the subdirectory — and each of them
+supports exactly one of those three sentences. A file tree supports all three and needs
+no fields at all.
+
+The version worth naming as the mistake: **writing one plea turned free text off for the
+whole tenant**, in Rust. One bit, chosen by cm, standing in for a sentence the
+organisation could write itself, identical for a support engineer and a nightly job. It
+is a sentence now, weighed like everything else.
+
+Two arguments stay cm's own, because cm acts on them mechanically rather than
+interpreting them: `--count` bounds the grant, and `--need` picks machines that can do
+the work — a box without `gpu` cannot run gpu tests, and no policy changes that.
+
+The prompt says outright that cm read none of the keys, that nothing upstream checked
+whether `plea` names anything real, and that a key the files say nothing about earns
+nothing — because without that a model reasonably assumes somebody already validated it,
+and then nobody has. The deterministic guarantees do not depend on any of it: the
+ceiling, the budget and availability clamp whatever comes back.
 
 ## Budgets
 
@@ -539,8 +552,8 @@ SIRJI=/path/to/sirji scripts/fleet.sh
 Early, and running end to end: enrolment, resolution, ticket, capability-matched
 allocation, machines fetching the code themselves into isolated checkouts, real
 commands with their output streamed back live, artifacts returned as bytes, release,
-reclaim after a caller walks away, per-tenant policy, credit budgets, the model call
-for `policy.md`'s prose half, and named pleas. Verified against a real 1,900-test
+reclaim after a caller walks away, per-tenant policy, credit budgets, and the model
+call — the tenant's whole folder weighed in one pass. Verified against a real 1,900-test
 Playwright suite, sharded across a fleet and merged into one report.
 
 Next: `cm policy-test`, so a change to a policy or a plea can be reviewed like code —

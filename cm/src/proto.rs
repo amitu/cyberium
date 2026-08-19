@@ -80,44 +80,34 @@ pub struct Sight {
 /// The plea.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Nivedana {
-    /// Which of the organisation's own pleas this is, by alias.
+    /// Whatever the caller wanted to say, as keys and values. **cm assigns no meaning to
+    /// any of it.**
     ///
-    /// Preferred over `why`, and required once a tenant has written any down: what the
-    /// model then weighs is the organisation's words, and the caller's contribution is
-    /// an index into a list rather than prose.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plea: Option<String>,
-    /// Free-form English — the developer's own reason.
+    /// `plea=nightly-regression`, `why=the release is blocked`, `incident=INC-4471`,
+    /// `role=ci`, `branch=release-9`. What any of those earn is written in the tenant's
+    /// own files and weighed there. Earlier versions had `why`, then `plea`, then `role`,
+    /// then a `context` object as named fields, and each addition was cm guessing at a
+    /// vocabulary that belongs to the organisation — a schema here would end up as the
+    /// union of every field anybody ever wanted, with cm's own reading of each.
     ///
-    /// Only heard from tenants with no `nivedanas/` of their own. It is the one part of
-    /// a prompt written by the person asking, which is why an organisation can turn it
-    /// off simply by writing down the pleas it will hear.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub why: Option<String>,
-    /// Anything else the caller wants the policy to see: `{"incident": "INC-4471"}`,
-    /// a branch name, a queue depth, whatever this organisation's rules need.
-    ///
-    /// Arbitrary on purpose. A schema here would become a list of every field any
-    /// organisation might ever want, and the policy is already the place where meaning
-    /// lives. It travels as data, never as instruction — a policy may *require* a
-    /// field without any of it becoming something the model is told to obey.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<serde_json::Value>,
+    /// Ordered, so the prompt is stable for the same request.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub said: std::collections::BTreeMap<String, String>,
     /// How many machines they think they need.
+    ///
+    /// First-class, unlike everything above, because cm acts on it mechanically: it is
+    /// the ceiling on any grant. Nobody is handed machines they did not ask for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
-    /// What the work needs a machine to be able to do. Matched against what each
-    /// worker declared; a worker missing any of these is not a candidate.
+    /// What the work needs a machine to be able to do. Matched against what each worker
+    /// declared; a worker missing any of these is not a candidate.
     ///
-    /// Plain strings on purpose. The org invents its own vocabulary — `linux`,
-    /// `gpu`, `ios-17`, `has-2fa-sim` — and nothing here needs to understand any
-    /// of it to match on it.
+    /// Also first-class, and for the same reason: a machine without `gpu` cannot run gpu
+    /// work, and no amount of policy changes that. Plain strings, because the org invents
+    /// its own vocabulary — `linux`, `ios-17`, `has-2fa-sim` — and nothing here needs to
+    /// understand any of it to match on it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    /// Where this is running from: a laptop, a CI job, a nightly. The policy
-    /// author decides what these mean.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
 }
 
 /// The controller's answer.

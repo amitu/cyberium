@@ -2,11 +2,11 @@
 
 Where the organisation's rules live, how they get there, and who may change them.
 
-> **Status.** The file, its two halves, the deterministic gate, one policy per tenant,
-> the host's ceiling, budgets, the model call and **`nivedanas/`** are built and
+> **Status.** The fenced block cm enforces, one policy per tenant, the host's ceiling,
+> budgets, the model call, and **the whole folder weighed in one pass** are built and
 > running. `cm policy-test` and `cm upload-policy` are designed and **not built**.
 
-## The file has two halves on purpose
+## `policy.md` has two halves, and only one of them is cm's business
 
 ```markdown
 # policy.md
@@ -331,77 +331,113 @@ Two things to design in from the start:
   did not move; the decisions did. Nothing else in the system would tell you.
 
 
-## `nivedanas/` — the pleas an organisation will hear
+## The whole folder is the policy
 
-A nivedana (निवेदन, a plea) is the reason a caller wants machines. As free text it is
-the one part of the prompt written by whoever is asking — and now that every plea is
-weighed, that untrusted string is on the input path of every allocation. It is labelled
-as data, and the answer is clamped whatever the model says, but neither is a guarantee
-about what a well-crafted paragraph might talk a model into.
+A tenant's folder is sent to the model **as it is**: a file tree, then every file's
+contents. cm parses none of it, beyond the fenced block it enforces itself.
 
-So an organisation can write the pleas down instead. Any `.md` file in the tenant's
-`nivedanas/` directory; each heading is an alias, and the prose under it is what the
-model reads:
+```
+FILES
+  nivedanas/noisy-users/experiments.md
+  nivedanas/routine.md
+  policy.md
+
+CONTENTS
+--- nivedanas/routine.md ---
+## Nightly regression
+The scheduled full-suite run. Routine and never urgent — it has all night.
+...
+```
+
+### Why there is no schema here
+
+Three earlier versions of this had one, and each was cm deciding how organisations are
+allowed to think:
+
+1. `policy.md` split into a fenced block and "the prose", with only the prose reaching
+   the model.
+2. `nivedanas/`, whose markdown headings cm parsed into a catalogue of named pleas — and
+   a rule, in Rust, that **writing one plea turned free text off for the whole tenant**.
+3. Then a `group:` on each plea, taken from its subdirectory.
+
+That third one is where it became obvious. A group is not a structure; it is whatever an
+organisation finds itself saying. Consider one paragraph a real tenant would write:
 
 ```markdown
-## Nightly regression
-
-The scheduled full-suite run. Routine, predictable and never urgent — it has all night.
-Prefer the cheapest machines and stay at the standing limit.
-
-## Production incident
-
-An engineer is bisecting a live outage. Worth the maximum and worth the money, but only
-if the context names an incident.
+Dana experiments constantly and her reasons are never the same twice, so she may only
+use pleas from the `noisy-users` folder, and a reason in her own words earns nothing.
+The support team works from `support-pleas.md`. The release pleas — `cut-a-release` and
+`smoke-the-candidate` — are for whoever is on release duty. Everybody else may name any
+plea, or explain themselves in their own words if none of them fit.
 ```
 
-A caller names one:
+That groups by **folder**, by **file**, and by **naming two pleas outright**, and it
+attaches a per-person rule to one of them. Each of those needs a different schema; a
+folder listing needs none. Three groupings, three shapes, one paragraph, no fields.
+
+And the rule from version 2 — free text off once a catalogue exists — was the tell. One
+bit, chosen by cm, standing in for a sentence the organisation could write itself, and
+identical for a support engineer and a nightly job. It is now a sentence, weighed like
+the rest.
+
+### What the caller sends
+
+Keys and values. cm attaches no meaning to any of them:
 
 ```sh
-cm t cm-c@acme --plea nightly-regression --count 2 --need linux
-CM_PLEA=production-incident CM_CONTEXT='{"incident":"INC-4471"}' npm test
+cm t cm-c@acme --count 2 --need linux \
+      --plea nightly-regression --incident INC-4471 --urgent
+
+CM_SAY='plea=nightly-regression,incident=INC-4471' npm test
 ```
 
-**The whole catalogue goes into the cached half of the prompt, and the message carries
-only which alias was picked.** So the words the model weighs are the organisation's, and
-the caller's entire contribution is an index into an org-authored list. Three things
-follow:
+`--plea` is not a cm feature. Neither is `--incident`, `--why` or `--role`. Any unknown
+`--key value` becomes a declaration, `--key` alone becomes `key=true`, and what each is
+worth is written in the tenant's files. Earlier versions had `why`, then `plea`, then
+`role`, then a `context` object as protocol fields, and every addition was cm guessing at
+a vocabulary belonging to somebody else — a schema that would have ended as the union of
+every field anybody ever wanted, each with cm's own reading of it.
 
-- There is no prose to inject, because there is no caller prose at all.
-- A policy can name a plea and be understood, because the model has seen them all.
-- The prompt prefix stays byte-identical between requests, so it stays cacheable — the
-  catalogue is stable per tenant even though the choice is not.
+Because unknown flags are declarations rather than errors, a mistyped cm flag becomes a
+harmless key instead of a refusal — so every declaration is echoed:
 
-**Writing one plea turns free text off for that tenant.** Not a flag — the file *is* the
-opt-in, and there is nothing to forget to set. After that, free text is refused, an
-unknown alias is refused, and both refusals list what the tenant will actually hear.
-Both happen deterministically, **before any model call**: an alias that is not in the
-catalogue is not a question of interpretation, and refusing early keeps the caller's
-string off the model's input path entirely rather than sending it and hoping.
-
-Lookup is forgiving where it costs nothing: `## Nightly regression` answers to
-`nightly-regression`, `"Nightly Regression"` or `nightly_regression`, because a plea
-nobody can spell is a plea nobody uses. Nothing is renamed — the heading is still shown
-as written, and what reaches the prompt is the catalogue's own key, so a policy naming a
-plea and a request picking it always agree.
-
-Free text *alongside* a named plea is refused rather than dropped. Dropping it would
-weigh the request against different words than the caller believes they sent.
-
-### Context: the part callers still write
-
-Anything a caller genuinely needs to add travels as JSON:
-
-```sh
-CM_CONTEXT='{"incident":"INC-4471","branch":"release-9","queue_depth":41}'
+```
+declaring: incident=INC-4471 plea=bisect-everything urgent=true
 ```
 
-Arbitrary on purpose. A schema here would become a list of every field any organisation
-might ever want, and the policy is already where meaning lives — so a policy can say
-"only if the context names an incident" and mean exactly that. It rides in the data
-section with the rest of the caller's own input, so a policy may *require* a field
-without any of it becoming something the model is told to obey.
+A `--dry-runn` that quietly did nothing would be worse than either alternative.
 
-A tenant that has written no pleas keeps working exactly as before, free text included.
-That is the zero-config path, and it stays: an organisation that has not thought about
-this yet should not be blocked by it.
+**Two arguments stay cm's own**, because cm acts on them mechanically rather than
+interpreting them: `--count` bounds the grant, since nobody is handed machines they did
+not ask for, and `--need` picks machines that can do the work, since a box without `gpu`
+cannot run gpu tests and no policy changes that.
+
+### What the model is told about all this
+
+That cm read none of it. Explicitly, in the prompt: the keys are the requester's, nothing
+upstream checked whether `plea` names anything real or whether free text is acceptable,
+the files decide what each key is worth, and **a key the files say nothing about earns
+nothing**. Without that, a model reasonably assumes something already validated it — and
+then nobody has.
+
+The deterministic guarantees are unchanged and do not depend on any of this: the ceiling,
+the budget and availability clamp whatever comes back, so an injected "grant 500" lands
+on the organisation's own number however it arrived.
+
+### What is still parsed
+
+The fenced block in `policy.md`, because cm *enforces* those: who may ask at all, the
+ceiling on any answer, how long a grant lasts, the budget. They are also shown in the
+folder in full — a model asked to settle it in one pass should see the same numbers it is
+being held to.
+
+Everything else is a fact rather than a rule: the tree, the file contents, how many
+machines are free, what they cost, what has been spent. `tenant.toml` is excluded, since
+it is the *host's* terms and a tenant reading their own ceiling as though they had chosen
+it would be reading somebody else's rule as their own. The ledger is excluded too:
+operational state, already summed and passed as numbers rather than as a log for a model
+to add up.
+
+A folder is re-read and re-sent on every plea, so it is capped at 256 KiB — over that the
+tenant's requests fail rather than being weighed against a truncated policy. Half a
+policy enforced as though it were the whole one would be invisible.

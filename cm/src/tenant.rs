@@ -74,9 +74,9 @@ pub struct Tenant {
     pub alias: String,
     pub terms: Terms,
     pub policy: Policy,
-    /// The pleas this tenant will hear. Empty means it wrote none, and free text is
-    /// still accepted from it.
-    pub nivedanas: crate::nivedana::Nivedanas,
+    /// Everything this tenant has written down, ready to send. Read once here rather
+    /// than per request, so a plea does not pay for a directory walk.
+    pub rulebook: crate::rulebook::Rulebook,
 }
 
 impl Tenant {
@@ -301,7 +301,7 @@ fn read(dir: &Path, alias: &str) -> Result<Tenant> {
         alias: alias.to_string(),
         terms,
         policy: Policy::load(dir)?,
-        nivedanas: crate::nivedana::Nivedanas::load(dir)?,
+        rulebook: crate::rulebook::Rulebook::load(dir)?,
     })
 }
 

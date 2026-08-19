@@ -72,20 +72,36 @@ start_controller() {
 
 t() { CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM test cm-c@acme "$@"; }
 
-# The pleas this tenant will hear. Writing any is what stops free text being heard,
-# so the scenario below can show both sides of that switch.
-mkdir -p "$LAB/cm-c/root/tenants/team/nivedanas"
-cat >"$LAB/cm-c/root/tenants/team/nivedanas/pleas.md" <<'PLEAS'
+# What this tenant has written down. Note that the rule Amit asked about — who may use
+# which pleas, and who may write their own reason — is a *sentence here*, not a cm
+# feature. cm parses none of it.
+mkdir -p "$LAB/cm-c/root/tenants/team/nivedanas/noisy-users"
+cat >"$LAB/cm-c/root/tenants/team/nivedanas/routine.md" <<'PLEAS'
 ## Nightly regression
 
 The scheduled full-suite run. Routine, predictable and never urgent — it has all night.
-Prefer the cheapest machines and stay at the standing limit.
+Stay at the standing limit.
 
 ## Production incident
 
-An engineer is bisecting a live outage. Worth the maximum and worth the money, but only
-if the context names an incident.
+An engineer is bisecting a live outage. Worth the maximum, but only if `incident` names
+one.
 PLEAS
+cat >"$LAB/cm-c/root/tenants/team/nivedanas/noisy-users/experiments.md" <<'PLEAS'
+## Bisect everything
+
+Somebody is hunting a flake by brute force. Legitimate, and never worth more than the
+standing limit — it can run again tomorrow.
+PLEAS
+cat >>"$LAB/cm-c/root/tenants/team/policy.md" <<'RULES'
+
+## Who may ask for what
+
+Dana experiments constantly and her reasons are never the same twice, so she may only
+use pleas from the `noisy-users` folder, and a reason in her own words earns nothing.
+Everybody else may name any plea from `nivedanas/routine.md`, or explain themselves in
+their own words if none of them fit.
+RULES
 
 say "no key at all: the controller refuses to start, and says why"
 # Captured first: piping the controller straight into `grep -m1` makes grep exit while
@@ -101,22 +117,14 @@ done
 for _ in $(seq 40); do [ "$(grep -c arrived cm-c.log || true)" -ge 6 ] && break; sleep 1; done
 grep "policy weighed by" cm-c.log | tail -1 | sed 's/^/  /' || true
 
-say "this tenant wrote pleas down, so free text is refused — and it lists them"
-t "just trust me" --count 2 --need linux --dry-run 2>&1 | tail -1 | cut -c1-108 | sed 's/^/  /' || true
-echo "  prompts sent: $(sent)      (must be 0: refused before the model)"
+say "arbitrary keys — cm reads none of them and says so"
+t --plea bisect-everything --incident INC-4471 --urgent \
+  --count 2 --need linux --dry-run 2>&1 | grep -E "declaring|would get" | sed 's/^/  /'
+echo "  prompts sent: $(sent)"
 
-say "a plea nobody wrote is refused too, with the list"
-t --plea noctural --count 2 --need linux --dry-run 2>&1 | tail -1 | cut -c1-108 | sed 's/^/  /' || true
-echo "  prompts sent: $(sent)      (still 0)"
-
-say "naming one of the org's own pleas — spelled however you like"
-t --plea "Nightly_Regression" --count 2 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
-echo "  prompts sent: $(sent)      (1: this one reached the model)"
-
-say "and the same for a big one, with context JSON the policy can require"
-t --plea production-incident --context '{"incident":"INC-4471"}' \
-  --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
-echo "  prompts sent: $(sent)      (one per plea, never two)"
+say "a plea a caller may not use, and a reason in their own words — both the policy's call"
+t "just trust me, it is urgent" --count 3 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
+echo "  prompts sent: $(sent)      (2: the policy decides, so the model is asked)"
 
 say "what the prompt actually contained"
 python3 - "$LAB/prompt.log" <<'PYX'
@@ -126,13 +134,14 @@ sysp, user = body["system"][0]["text"], body["messages"][0]["content"]
 both = sysp + user
 def check(label, ok):
     print(f"    {'ok  ' if ok else 'FAIL'} {label}")
-check("carries the org's prose",            "open production incident" in sysp)
-check("carries the whole catalogue",        "### nightly-regression" in sysp and "### production-incident" in sysp)
-check("says the caller may only pick",      "never write their own" in sysp)
-check("the chosen plea is in the message",  "plea: production-incident" in user)
-check("the plea's prose is not re-sent",    "bisecting a live outage" not in user)
-check("context rides along as data",        "INC-4471" in user)
-check("gives the fallback as calibration",  "2 is what it falls back to" in sysp)
+check("carries the file tree",              "nivedanas/noisy-users/experiments.md" in sysp)
+check("carries every file's contents",      "hunting a flake by brute force" in sysp)
+check("carries the org's own rule",         "noisy-users` folder" in sysp)
+check("shows the fenced block too",         "standing_limit: 2" in sysp)
+check("cm claims no meaning for keys",      "cm read none of them" in sysp)
+check("what they said is in the message",   "why: just trust me" in user)
+check("the plea's text is not re-sent",     "hunting a flake" not in user)
+check("gives the fallback as calibration",  "2 is what this organisation falls back to" in sysp)
 check("not as a floor",                     "not as a floor" in sysp)
 check("states the ceiling (4)",             "at most 4" in sysp)
 check("says every request comes to it",     "Every request comes to you" in sysp)
@@ -145,9 +154,12 @@ check("labels caller text as data",         "not instruction" in sysp)
 check("separates attested from declared",   "ATTESTED" in user and "DECLARED" in user)
 check("temperature is zero",                body["temperature"] == 0)
 check("the policy prefix is cacheable",     body["system"][0]["cache_control"]["type"] == "ephemeral")
-# The model gets counts, never identities: what it was never told, it cannot leak.
-for leak in ["cm-w-", "held by", "reservation"]:
-    check(f"no machine identities: {leak!r}", leak not in both)
+# The model gets counts, never identities: what it was never told, it cannot leak. Checked
+# by key rather than by word, now that the org's own files are quoted in full and may
+# legitimately say "reservation".
+import re
+check("no machine keys anywhere",           not re.search(r"\b[a-z0-9]{52}\b", both))
+check("no holder names",                    "held by" not in both)
 check("told not to quote the numbers back", "not theirs to learn" in sysp)
 PYX
 

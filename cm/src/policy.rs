@@ -178,19 +178,6 @@ impl Policy {
         }
     }
 
-    /// The prose half — everything outside the fenced block.
-    ///
-    /// What a model is asked to weigh. The fenced block is deliberately excluded: it
-    /// has already been applied deterministically, and showing it again invites the
-    /// model to reinterpret a decision that was not its to make.
-    pub fn prose(&self) -> String {
-        match fenced_block(&self.text, "yaml") {
-            Some(block) => self.text.replace(block, "").replace("```yaml", "").replace("```", ""),
-            None => self.text.clone(),
-        }
-        .trim()
-        .to_string()
-    }
 
     /// How long a grant survives unreleased.
     pub fn reservation_secs(&self) -> u64 {
@@ -306,7 +293,6 @@ mod tests {
 
     fn plea(count: Option<u32>) -> Nivedana {
         Nivedana {
-            why: Some("because".into()),
             count,
             ..Default::default()
         }
@@ -395,17 +381,6 @@ mod tests {
             Ruling::Consider { standing, ceiling, .. } => assert_eq!((standing, ceiling), (10, 10)),
             other => panic!("expected Consider, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn the_prose_half_excludes_the_fenced_block() {
-        // The block has already been applied deterministically. Showing it to a model
-        // invites it to reinterpret a decision that was never its to make.
-        let p = policy(STARTER);
-        let prose = p.prose();
-        assert!(!prose.contains("standing_limit:"), "{prose}");
-        assert!(!prose.contains("requesters:"), "{prose}");
-        assert!(prose.contains("Circumstantial override"), "{prose}");
     }
 
     #[test]
