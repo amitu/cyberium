@@ -416,7 +416,7 @@ The tenant is chosen by **the verified alias in the caller's ticket** — minted
 controller's own sirji, not asserted by the caller — so this needed no accounts and
 no new credential. Adding a tenant or editing a policy needs no restart.
 
-What is not built: `cm policy-test`, `cm upload-policy`, and the credential story.
+What is not built: `cm upload-policy` and the credential story.
 Three design notes carry those, each opening with what does and does not exist:
 [docs/policy.md](docs/policy.md), [docs/budget.md](docs/budget.md) and
 [docs/auth.md](docs/auth.md).
@@ -464,6 +464,53 @@ whether `plea` names anything real, and that a key the files say nothing about e
 nothing — because without that a model reasonably assumes somebody already validated it,
 and then nobody has. The deterministic guarantees do not depend on any of it: the
 ceiling, the budget and availability clamp whatever comes back.
+
+## Testing a policy
+
+A policy decides how much money a fleet spends, and a model reading prose decides what it
+means. So the cases go in beside it, and `cm policy-test` runs them — no controller, no
+fleet, just a folder and a model key, in the repository where the policy lives:
+
+```sh
+$ cm policy-test .
+8 case(s) against .
+weighed by: claude-sonnet-5 at https://api.anthropic.com/v1/messages
+
+  ok    a nightly run is counted back to the standing limit
+  ok    an incident with an identifier may have the maximum
+  FAIL  urgency without an incident identifier is not an incident
+          expected at most 2, got 6
+          it said: the request describes an urgent production problem
+  ok    an instruction in the caller's own words is not an instruction
+```
+
+Cases are JSON in `policy-tests/`, and everything but the name and the expectation has a
+default, so a case about a *rule* does not describe hardware:
+
+```json
+{
+  "name": "dana's own words earn her nothing beyond the standing limit",
+  "caller": "dana",
+  "asked": 6,
+  "said": { "why": "trust me, I need six of them" },
+  "expect": { "at_most": 2 }
+}
+```
+
+Expectations can be as vague as the rule they check — `count` exactly, `at_most` and
+`at_least` as bounds, `verdict` as the caller would experience it. "Counted back towards
+the standing limit" is a real sentence to write, and `at_most` checks it without inventing
+a number the policy never named. `--repeat 5` asks the same question five times, which is
+a different question: whether the rule is written clearly enough to hold every time.
+
+Two things it gets right deliberately. The cases live in `policy-tests/`, which is
+**excluded from what the model is sent** — a folder goes over verbatim, so a case inside it
+would hand over the answer key with the question and every test would pass while checking
+nothing. And the decision comes from the same `weigh` function the controller calls, not a
+reimplementation, because a test that passes against a slightly different decision than
+the fleet makes is worse than no test at all.
+
+There is a worked example in [`examples/policy/`](examples/policy).
 
 ## Budgets
 
@@ -552,13 +599,14 @@ SIRJI=/path/to/sirji scripts/fleet.sh
 Early, and running end to end: enrolment, resolution, ticket, capability-matched
 allocation, machines fetching the code themselves into isolated checkouts, real
 commands with their output streamed back live, artifacts returned as bytes, release,
-reclaim after a caller walks away, per-tenant policy, credit budgets, and the model
-call — the tenant's whole folder weighed in one pass. Verified against a real 1,900-test
+reclaim after a caller walks away, per-tenant policy, credit budgets, the model call —
+the tenant's whole folder weighed in one pass — and `cm policy-test`. Verified against a
+real 1,900-test
 Playwright suite, sharded across a fleet and merged into one report.
 
-Next: `cm policy-test`, so a change to a policy or a plea can be reviewed like code —
-snapshots of what a given plea against a given fleet should be granted. And caching
-the install step, which is now the slowest thing in a run.
+Next: `cm upload-policy`, so a checked-in policy reaches a controller it does not share a
+filesystem with, and the credential story behind it. And caching the install step, which
+is now the slowest thing in a run.
 
 ## License
 

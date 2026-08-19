@@ -180,6 +180,16 @@ impl Policy {
 
 
     /// How long a grant survives unreleased.
+    /// The two figures the fenced block puts on any answer: what this org calls ordinary,
+    /// and the most interpretation may grant.
+    ///
+    /// Derived the same way `weigh` derives them, so a policy test is held to the numbers
+    /// a real plea would be.
+    pub fn bounds(&self) -> (u32, u32) {
+        let standing = self.grants.standing_limit;
+        (standing, self.grants.max_limit.unwrap_or(standing).max(standing))
+    }
+
     pub fn reservation_secs(&self) -> u64 {
         self.grants.reservation_seconds
     }

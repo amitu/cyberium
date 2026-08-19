@@ -20,7 +20,7 @@ def behave(system, user):
         m = re.search(pattern, text)
         return int(m.group(1)) if m else default
 
-    asked = find(r"count: (\d+)", user, 1)
+    asked = find(r"machines asked for: (\d+)", user, 1)
     ceiling = find(r"at most (\d+)", system, 10 ** 6)
     free = find(r"free right now: (\d+)", user, 10 ** 6)
     return min(asked, ceiling, free)

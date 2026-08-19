@@ -20,6 +20,7 @@ mod adviser;
 mod budget;
 mod fleet;
 mod policy;
+mod policytest;
 mod rulebook;
 mod proto;
 mod tenant;
@@ -140,6 +141,9 @@ fn main() -> Result<std::process::ExitCode> {
         ["worker", rest @ ..] => rt()?.block_on(worker(rest)).map(|_| ok),
         // `why` is positional but optional: a ping asks for nothing, so making
         // somebody justify one would be a small daily absurdity.
+        // `policy-test`, not `test-policy`: it is a sister of `cm test`, and reading the
+        // pair aloud is how anybody remembers which is which.
+        ["policy-test", rest @ ..] => rt()?.block_on(policy_test(rest)),
         ["test", target, rest @ ..] if rest.contains(&"--ping") => rt()?.block_on(ping(target)),
         // The reason is optional: a caller naming one of the organisation's own pleas
         // has nothing of their own to say, and a tenant with a catalogue would refuse
@@ -605,66 +609,34 @@ impl Control {
         // inventing one would keep the fleet running while nobody's policy is applied.
         // A `?` is the whole safeguard: nothing downstream can mistake a fault for a
         // decision, because it never becomes one.
-        let opinion = self
-            .adviser
-            .weigh(&advice)
+        let limit = Limit {
+            ceiling: ceiling.min(host_ceiling),
+            free: brief.free,
+            host: host_ceiling,
+            affordable: money.as_ref().map(|m| {
+                budget::Room { budget: m.budget, spent: m.spent, committed: m.committed }
+                    .affordable(&brief.rates, lifetime)
+            }),
+        };
+
+        // The decision itself, shared verbatim with `cm policy-test`. Splitting it out is
+        // the same rule as sharing `choose` with the dry run: a second implementation
+        // would eventually disagree with this one, and be believed — a policy test that
+        // passes against a slightly different decision than the fleet makes is worse than
+        // no policy test at all.
+        let weighed = weigh(&self.adviser, &advice, limit)
             .await
             .with_context(|| format!("weighing {alias}'s plea"))?;
 
-        if opinion.denies() {
-            println!("policy refused {alias}: {}", opinion.rationale);
-            return refused(opinion.rationale);
+        for line in weighed.log(alias) {
+            println!("{line}");
         }
-
-        let said = opinion.count;
-        let mut allowed = opinion.bounded(&advice);
-        let mut rationale = opinion.rationale.clone();
-        println!(
-            "policy weighed {alias}: asked {wanted}, said {said}, giving {allowed} — {rationale}"
-        );
-
-        // The sanity net, applied in one pure place so it can be tested without a
-        // controller, a fleet or a network.
-        let (cut, faults) = sanity(
-            said,
-            allowed,
-            Limit {
-                ceiling: ceiling.min(host_ceiling),
-                free: brief.free,
-                host: host_ceiling,
-                affordable: money.as_ref().map(|m| {
-                    let rates: Vec<u32> =
-                        brief.rates.iter().copied().take(allowed as usize).collect();
-                    budget::Room { budget: m.budget, spent: m.spent, committed: m.committed }
-                        .affordable(&rates, lifetime)
-                }),
-            },
-        );
-        allowed = cut;
-
-        if !faults.is_empty() {
-            // Loudly. A policy that keeps overshooting is a policy nobody has noticed
-            // is wrong, because the clamp has been quietly making it look right.
-            eprintln!(
-                "policy for {tenant_name} overshot limits it was shown ({}) — cut to \
-                 {allowed}. Fix the policy; the prompt stated every one of them.",
-                faults.join("; ")
-            );
-            // The model's sentence argued for a number the caller is not getting, so
-            // it is not an explanation of the one they are.
-            rationale = format!("{allowed} machine(s): {}", faults.join("; "));
+        if let Some(fault) = weighed.fault_report(&tenant_name) {
+            eprintln!("{fault}");
         }
-
-        if allowed == 0 {
-            // In cm's own words. The model's sentence argued for a number nobody is
-            // getting, and printing it beside a refusal produced denials that read
-            // "granted what was asked" — true of the argument, false of the outcome.
-            return refused(if faults.is_empty() {
-                format!("this policy granted none of the {wanted} asked for")
-            } else {
-                faults.join("; ")
-            });
-        }
+        let Some((allowed, rationale)) = weighed.granted() else {
+            return refused(weighed.refusal(wanted));
+        };
 
         Ok(Ok((allowed, Some(rationale))))
     }
@@ -973,6 +945,101 @@ impl Caller {
     }
 }
 
+/// One decision, start to finish: what the model said, what it was cut to, and why.
+///
+/// Shared by the controller and `cm policy-test`, so a test cannot pass against a
+/// decision the fleet would not make.
+struct Weighed {
+    /// What the model proposed, before anything was applied.
+    said: u32,
+    /// What it comes to after the ask, the ceiling, availability and the budget.
+    allowed: u32,
+    /// A refusal from the model itself, in its own words.
+    denied: Option<String>,
+    rationale: String,
+    /// Limits it was shown and exceeded anyway. Empty in the ordinary case.
+    faults: Vec<String>,
+}
+
+impl Weighed {
+    /// The grant, or nothing — a denial, or everything clamped away.
+    fn granted(&self) -> Option<(u32, String)> {
+        if self.denied.is_some() || self.allowed == 0 {
+            return None;
+        }
+        Some((self.allowed, self.rationale.clone()))
+    }
+
+    /// Why there is nothing, in cm's words rather than the model's: a sentence that
+    /// argued for a number nobody is getting does not explain the one they are.
+    fn refusal(&self, wanted: u32) -> String {
+        if let Some(why) = &self.denied {
+            return why.clone();
+        }
+        if self.faults.is_empty() {
+            format!("this policy granted none of the {wanted} asked for")
+        } else {
+            self.faults.join("; ")
+        }
+    }
+
+    fn log(&self, alias: &str) -> Vec<String> {
+        match &self.denied {
+            Some(why) => vec![format!("policy refused {alias}: {why}")],
+            // Both numbers: "why did I get 4" must be answerable, and a clamp that left
+            // no trace would make an organisation's own ceiling invisible.
+            None => vec![format!(
+                "policy weighed {alias}: said {}, giving {} — {}",
+                self.said, self.allowed, self.rationale
+            )],
+        }
+    }
+
+    /// Loudly, when it fires. A policy that keeps overshooting is a policy nobody has
+    /// noticed is wrong, because the clamp has been quietly making it look right.
+    fn fault_report(&self, tenant: &str) -> Option<String> {
+        if self.faults.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "policy for {tenant} overshot limits it was shown ({}) — cut to {}. Fix the \
+             policy; the prompt stated every one of them.",
+            self.faults.join("; "),
+            self.allowed
+        ))
+    }
+}
+
+async fn weigh(
+    adviser: &adviser::Claude,
+    advice: &adviser::Advice,
+    limit: Limit,
+) -> Result<Weighed> {
+    // No fallback, on purpose, and no verdict either — this leaves as an error. There is
+    // no number to substitute that any organisation asked for, and inventing one would
+    // keep the fleet running while nobody's policy is applied.
+    let opinion = adviser.weigh(advice).await?;
+
+    if opinion.denies() {
+        return Ok(Weighed {
+            said: opinion.count,
+            allowed: 0,
+            denied: Some(opinion.rationale.clone()),
+            rationale: opinion.rationale,
+            faults: Vec::new(),
+        });
+    }
+
+    let said = opinion.count;
+    let (allowed, faults) = sanity(said, opinion.bounded(advice), limit);
+    let rationale = if faults.is_empty() {
+        opinion.rationale
+    } else {
+        format!("{allowed} machine(s): {}", faults.join("; "))
+    };
+    Ok(Weighed { said, allowed, denied: None, rationale, faults })
+}
+
 /// What policy and the fleet concluded: a number, or a verdict to send instead.
 ///
 /// Wrapped in a `Result` by its callers, whose `Err` means something different again —
@@ -990,6 +1057,7 @@ fn refused(rationale: String) -> Result<Entitled> {
 /// All four were in the prompt. This exists for the case where the answer ignored one
 /// anyway — a policy that argues past its own ceiling, a model that misreads a
 /// number, a fleet that emptied between the brief and the answer.
+#[derive(Clone)]
 struct Limit {
     /// The organisation's own `max_limit`.
     ceiling: u32,
@@ -1943,6 +2011,31 @@ async fn run_command(
 // ---------------------------------------------------------------------------
 // the tester
 // ---------------------------------------------------------------------------
+
+/// `cm policy-test [folder] [--repeat N] [--only substring]`
+async fn policy_test(args: &[&str]) -> Result<std::process::ExitCode> {
+    let mut dir = ".".to_string();
+    let (mut repeat, mut only) = (1u32, None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--repeat" => {
+                repeat = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
+                i += 2;
+            }
+            "--only" => {
+                only = args.get(i + 1).map(|v| (*v).to_string());
+                i += 2;
+            }
+            other if other.starts_with("--") => bail!("unrecognised argument: {other}"),
+            other => {
+                dir = other.to_string();
+                i += 1;
+            }
+        }
+    }
+    policytest::run(std::path::Path::new(&dir), repeat, only.as_deref()).await
+}
 
 async fn test(
     target: &str,

@@ -3,8 +3,8 @@
 Where the organisation's rules live, how they get there, and who may change them.
 
 > **Status.** The fenced block cm enforces, one policy per tenant, the host's ceiling,
-> budgets, the model call, and **the whole folder weighed in one pass** are built and
-> running. `cm policy-test` and `cm upload-policy` are designed and **not built**.
+> budgets, the model call, the whole folder weighed in one pass, and **`cm policy-test`**
+> are built and running. `cm upload-policy` is designed and **not built**.
 
 ## `policy.md` has two halves, and only one of them is cm's business
 
@@ -441,3 +441,84 @@ to add up.
 A folder is re-read and re-sent on every plea, so it is capped at 256 KiB — over that the
 tenant's requests fail rather than being weighed against a truncated policy. Half a
 policy enforced as though it were the whole one would be invisible.
+
+
+## `cm policy-test`
+
+A policy decides how much money a fleet spends, and it is decided by a model reading
+prose. Both halves of that need a test. Prose can be ambiguous in ways nobody notices
+until a release night, and an edit meant to tighten one rule routinely loosens another.
+
+```sh
+cm policy-test .                       # in the repo where the policy lives
+cm policy-test . --repeat 5            # and does it hold every time?
+cm policy-test . --only "incident"
+```
+
+No controller, no fleet, no sirji — a folder, a model key, and the cases. It runs in the
+organisation's own CI, on the repository the policy lives in, before anything is uploaded.
+
+Cases are JSON in `policy-tests/`, one per file or many in a list:
+
+```json
+{
+  "name": "urgency without an incident identifier is not an incident",
+  "caller": "dana",
+  "asked": 6,
+  "said": { "plea": "production-incident", "why": "this is extremely urgent!!" },
+  "fleet": { "capable": 8, "free": 6, "rates": [1, 1, 2, 2, 8, 8] },
+  "money": { "budget": 400, "spent": 380, "window": 86400 },
+  "expect": { "at_most": 2 }
+}
+```
+
+Everything but `name` and `expect` has a default, so a case about a *rule* does not have
+to describe hardware. `fleet` defaults to a quiet fleet with room; `money` to no budget;
+`asked` to 1; `caller` to `somebody`.
+
+**`fleet` is pinnable because the answer depends on it.** Availability is an input to the
+decision, so "six machines" is a different question on a quiet Tuesday and a release
+night. A case that did not say which would pass or fail by accident — which is the price
+of putting fleet state in the prompt, paid here.
+
+**Expectations can be as vague as the rule they check.** `count` is exact; `at_most` and
+`at_least` are bounds; `verdict` is `allow`, `counter` or `deny` as the *caller* would
+experience it, not as the model worded it — fewer than asked is a counter however it
+happened, and nothing at all is a denial whether the model refused or a clamp took it.
+"Counted back towards the standing limit" is a real sentence to write, and `at_most` checks
+it without inventing a number the policy never named. A case that expects nothing is
+refused at load: it would pass against any answer, which is worse than no test because it
+looks like coverage.
+
+**`--repeat` is not paranoia.** The answer comes from a model, so "does this rule hold"
+and "does this rule hold every time" are different questions, and only the second tells
+you whether a policy is written clearly enough to depend on.
+
+A failure quotes the rationale, always:
+
+```
+  FAIL  an incident with an identifier may have the maximum
+          expected at least 4, got 2
+          it said: no incident identifier was given, so this was treated as routine
+```
+
+Without that an author knows the number was wrong and nothing about which sentence of
+theirs produced it.
+
+### Two things this gets right on purpose
+
+**The cases are not part of the policy.** They live in `policy-tests/`, which the folder
+reader excludes. A folder is sent to the model verbatim, so a case inside it would hand
+over the answer key with the question and every test would pass while checking nothing.
+Of everything excluded from the prompt, this is the one that would fail silently and
+completely — so `scripts/policytest.sh` asserts it against the prompt the model actually
+received.
+
+**The decision is the same code the controller runs.** One `weigh` function, shared. A
+second implementation would eventually disagree with the first and be believed — a policy
+test that passes against a slightly different decision than the fleet makes is worse than
+having none. Same rule as the dry run sharing `choose`.
+
+There is a worked example in [`examples/policy/`](../examples/policy): a policy with
+per-person rules, pleas grouped three different ways, and eight cases including a prompt
+injection attempt. Its assertions are about prose, so running it needs a real model.

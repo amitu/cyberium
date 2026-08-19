@@ -52,6 +52,16 @@ fn theirs_to_write(name: &str) -> bool {
     name != crate::tenant::FILE && name != crate::budget::FILE
 }
 
+/// Directories that are about the policy rather than part of it.
+///
+/// `policy-tests/` holds the expected answers. A folder is sent to the model verbatim, so
+/// including them would hand over the answer key with the question — and every test would
+/// pass while checking nothing. Of everything excluded here, this is the one that would
+/// fail silently and completely.
+fn part_of_the_policy(name: &str) -> bool {
+    name != crate::policytest::DIR
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Rulebook {
     rendered: String,
@@ -115,7 +125,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<()> {
             continue;
         }
         if path.is_dir() {
-            if depth < DEEPEST {
+            if depth < DEEPEST && part_of_the_policy(name) {
                 collect(&path, out, depth + 1)?;
             }
             continue;
