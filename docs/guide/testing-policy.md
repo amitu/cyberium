@@ -51,7 +51,7 @@ JSON in `policy-tests/`, one case per file or many in a list:
 Everything but `name` and `expect` has a default, so a case about a *rule* does not have to
 describe hardware:
 
-| | | |
+| Field | What it is | Default |
 |---|---|---|
 | `caller` | who is asking | `somebody` |
 | `asked` | machines requested | `1` |
@@ -71,7 +71,7 @@ accident.
 
 As vague as the rule they check:
 
-| | |
+| Expectation | What it checks |
 |---|---|
 | `count` | exactly this many |
 | `at_most` / `at_least` | a bound |

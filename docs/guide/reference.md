@@ -11,7 +11,7 @@ disagree.
 
 ## Commands
 
-| | |
+| Command | What it does |
 |---|---|
 | `cm init --parent <invite> [--root <dir>]` | create `$CM_HOME` and enrol with the sirji that issued the invite |
 | `cm whoami` | this device's name and key — what `cm admin add` wants |
@@ -27,7 +27,7 @@ disagree.
 
 ## `cm worker`
 
-| | |
+| Flag | What it does |
 |---|---|
 | `--controller <name>` | which sibling to register with |
 | `--can <cap>` | a capability. Repeatable |
@@ -39,14 +39,14 @@ disagree.
 
 Cyberium's own, because it acts on them mechanically:
 
-| | |
+| Flag | What it does |
 |---|---|
 | `--count N` | how many machines. A ceiling on the grant |
 | `--need <cap>` | required capability. Repeatable; all must match |
 
 The run:
 
-| | |
+| Flag | What it does |
 |---|---|
 | `--run <cmd>` | what to run on each machine |
 | `--repo <url>` | fetch this first |
@@ -69,7 +69,7 @@ cyberium attaches no meaning to any of it.
 
 ## `cm tenant add`
 
-| | |
+| Flag | What it does |
 |---|---|
 | `--ceiling N` | your cap on them, whatever their policy says |
 | `--credits N` / `--window SECS` | budget per rolling window |
@@ -79,7 +79,7 @@ cyberium attaches no meaning to any of it.
 
 ## `cm policy-test`
 
-| | |
+| Flag | What it does |
 |---|---|
 | `--repeat N` | run each case N times; all must pass |
 | `--only <substring>` | just the cases whose name contains this |
@@ -88,14 +88,14 @@ cyberium attaches no meaning to any of it.
 
 **Everywhere**
 
-| | |
+| Variable | What it does |
 |---|---|
 | `CM_HOME` | this device's home. Default `~/.cm` |
 | `SIRJI_HOME` | the sirji identity to use |
 
 **Controller**
 
-| | |
+| Variable | What it does |
 |---|---|
 | `CM_MODEL_KEY` | **required.** No key, no controller |
 | `CM_MODEL` | default `claude-sonnet-5` |
@@ -103,7 +103,7 @@ cyberium attaches no meaning to any of it.
 
 **Caller**
 
-| | |
+| Variable | What it does |
 |---|---|
 | `CM_SAY` | declarations from CI: `plea=nightly,incident=INC-1` |
 
@@ -113,7 +113,7 @@ cyberium attaches no meaning to any of it.
 
 ## Files
 
-| | |
+| File | What is in it |
 |---|---|
 | `$CM_HOME/config.toml` | this device: name, key, parent, root |
 | `<root>/admins.toml` | who may look inside. Host-written, by key |
@@ -127,7 +127,7 @@ cyberium attaches no meaning to any of it.
 
 Every one of these runs live, against a stand-in model, and prints what happened:
 
-| | |
+| Script | What it exercises |
 |---|---|
 | `scripts/fleet.sh` | a whole fleet: capabilities, checkouts, artifacts, reclaim, hygiene |
 | `scripts/model.sh` | the model call: bounds, refusals, faults, prompt contents, uploads |

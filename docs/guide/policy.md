@@ -33,7 +33,7 @@ budget_window: 86400
 
 These are the only things cyberium reads for itself, and only because it **enforces** them:
 
-| | |
+| Key | What it means |
 |---|---|
 | `requesters` | who may ask at all. `everyone` means any authenticated member. |
 | `standing_limit` | what you call an ordinary request. Calibration, not a floor. |

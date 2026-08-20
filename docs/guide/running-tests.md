@@ -48,7 +48,7 @@ cm t cm-c@acme --plea nightly --count 4 \
     --run 'npx playwright test --shard={shard}/{shards}'
 ```
 
-| | |
+| Flag | What it does |
 |---|---|
 | `--repo <url>` | fetched before anything runs |
 | `--ref <commit>` | which commit — pass a SHA, not a branch, or you are testing a moving target |

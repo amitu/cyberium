@@ -34,29 +34,25 @@ main thing still unbuilt — see [Identity and access](design/auth.html).
 
 ## Start here
 
-| | |
-|---|---|
-| [Install](guide/installing.html) | Binaries, or build it yourself. |
-| [Quickstart](guide/quickstart.html) | A controller, a worker and a test run, on one machine. |
-| [Run a suite](guide/running-tests.html) | `cm t` in full: sharding, checkouts, artifacts. |
-| [Playwright](guide/playwright.html) | `npm test` distributes itself. Your config is untouched. |
+- **[Install](guide/installing.html)** — binaries, or build it yourself
+- **[Quickstart](guide/quickstart.html)** — a controller, a worker and a test run, on one machine
+- **[Run a suite](guide/running-tests.html)** — `cm t` in full: sharding, checkouts, artifacts
+- **[Playwright](guide/playwright.html)** — `npm test` distributes itself, and your config is untouched
 
 ## The policy
-| | |
-|---|---|
-| [Writing a policy](guide/policy.html) | The folder is the policy, and a model reads all of it. |
-| [Testing a policy](guide/testing-policy.html) | `cm policy-test` — check prose the way you check code. |
-| [Shipping a policy](guide/uploading-policy.html) | `cm upload-policy`, and who is allowed to. |
-| [Budgets](guide/budgets.html) | Credits, rates, and what a machine-minute costs. |
+
+- **[Writing a policy](guide/policy.html)** — the folder is the policy, and a model reads all of it
+- **[Testing a policy](guide/testing-policy.html)** — `cm policy-test`, to check prose the way you check code
+- **[Shipping a policy](guide/uploading-policy.html)** — `cm upload-policy`, and who is allowed to
+- **[Budgets](guide/budgets.html)** — credits, rates, and what a machine-minute costs
 
 ## Running a fleet
-| | |
-|---|---|
-| [Workers](guide/workers.html) | Capabilities, rates, and cleaning up between tenants. |
-| [Tenants](guide/tenants.html) | Teams, members, admins, and facts you attest about them. |
-| [Operating](guide/operating.html) | Admin devices, and looking inside a running controller. |
-| [Your own controller](guide/custom-controller.html) | The library seam, for callers who live in a directory. |
-| [Reference](guide/reference.html) | Every command, every environment variable. |
+
+- **[Workers](guide/workers.html)** — capabilities, rates, and cleaning up between tenants
+- **[Tenants](guide/tenants.html)** — teams, members, admins, and the facts you attest about them
+- **[Operating a controller](guide/operating.html)** — admin devices, and looking inside a running one
+- **[Your own controller](guide/custom-controller.html)** — the library seam, for callers who live in a directory
+- **[Reference](guide/reference.html)** — every command, flag, environment variable and file
 
 ## Why it is built this way
 

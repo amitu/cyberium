@@ -52,7 +52,7 @@ thirds of a six-way one.
 All by environment, because a plugin that needed its own config file would be a second place
 for the same information to disagree with itself.
 
-| | |
+| Variable | What it does |
 |---|---|
 | `CM_CONTROLLER` | **Required.** `name@org` of the controller. |
 | `CM_SHARDS` | How many machines to ask for. Default 4. |
