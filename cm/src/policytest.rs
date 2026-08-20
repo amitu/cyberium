@@ -136,6 +136,29 @@ pub struct Expect {
 }
 
 impl Expect {
+    /// Why this case can never pass, if it cannot.
+    ///
+    /// The ask is a hard ceiling — nobody is handed machines they did not request — so
+    /// `at_least` above `asked` is a case that fails for being impossible rather than for
+    /// anything being wrong. Better said at load than debugged against a red build.
+    fn impossible(&self, asked: u32) -> Option<String> {
+        if let Some(least) = self.at_least.filter(|l| *l > asked.max(1)) {
+            return Some(format!(
+                "expects at least {least} but only asks for {asked}, and no answer may \
+                 exceed the ask"
+            ));
+        }
+        if let Some(exact) = self.count.filter(|c| *c > asked.max(1)) {
+            return Some(format!("expects {exact} but only asks for {asked}"));
+        }
+        if let (Some(most), Some(least)) = (self.at_most, self.at_least)
+            && least > most
+        {
+            return Some(format!("expects at least {least} and at most {most}"));
+        }
+        None
+    }
+
     /// Empty expectations would pass against anything, which is worse than no test: it
     /// looks like coverage.
     fn says_something(&self) -> bool {
@@ -213,6 +236,9 @@ pub fn load(dir: &Path) -> Result<Vec<Case>> {
                     path.display(),
                     case.name
                 );
+            }
+            if let Some(why) = case.expect.impossible(case.asked) {
+                bail!("{}: `{}` {why}", path.display(), case.name);
             }
         }
         cases.extend(parsed);
@@ -321,7 +347,9 @@ async fn one_case(
     };
 
     for attempt in 1..=repeat.max(1) {
-        let weighed = weigh(adviser, &advice, limit.clone())
+        // No deployment behind a folder, so no post-processing. A policy test checks the
+        // policy; whatever `Directory::reviewed` does is that deployment's to test.
+        let weighed = weigh(adviser, &advice, limit.clone(), None)
             .await
             .map_err(|e| format!("{e:#}"))?;
         let (got, denied) = (weighed.allowed, weighed.denied.is_some());
@@ -388,6 +416,20 @@ mod tests {
         assert!(e.check(3, 9, false).is_none());
         assert!(e.check(1, 9, false).is_some());
         assert!(e.check(5, 9, false).is_some());
+    }
+
+    #[test]
+    fn a_case_that_cannot_pass_is_refused_at_load() {
+        // Found in this repository's own example folder: an incident case expecting at
+        // least eight machines while asking for six. The ask is a hard ceiling, so it
+        // could never have passed, and nothing about the failure said so.
+        let e = expect(r#"{"at_least": 8}"#).impossible(6).unwrap();
+        assert!(e.contains("only asks for 6"), "{e}");
+        assert!(expect(r#"{"at_least": 6}"#).impossible(6).is_none());
+
+        assert!(expect(r#"{"count": 9}"#).impossible(6).is_some());
+        assert!(expect(r#"{"at_least": 5, "at_most": 2}"#).impossible(9).is_some());
+        assert!(expect(r#"{"at_most": 2}"#).impossible(6).is_none());
     }
 
     #[test]

@@ -210,9 +210,10 @@ impl Claude {
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": 512,
-            // Zero because two identical pleas against an identical fleet should get
-            // the same answer. Necessary and nowhere near sufficient — which is why
-            // policy gets snapshot tests.
+            // Zero, so the same plea against the same fleet gets the same answer and a
+            // policy can be tested at all. The *shape* of the answer is not left to luck
+            // either: one JSON object, three fields, and an unknown verdict is an error
+            // rather than a guess — see `parse_opinion`.
             "temperature": 0,
             // One block, marked cacheable. The split between here and the user message
             // is exactly the split between what holds still and what moves: the

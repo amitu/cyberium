@@ -84,8 +84,13 @@ without inventing a number your policy never named.
 asked is a counter however it happened, and nothing at all is a denial whether the model
 refused or a clamp took it.
 
-A case that expects nothing is refused at load. It would pass against any answer, which is
-worse than having no test, because it looks like coverage.
+A case that expects nothing is refused at load: it would pass against any answer, which is
+worse than having no test because it looks like coverage.
+
+So is a case that **cannot** pass — `at_least: 8` while asking for 6, or `at_least` above
+`at_most`. The ask is a hard ceiling, so such a case fails for being impossible rather than
+for anything being wrong, and a red build would not say which. This repository's own example
+folder had one.
 
 ## `--repeat` is not paranoia
 
@@ -123,3 +128,11 @@ a prompt-injection attempt:
 ```
 
 Its assertions are about prose, so running it needs a real model key.
+
+## What a policy test does not cover
+
+`cm policy-test` runs against a folder, with no deployment behind it — so a hosted
+deployment's [post-processor](custom-controller.html#looking-at-the-answer) is not called. A
+policy test checks the policy; whatever happens after it is that deployment's to test.
+
+For why it is shaped this way, see the [design note](../design/policy-testing.html).

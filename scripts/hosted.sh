@@ -117,6 +117,23 @@ CM_HOME=$LAB/t-dana SIRJI_HOME=$LAB/t-dana $CM upload-policy cm-c@acme "$LAB/edi
   | tail -1 | cut -c1-108 | sed 's/^/  /'
 set -e
 
+say "the deployment's post-processor saw every decision"
+grep -c "^decision:" cm-c.log | sed 's/^/  decisions recorded: /'
+grep -m2 "^decision:" cm-c.log | cut -c1-108 | sed 's/^/  /'
+
+say "and it can decide, not only watch — a freeze belongs to the fleet, not to a tenant"
+pkill -f hosted-controller 2>/dev/null || true
+sleep 1
+FLEET_FROZEN=1 CM_MODEL_KEY=stand-in CM_MODEL_URL=http://127.0.0.1:$PORT \
+CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $HOSTED >>cm-c.log 2>&1 &
+sleep 3
+for w in w1 w2 w3 w4; do
+  CM_HOME=$LAB/$w SIRJI_HOME=$LAB/$w $CM worker --can linux --rate 1 >>$w.log 2>&1 &
+done
+for _ in $(seq 40); do [ "$(grep -c arrived cm-c.log || true)" -ge 8 ] && break; sleep 1; done
+t dana --plea nightly-regression --count 4 --need linux --dry-run 2>&1 | tail -1 | sed 's/^/  /'
+echo "  (the same plea got 4 before the freeze)"
+
 say "controller log"
 grep -E "policy (weighed|refused)|bill |not a tenant" cm-c.log | cut -c1-108 | sed 's/^/  /'
 

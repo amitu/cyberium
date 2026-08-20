@@ -313,19 +313,32 @@ reservation ends, so nothing has to be timed out at the edge either.
 
 One file, hand-edited, `git`-able. Two halves on purpose:
 
-```markdown
+````markdown
+# Payments — how we hand out test machines
+
 ```yaml
 requesters:
   - everyone
-standing_limit: 10
-reservation_seconds: 600
+standing_limit: 4
+max_limit: 16
+reservation_seconds: 2400
+daily_budget: 6000
+budget_window: 86400
 ```
 
-## Circumstantial override
+## What we are optimising for, in order
 
-If a request asserts a production incident and names an incident tracker URL,
-allow up to 5x the standing limit for one hour, then re-evaluate.
-```
+1. A pull request gets an answer in under ten minutes. That is the number people feel.
+2. The nightly suite finishes before the 09:30 standup. It has eight hours.
+3. Everything else can wait, and saying so is the point of this file.
+
+## Money
+
+When more than three quarters of today's budget is gone, hold everything except incidents
+to the standing limit. The last of a day's credits should be there for something that
+could not wait, and by mid-afternoon we do not know yet what that will be.
+````
+
 
 The fenced block is read **deterministically** and settles who may even ask — an
 unauthorised caller is refused before any model is consulted, so a security decision
@@ -574,6 +587,8 @@ pub trait Directory: Send + Sync {
     async fn charge(&self, tenant: &str, entry: &budget::Entry) -> Result<()>;
     async fn write_rules(&self, tenant: &str, up: &proto::Upload) -> Result<Vec<String>>;
     async fn roster(&self) -> Result<Vec<Listed>>;
+    /// The model's answer, before any of it is enforced. Log it, or decide.
+    async fn reviewed(&self, about: &Weighing<'_>, opinion: &mut Opinion) -> Result<()>;
     fn describe(&self) -> String;
 }
 ```

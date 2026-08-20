@@ -3,6 +3,7 @@
 Brute-force flake hunting: run the suite over and over until the flake shows itself.
 Legitimate work, and never urgent — it can run again tomorrow.
 
-## Try something odd
+## Try a new shard split
 
-An experiment whose shape we do not know yet. Give it the standing limit and no more.
+Checking whether a different split is faster or more even. Useful, and nobody is blocked on
+the answer.

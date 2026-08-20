@@ -56,9 +56,12 @@ main thing still unbuilt — see [Identity and access](design/auth.html).
 
 ## Why it is built this way
 
-Three [design notes](design/policy.html) carry the reasoning, each opening with what does
-and does not exist yet. They are worth reading before disagreeing with a decision:
-[policy](design/policy.html), [budgets](design/budget.html), and
+Four [design notes](design/policy.html) carry the reasoning, each opening with what does and
+does not exist yet. They are worth reading before disagreeing with a decision:
+[policy](design/policy.html) — including [the answer's
+schema](design/policy.html#the-answer-is-a-contract-not-a-conversation) and the
+[post-processor](design/policy.html#the-post-processor) — [testing a
+policy](design/policy-testing.html), [budgets](design/budget.html), and
 [identity](design/auth.html).
 
 ---

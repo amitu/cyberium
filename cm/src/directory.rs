@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::{budget, proto, tenant, upload};
+use crate::{adviser, budget, proto, tenant, upload};
 
 /// Everything a controller needs to decide one caller's plea.
 ///
@@ -88,6 +88,20 @@ pub struct Listed {
     pub unread: Option<String>,
 }
 
+/// What a decision was about, for [`Directory::reviewed`].
+#[derive(Debug, Clone, Copy)]
+pub struct Weighing<'a> {
+    /// The caller, as their ticket proved them.
+    pub caller: &'a str,
+    /// Everything this deployment said about them.
+    pub tenancy: &'a Tenancy,
+    /// How many machines they asked for.
+    pub asked: u32,
+    /// The keys they sent. cm read none of them, and neither did the policy's author
+    /// unless they wrote a rule about one.
+    pub said: &'a BTreeMap<String, String>,
+}
+
 #[async_trait]
 pub trait Directory: Send + Sync {
     /// Who is this caller, and what do they get? `None` if this deployment has never
@@ -108,6 +122,36 @@ pub trait Directory: Send + Sync {
 
     /// Every tenant, for the operator's own view. Never for a caller.
     async fn roster(&self) -> Result<Vec<Listed>>;
+
+    /// The model's answer, before any of it is enforced. Change it, or do not.
+    ///
+    /// This is where a deployment's own business logic goes, and it is a `&mut` rather
+    /// than a return value because most implementations will only want to *read*: emit a
+    /// metric, write a decision to an audit log, count how often a policy is overshooting.
+    ///
+    /// It can also decide. An account in arrears, a region that is over capacity, an
+    /// incident freeze — the sort of rule that belongs to whoever runs the fleet rather
+    /// than to any one tenant's policy, and that nobody wants to express in prose.
+    ///
+    /// **Every clamp still applies afterwards.** Raising the count here does not escape
+    /// the ceiling, the budget or what is free; lowering it always works. So this is a
+    /// place to be stricter, or to watch, and not a way around the numbers a human wrote
+    /// — which is the same rule the model itself is held to.
+    ///
+    /// An `Err` fails the request rather than being ignored. If your audit log is the
+    /// reason you are allowed to hand out machines, a decision you could not record is a
+    /// decision you should not act on; if it is not, log and return `Ok`.
+    ///
+    /// Not called by `cm policy-test`, which runs against a folder with no deployment
+    /// behind it. A policy test therefore checks the policy, not this — worth knowing if
+    /// you put a rule here that a tenant could otherwise read about in their own files.
+    async fn reviewed(
+        &self,
+        _about: &Weighing<'_>,
+        _opinion: &mut adviser::Opinion,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// A line for the startup log, so an operator can see what is answering.
     fn describe(&self) -> String;

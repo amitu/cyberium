@@ -27,6 +27,7 @@ pub trait Directory: Send + Sync {
     async fn charge(&self, tenant: &str, entry: &budget::Entry) -> Result<()>;
     async fn write_rules(&self, tenant: &str, up: &proto::Upload) -> Result<Vec<String>>;
     async fn roster(&self) -> Result<Vec<Listed>>;
+    async fn reviewed(&self, about: &Weighing<'_>, opinion: &mut Opinion) -> Result<()>;
     fn describe(&self) -> String;
 }
 ```
@@ -58,6 +59,45 @@ Tenancy {
     budget: Some(Budget { credits: 4_000, window: 86_400 }),
 }
 ```
+
+## Looking at the answer
+
+There is one more method, with a default that does nothing:
+
+```rust
+async fn reviewed(&self, about: &Weighing<'_>, opinion: &mut Opinion) -> Result<()>;
+```
+
+Called with the model's answer **before any of it is enforced**. `&mut` rather than a return
+value, because most implementations only want to read:
+
+```rust
+async fn reviewed(&self, about: &Weighing<'_>, opinion: &mut Opinion) -> Result<()> {
+    audit(about.caller, &about.tenancy.tenant, opinion.count, &opinion.rationale).await?;
+
+    // A freeze belongs to whoever runs the fleet, not to any one tenant's prose.
+    if self.frozen().await && opinion.count > 1 {
+        opinion.count = 1;
+        opinion.rationale = "the fleet is frozen for a deploy; one machine until it lifts".into();
+    }
+    Ok(())
+}
+```
+
+`Weighing` carries the caller, the whole `Tenancy` including its attested facts, what was
+asked and what was said — so nothing has to be looked up twice.
+
+**Every clamp still runs afterwards.** Lowering the count always works; raising it does not
+escape the ceiling, the budget or availability. That is what makes this a safe place for
+business logic: it is held to the same numbers the model is.
+
+An `Err` **fails the request**. If an audit record is the reason you are permitted to hand out
+machines at all, a decision you could not record is one you should not act on. If it is not,
+log it and return `Ok`.
+
+It is not called by `cm policy-test`, which runs against a folder with no deployment behind
+it — the honest boundary, and worth knowing if you put a rule here that a tenant could
+otherwise have read in their own files.
 
 ## Three things the trait deliberately lacks
 

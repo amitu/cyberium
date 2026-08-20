@@ -14,21 +14,39 @@ Where the organisation's rules live, how they get there, and who may change them
 
 ## `policy.md` has two halves, and only one of them is cm's business
 
-```markdown
-# policy.md
+````markdown
+# Payments — how we hand out test machines
 
 ```yaml
 requesters:
   - everyone
-standing_limit: 10
-reservation_seconds: 600
+standing_limit: 4
+max_limit: 16
+reservation_seconds: 2400
+daily_budget: 6000
+budget_window: 86400
 ```
 
-## Circumstantial override
+## What we are optimising for, in order
 
-If a request asserts a production incident and names an incident tracker URL,
-allow up to 5x the standing limit for one hour, then re-evaluate.
-```
+1. A pull request gets an answer in under ten minutes. That is the number people feel.
+2. The nightly suite finishes before the 09:30 standup. It has eight hours.
+3. Everything else can wait, and saying so is the point of this file.
+
+## Who is asking
+
+`plan`, `team` and `on_call` come from our directory, not from the requester, so a rule
+that turns on one of them holds. Contractors get the standing limit and no more, whatever
+they name. Whoever is on call is treated as an incident by default, because somebody paged
+at 3am should not have to argue with a file.
+
+## Money
+
+When more than three quarters of today's budget is gone, hold everything except incidents
+to the standing limit. The last of a day's credits should be there for something that
+could not wait, and by mid-afternoon we do not know yet what that will be.
+````
+
 
 The fenced block is read **deterministically**. A caller outside `requesters` is
 refused without a model ever being consulted, so the cheap gate stays cheap and a
@@ -269,73 +287,39 @@ a developer's machines being *theirs* is rather the point.
 - Members are matched exactly; there is no pattern like `*@acme` for onboarding a
   whole organisation at once.
 
-## Getting a policy onto a controller
+## The bundle, and the gate that is not built
 
-Today: `cm tenant add`, then edit the `policy.md` it wrote. No restart — the
-controller re-reads a tenant's folder when they next ask.
+Editing a policy on the controller works today: `cm tenant add`, edit what it wrote, no
+restart. Getting one there from a repository works too — see
+[Who may change a policy](#who-may-change-a-policy) below, which is built.
 
-Designed, for the case where the tenant is a different organisation and should not
-need a shell on the controller:
+What is **designed and not built** is the shape around it:
 
 ```
 <org>/cyberium repo
   policy.md, nivedanas/, policy-tests/
         │
-        ├── cm test-policy      in the org's CI: snapshots must pass to merge
+        ├── cm policy-test      in the org's CI: cases must pass to merge      [built]
         │
-        └── cm upload-policy    on merge: push the bundle to the controller
+        └── cm upload-policy    on merge: push the folder to the controller    [built]
                                      │
                                      └── which re-runs policy-tests/ against the
-                                         new bundle and REFUSES it on any diff
+                                         new folder and REFUSES it on any failure
+                                                                        [NOT built]
 ```
 
-The controller running the organisation's *own* tests as an **admission gate** is
-what makes remote policy editing safe. A policy that fails its own snapshots never
-takes effect, and the rejection is a diff rather than a surprise next Tuesday.
+The controller running the organisation's *own* tests as an **admission gate** is what
+would make remote policy editing safe rather than merely convenient. A policy that fails
+its own cases would never take effect, and the rejection would be a diff rather than a
+surprise next Tuesday.
 
-It also means the tests are not decoration. They are the thing standing between a
-careless edit and an allocator that quietly stops making sense.
+It also would mean the cases are not decoration: the thing standing between a careless
+edit and an allocator that quietly stops making sense. Today that responsibility sits with
+whoever runs CI, and an admin who skips CI can upload anything that parses.
 
-## Who may change it
-
-Two credentials, and the separation is the point:
-
-| credential | held by | authorises |
-|---|---|---|
-| policy-admin | the `<org>/cyberium` repo | replacing the policy bundle |
-| ordinary | every other repo | asking for machines |
-
-A repository that can ask for machines must not be able to raise its own limit.
-
-## Testing prose
-
-A policy whose prose nobody can test is prose nobody will dare edit. So a bundle
-carries its own cases, and they are checked in beside the file they test:
-
-```json
-[
-  { "alias": "flaky-bisect", "asker": "dana", "count": 3, "expect": 3 },
-  { "alias": "p0-incident",  "asker": "dana", "count": 50,
-    "fleet": { "machines": 60, "free": 4 }, "expect": 50 },
-  { "alias": "no-such-thing", "asker": "dana", "count": 50, "expect": 10,
-    "note": "an unknown alias must not reach the model at all" }
-]
-```
-
-Carrying the fleet state in the fixture looks like a complication and is the payoff:
-**contention becomes testable without a contended fleet.** "Does an incident still
-win when four machines are free" is the question you most want answered and can
-never stage live.
-
-Two things to design in from the start:
-
-- **Models are not deterministic.** Temperature zero is necessary and nowhere near
-  sufficient. Expect a number *or* a range, run each case a few times, and report
-  the spread — which turns flakiness into a visible measurement rather than a random
-  red build.
-- **The real value is catching the day the model changes under you.** Your wording
-  did not move; the decisions did. Nothing else in the system would tell you.
-
+Two credentials would separate the two rights — one repository that may replace a policy,
+every other repository able only to ask for machines — and neither exists yet. See
+[Identity and access](auth.html); today both are a paired sirji device.
 
 ## The whole folder is the policy
 
@@ -449,87 +433,6 @@ tenant's requests fail rather than being weighed against a truncated policy. Hal
 policy enforced as though it were the whole one would be invisible.
 
 
-## `cm policy-test`
-
-A policy decides how much money a fleet spends, and it is decided by a model reading
-prose. Both halves of that need a test. Prose can be ambiguous in ways nobody notices
-until a release night, and an edit meant to tighten one rule routinely loosens another.
-
-```sh
-cm policy-test .                       # in the repo where the policy lives
-cm policy-test . --repeat 5            # and does it hold every time?
-cm policy-test . --only "incident"
-```
-
-No controller, no fleet, no sirji — a folder, a model key, and the cases. It runs in the
-organisation's own CI, on the repository the policy lives in, before anything is uploaded.
-
-Cases are JSON in `policy-tests/`, one per file or many in a list:
-
-```json
-{
-  "name": "urgency without an incident identifier is not an incident",
-  "caller": "dana",
-  "asked": 6,
-  "said": { "plea": "production-incident", "why": "this is extremely urgent!!" },
-  "fleet": { "capable": 8, "free": 6, "rates": [1, 1, 2, 2, 8, 8] },
-  "money": { "budget": 400, "spent": 380, "window": 86400 },
-  "expect": { "at_most": 2 }
-}
-```
-
-Everything but `name` and `expect` has a default, so a case about a *rule* does not have
-to describe hardware. `fleet` defaults to a quiet fleet with room; `money` to no budget;
-`asked` to 1; `caller` to `somebody`.
-
-**`fleet` is pinnable because the answer depends on it.** Availability is an input to the
-decision, so "six machines" is a different question on a quiet Tuesday and a release
-night. A case that did not say which would pass or fail by accident — which is the price
-of putting fleet state in the prompt, paid here.
-
-**Expectations can be as vague as the rule they check.** `count` is exact; `at_most` and
-`at_least` are bounds; `verdict` is `allow`, `counter` or `deny` as the *caller* would
-experience it, not as the model worded it — fewer than asked is a counter however it
-happened, and nothing at all is a denial whether the model refused or a clamp took it.
-"Counted back towards the standing limit" is a real sentence to write, and `at_most` checks
-it without inventing a number the policy never named. A case that expects nothing is
-refused at load: it would pass against any answer, which is worse than no test because it
-looks like coverage.
-
-**`--repeat` is not paranoia.** The answer comes from a model, so "does this rule hold"
-and "does this rule hold every time" are different questions, and only the second tells
-you whether a policy is written clearly enough to depend on.
-
-A failure quotes the rationale, always:
-
-```
-  FAIL  an incident with an identifier may have the maximum
-          expected at least 4, got 2
-          it said: no incident identifier was given, so this was treated as routine
-```
-
-Without that an author knows the number was wrong and nothing about which sentence of
-theirs produced it.
-
-### Two things this gets right on purpose
-
-**The cases are not part of the policy.** They live in `policy-tests/`, which the folder
-reader excludes. A folder is sent to the model verbatim, so a case inside it would hand
-over the answer key with the question and every test would pass while checking nothing.
-Of everything excluded from the prompt, this is the one that would fail silently and
-completely — so `scripts/policytest.sh` asserts it against the prompt the model actually
-received.
-
-**The decision is the same code the controller runs.** One `weigh` function, shared. A
-second implementation would eventually disagree with the first and be believed — a policy
-test that passes against a slightly different decision than the fleet makes is worse than
-having none. Same rule as the dry run sharing `choose`.
-
-There is a worked example in [`examples/policy/`](https://github.com/amitu/cyberium/tree/main/examples/policy): a policy with
-per-person rules, pleas grouped three different ways, and eight cases including a prompt
-injection attempt. Its assertions are about prose, so running it needs a real model.
-
-
 ## Who may change a policy
 
 `cm policy-test` proves a policy says what its author meant. `cm upload-policy` gets it to
@@ -606,11 +509,88 @@ answers.
 
 ### One thing this found
 
-The scenario meant to upload a broken policy and appended a second ```yaml block to do it.
+The scenario meant to upload a broken policy and appended a second `` ```yaml `` block to do it.
 The upload was **accepted** — only the first block is ever read, so the second was silently
 ignored. Which means anybody appending a rule that way would see no error and believe it was
 in force. Two blocks is now a refusal: which one was meant is not cm's to guess.
 
+
+## The answer is a contract, not a conversation
+
+The model is not asked what it thinks. It is asked for one JSON object:
+
+```json
+{
+  "verdict": "allow",
+  "count": 4,
+  "rationale": "a pre-merge check with somebody waiting, and the budget has room"
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `verdict` | `"allow"` \| `"counter"` \| `"deny"` | whether the policy supports the request |
+| `count` | number | how many machines. Ignored when the verdict is `deny` |
+| `rationale` | string | one sentence, shown to the caller |
+
+That is the whole surface, and it is enforced on the way in:
+
+- The object is **extracted from whatever it arrives wrapped in.** Models put JSON inside
+  prose and inside code fences, and treating a formatting habit as a refusal would be a poor
+  trade. The first `{` to the last `}` is parsed.
+- **An unknown verdict is an error, not a guess.** `"maybe"` fails the request rather than
+  being read as one of the three.
+- **`count` and `rationale` default** rather than failing: a `deny` with no number is
+  perfectly sensible, and an answer with no sentence is still an answer.
+- Anything else in the object is ignored.
+
+### `allow` and `counter` are the same thing
+
+Worth saying plainly, because the prompt asks for both. Only `deny` branches in the code;
+`allow` and `counter` are treated identically, and the count decides everything. The verdict
+a *caller* sees is derived afterwards — fewer than asked is a counter, however the model
+worded it, and zero is a denial whether it refused or a clamp took the last machine.
+
+The distinction is kept in the prompt because asking for it makes a model state its intent,
+and an answer of `counter: 4` against an ask of 4 is a signal that the wording confused it.
+It is not load-bearing.
+
+### And then the numbers apply
+
+`verdict: "allow", count: 99` does not grant 99. The answer is clamped to the ceiling, the
+ask, what is free and what the budget buys — and because every one of those was *in* the
+prompt, a clamp that fires is [logged as a
+defect](#the-clamps-are-a-sanity-net-not-the-logic) in the policy rather than treated as the
+normal way an answer gets made.
+
+## The post-processor
+
+Between the model answering and any of it being enforced, the deployment gets to look:
+
+```rust
+async fn reviewed(&self, about: &Weighing<'_>, opinion: &mut Opinion) -> Result<()>;
+```
+
+A `&mut` rather than a return value, because most implementations only want to *read* —
+write an audit row, emit a metric, count how often a policy overshoots its own ceiling. The
+`Weighing` carries the caller, the tenancy with its attested facts, what was asked and what
+was said, so nothing has to be looked up twice.
+
+It can also decide. An account in arrears, a region over capacity, a deploy freeze: rules
+that belong to whoever runs the fleet rather than to any one tenant's policy, and that
+nobody wants to express in prose for every tenant separately.
+
+**Every clamp still runs afterwards.** Lowering the count here always works; raising it does
+not escape the ceiling, the budget or availability. So it is a place to be stricter, or to
+watch — held to the same numbers the model is, which is the property that makes it safe to
+put business logic in.
+
+An `Err` fails the request rather than being swallowed. If an audit record is the reason you
+are permitted to hand out machines at all, a decision you could not record is one you should
+not act on; if it is not, log it and return `Ok`.
+
+It is [not called by `cm policy-test`](policy-testing.html#what-a-policy-test-does-not-cover),
+which is the honest boundary rather than an oversight.
 
 ## Attested facts: an organisation's own shape
 

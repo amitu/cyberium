@@ -32,7 +32,8 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use async_trait::async_trait;
 use cyberium::budget;
-use cyberium::directory::{Budget, Directory, Listed, Tenancy};
+use cyberium::adviser::Opinion;
+use cyberium::directory::{Budget, Directory, Listed, Tenancy, Weighing};
 use cyberium::proto;
 
 /// Stands in for what a real deployment would call: an identity service, a plan service,
@@ -183,6 +184,35 @@ impl Directory for Hosted {
              usual review, not through {} file(s) over the wire",
             up.files.len()
         )
+    }
+
+    /// The deployment's own look at the answer, before anything is enforced.
+    ///
+    /// Two kinds of thing belong here, and this shows both: something to *record*, and a
+    /// rule that is the fleet's rather than any one tenant's.
+    async fn reviewed(&self, about: &Weighing<'_>, opinion: &mut Opinion) -> Result<()> {
+        // Recorded whatever happens. A real one emits a metric and an audit row keyed on
+        // the user id, which is why `Weighing` carries the attested facts rather than
+        // making this look the caller up again.
+        println!(
+            "decision: caller={} tenant={} plan={} asked={} verdict={} count={}",
+            about.caller,
+            about.tenancy.tenant,
+            about.tenancy.facts.get("plan").map(String::as_str).unwrap_or("?"),
+            about.asked,
+            opinion.verdict,
+            opinion.count,
+        );
+
+        // A freeze belongs to whoever runs the fleet, not to a tenant's own prose: during
+        // one, no policy should be able to argue its way to more machines. Lowering always
+        // works — raising would not, because every clamp still runs after this.
+        if std::env::var("FLEET_FROZEN").is_ok() && opinion.count > 1 {
+            opinion.count = 1;
+            opinion.rationale =
+                "the fleet is frozen for a deploy; one machine only until it lifts".into();
+        }
+        Ok(())
     }
 
     async fn roster(&self) -> Result<Vec<Listed>> {

@@ -310,9 +310,22 @@ impl Control {
         // would eventually disagree with this one, and be believed — a policy test that
         // passes against a slightly different decision than the fleet makes is worse than
         // no policy test at all.
-        let weighed = weigh(&self.adviser, &advice, limit)
-            .await
-            .with_context(|| format!("weighing {alias}'s plea"))?;
+        let weighed = weigh(
+            &self.adviser,
+            &advice,
+            limit,
+            Some(Review {
+                directory: self.directory.as_ref(),
+                about: directory::Weighing {
+                    caller: alias,
+                    tenancy: &who,
+                    asked: wanted,
+                    said: &nivedana.said,
+                },
+            }),
+        )
+        .await
+        .with_context(|| format!("weighing {alias}'s plea"))?;
 
         for line in weighed.log(alias) {
             println!("{line}");
@@ -736,15 +749,33 @@ impl Weighed {
     }
 }
 
+/// Who gets to look at the answer before it is enforced.
+///
+/// `Option` in [`weigh`] rather than a required argument, because `cm policy-test` runs
+/// against a folder with no deployment behind it — and a test that silently invented one
+/// would be checking something other than the policy.
+pub struct Review<'a> {
+    pub directory: &'a dyn Directory,
+    pub about: directory::Weighing<'a>,
+}
+
 pub async fn weigh(
     adviser: &adviser::Claude,
     advice: &adviser::Advice,
     limit: Limit,
+    review: Option<Review<'_>>,
 ) -> Result<Weighed> {
     // No fallback, on purpose, and no verdict either — this leaves as an error. There is
     // no number to substitute that any organisation asked for, and inventing one would
     // keep the fleet running while nobody's policy is applied.
-    let opinion = adviser.weigh(advice).await?;
+    let mut opinion = adviser.weigh(advice).await?;
+
+    // The deployment's own look at it, before anything is enforced. An error here fails
+    // the request: a decision somebody could not record is one they should not act on,
+    // and deciding that for them is not cm's business.
+    if let Some(review) = &review {
+        review.directory.reviewed(&review.about, &mut opinion).await?;
+    }
 
     if opinion.denies() {
         return Ok(Weighed {

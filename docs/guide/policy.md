@@ -42,7 +42,7 @@ These are the only things cyberium reads for itself, and only because it **enfor
 | `daily_budget` / `budget_window` | credits per rolling window. See [Budgets](budgets.html). |
 
 {: .warning }
-**One block only.** A second ` ```yaml ` block is refused, because only the first would be
+**One block only.** A second `` ```yaml `` block is refused, because only the first would be
 read — and somebody appending a rule to a second block would see no error and believe it was
 in force.
 
@@ -136,6 +136,35 @@ of 6) — cut to 6. Fix the policy; the prompt stated every one of them.
 
 That is a defect report, not a normal outcome. A clamp firing routinely means your rules and
 your `max_limit` disagree.
+
+## What comes back
+
+One JSON object, and nothing else is accepted:
+
+```json
+{
+  "verdict": "allow",
+  "count": 4,
+  "rationale": "a pre-merge check with somebody waiting, and the budget has room"
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `verdict` | `"allow"` \| `"counter"` \| `"deny"` | whether your rules support the request |
+| `count` | number | how many machines. Ignored on a `deny` |
+| `rationale` | string | one sentence, shown to the caller |
+
+The object is pulled out of whatever it arrives wrapped in — models put JSON inside prose and
+inside code fences, and treating a formatting habit as a refusal would be a poor trade. An
+unknown verdict is an error rather than a guess. `count` and `rationale` may be omitted; a
+`deny` with no number is sensible.
+
+Worth knowing: **`allow` and `counter` are the same thing in effect.** Only `deny` branches,
+and the count decides everything else. The verdict a caller sees is derived afterwards —
+fewer than asked is a counter however the model worded it. The
+[design note](../design/policy.html#the-answer-is-a-contract-not-a-conversation) has the
+reasoning.
 
 ## The things that hold whatever the model says
 

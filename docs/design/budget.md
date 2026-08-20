@@ -1,7 +1,7 @@
 ---
 title: Budgets
 parent: Design notes
-nav_order: 2
+nav_order: 3
 ---
 
 # Budgets, and the unit they are counted in
