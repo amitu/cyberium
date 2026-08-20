@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::proto::Nivedana;
 
 pub const FILE: &str = "policy.md";
 
@@ -56,32 +55,6 @@ allow up to 5x the standing limit for one hour, then re-evaluate.
 
 For everything else, apply the standing budget.
 "#;
-
-/// What policy permits. Not a verdict: a verdict also depends on what is free.
-#[derive(Debug, Clone)]
-pub enum Ruling {
-    Deny {
-        rationale: String,
-    },
-    /// The plea reached the prose, which is where the number comes from.
-    ///
-    /// Returned rather than resolved here so `policy.rs` stays synchronous and pure.
-    /// The model call needs a runtime, a network, a key and a timeout, and all four
-    /// already live at the controller — putting them here would make every test of
-    /// the cheap gate drag them along.
-    Consider {
-        /// What the caller asked for. An upper bound on the answer: nobody is given
-        /// machines they did not ask for.
-        wanted: u32,
-        /// What this organisation calls an ordinary request. Calibration for the
-        /// model, and nothing else: not a floor, not a fast path, and not a fallback —
-        /// a plea that cannot be weighed fails rather than quietly landing here.
-        standing: u32,
-        /// The most any interpretation may grant. **Never** exceeded, whatever the
-        /// model says.
-        ceiling: u32,
-    },
-}
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -146,40 +119,6 @@ impl Policy {
         Ok(Self { path, text, grants })
     }
 
-    /// How many machines policy permits, if any.
-    ///
-    /// Policy decides *entitlement*; it never picks machines. What is actually
-    /// free, and which of them can do the work, is the fleet's business — keeping
-    /// those apart is what lets policy stay a text file.
-    pub fn weigh(&self, asker: &str, nivedana: &Nivedana) -> Ruling {
-        if !self.may_ask(asker) {
-            // The one thing that needs no interpretation: whether this caller may
-            // ask at all. Refused without spending a token.
-            return Ruling::Deny {
-                rationale: format!("{asker} is not in the requesters list"),
-            };
-        }
-
-        // Everything else is the prose's to decide. How many machines a plea deserves
-        // is exactly the question the policy was written to answer, so a number
-        // arrived at without reading it would not be this organisation's answer — it
-        // would be a default wearing its name.
-        //
-        // A `max_limit` below the standing limit is a contradiction in the file, not
-        // a tighter rule: the standing limit is the firmer promise, so it wins.
-        let standing = self.grants.standing_limit;
-        Ruling::Consider {
-            wanted: nivedana.count.unwrap_or(1),
-            standing,
-            // Absent `max_limit`, interpretation can lower a number but never raise
-            // one. That is the default on purpose: a model should only be able to
-            // exceed the standing limit where somebody wrote down how far.
-            ceiling: self.grants.max_limit.unwrap_or(standing).max(standing),
-        }
-    }
-
-
-    /// How long a grant survives unreleased.
     /// The two figures the fenced block puts on any answer: what this org calls ordinary,
     /// and the most interpretation may grant.
     ///
@@ -201,7 +140,7 @@ impl Policy {
         })
     }
 
-    fn may_ask(&self, asker: &str) -> bool {
+    pub fn may_ask(&self, asker: &str) -> bool {
         self.grants
             .requesters
             .iter()
@@ -310,18 +249,12 @@ mod tests {
         }
     }
 
-    fn plea(count: Option<u32>) -> Nivedana {
-        Nivedana {
-            count,
-            ..Default::default()
-        }
-    }
 
     #[test]
     fn the_starter_policy_parses() {
         let p = policy(STARTER);
         assert!(p.may_ask("anyone-at-all"));
-        assert!(matches!(p.weigh("dana", &plea(Some(3))), Ruling::Consider { .. }));
+        assert_eq!(p.bounds(), (10, 10));
     }
 
     #[test]
@@ -329,29 +262,12 @@ mod tests {
         let p = policy("```yaml\nrequesters:\n  - dana\n  - kiran\nstanding_limit: 4\n```");
         assert!(p.may_ask("dana"));
         assert!(!p.may_ask("lee"));
-
-        let denied = p.weigh("lee", &plea(Some(1)));
-        assert!(matches!(denied, Ruling::Deny { .. }), "{denied:?}");
-    }
-
-    #[test]
-    fn asking_for_a_lot_is_a_question_for_the_prose_not_a_refusal() {
-        // The deterministic half does not counter, because it does not have a number
-        // to counter with — 4 is what this org calls ordinary, not what it decided.
-        let p = policy("```yaml\nrequesters:\n  - everyone\nstanding_limit: 4\n```");
-        match p.weigh("dana", &plea(Some(50))) {
-            Ruling::Consider { wanted, standing, ceiling } => {
-                assert_eq!((wanted, standing, ceiling), (50, 4, 4));
-            }
-            other => panic!("expected Consider, got {other:?}"),
-        }
     }
 
     #[test]
     fn a_missing_grants_block_still_works() {
         let p = policy("# policy.md\n\nJust prose, no fenced block.\n");
         assert!(p.may_ask("dana"));
-        assert!(matches!(p.weigh("dana", &plea(Some(1))), Ruling::Consider { .. }));
     }
 
     #[test]
@@ -364,42 +280,17 @@ mod tests {
 
     #[test]
     fn prose_cannot_expand_entitlement_unless_the_org_said_so() {
-        // The prose is still read and still decides — it simply cannot go above the
-        // standing limit. Interpretation may lower a number; raising one takes an
-        // explicit `max_limit`, and opting in is the organisation's act.
-        let p = policy("```yaml\nstanding_limit: 4\n```");
-        match p.weigh("dana", &plea(Some(50))) {
-            Ruling::Consider { standing, ceiling, .. } => assert_eq!((standing, ceiling), (4, 4)),
-            other => panic!("expected Consider, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_prose_decides_every_plea_not_only_the_large_ones() {
-        // The whole proposition is that a policy written in English is what allocates
-        // machines. A cheap path that answered small pleas without reading it would
-        // make the policy an exception handler.
-        let p = policy("```yaml\nstanding_limit: 4\nmax_limit: 20\n```");
-        for asked in [1, 3, 4, 12, 50] {
-            match p.weigh("dana", &plea(Some(asked))) {
-                Ruling::Consider { wanted, standing, ceiling } => {
-                    assert_eq!((wanted, standing, ceiling), (asked, 4, 20));
-                }
-                other => panic!("expected Consider for {asked}, got {other:?}"),
-            }
-        }
+        // Interpretation may still refuse or trim; raising a number takes an explicit
+        // `max_limit`, and opting in is the organisation's act.
+        assert_eq!(policy("```yaml\nstanding_limit: 4\n```").bounds(), (4, 4));
+        assert_eq!(policy("```yaml\nstanding_limit: 4\nmax_limit: 20\n```").bounds(), (4, 20));
     }
 
     #[test]
     fn a_max_below_the_standing_limit_is_ignored_not_obeyed() {
         // It would otherwise put the ceiling *below* what this org calls an ordinary
-        // request, which is not what a maximum means — and would leave a model told
-        // that normal is 10 and it may grant at most 5.
-        let p = policy("```yaml\nstanding_limit: 10\nmax_limit: 5\n```");
-        match p.weigh("dana", &plea(Some(50))) {
-            Ruling::Consider { standing, ceiling, .. } => assert_eq!((standing, ceiling), (10, 10)),
-            other => panic!("expected Consider, got {other:?}"),
-        }
+        // request, leaving a model told that normal is 10 and it may grant at most 5.
+        assert_eq!(policy("```yaml\nstanding_limit: 10\nmax_limit: 5\n```").bounds(), (10, 10));
     }
 
     #[test]
@@ -418,14 +309,5 @@ mod tests {
     fn a_bad_limit_is_an_error_not_a_default() {
         // Silently falling back would give the org a limit it never wrote.
         assert!(parse_grants("```yaml\nstanding_limit: lots\n```").is_err());
-    }
-
-    #[test]
-    fn no_count_asks_for_one() {
-        let p = policy(STARTER);
-        match p.weigh("dana", &plea(None)) {
-            Ruling::Consider { wanted, .. } => assert_eq!(wanted, 1),
-            other => panic!("expected Consider, got {other:?}"),
-        }
     }
 }

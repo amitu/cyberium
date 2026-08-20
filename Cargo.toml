@@ -1,5 +1,5 @@
 [workspace]
-members = ["cm"]
+members = ["cm", "examples/hosted"]
 resolver = "3"
 
 [workspace.package]
@@ -17,6 +17,10 @@ rust-version = "1.97.1"   # what we build and test with; see rust-toolchain.toml
 sirji = { git = "https://github.com/amitu/sirji" }
 
 anyhow = "1"
+# Already in the tree beneath iroh. Named directly because the directory seam is a
+# public trait that other people implement, and hand-rolled boxed futures are a poor
+# thing to ask of somebody writing their first custom controller.
+async-trait = "0.1"
 # Already in the tree beneath sirji, which uses it for id52. Naming it directly
 # rather than reaching through sirji's re-exports: artifacts travelling as base64 is
 # cm's own concern, not something the substrate should have an opinion about.

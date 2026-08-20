@@ -1,5 +1,7 @@
 [package]
-name = "cm"
+# The crate is `cyberium`, the binary it ships is `cm`. That way `cargo add cyberium` is
+# the thing somebody writing their own controller reaches for, and `cm` stays the command.
+name = "cyberium"
 description = "cost-aware allocation of test machines, over sirji"
 version.workspace = true
 edition.workspace = true
@@ -10,7 +12,6 @@ rust-version.workspace = true
 # A library as well as a binary: the reference controller is one deployment's answer,
 # and a company with its own identity service builds another around the same pieces.
 [lib]
-name = "cyberium"
 path = "src/lib.rs"
 
 [[bin]]
@@ -20,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 sirji.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 data-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true

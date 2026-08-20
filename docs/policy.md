@@ -648,4 +648,5 @@ says "this group may not have gpu machines" is a rule cm enforces by weighing, n
 branching.
 
 `[facts]` is the self-hosted source. A deployment with a real directory behind it fills the
-same map from there — the shape does not change, only where it comes from.
+same map from there — the shape does not change, only where it comes from. That seam is
+`cyberium::directory::Directory`; see the README and `examples/hosted/`.

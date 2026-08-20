@@ -10,9 +10,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::fleet::{Fleet, Shortfall, Worker};
-use crate::policy::Ruling;
 use crate::proto::{Aadesh, Answer, Knock, Nivedana, Plea, Register, Verdict, WorkerHandle};
-use crate::{admin, adviser, budget, fleet, proto, tenant, upload};
+use crate::directory::{self, Directory};
+use crate::{admin, adviser, budget, fleet, proto, tenant};
 use crate::{Config, home, keys, listening, load_config, quiet, read_line, write_line};
 use sirji::id52;
 
@@ -30,7 +30,11 @@ pub struct Control {
     /// One policy per tenant, keyed by the alias our own sirji minted into their
     /// ticket. Behind a lock because it re-reads from disk, so a policy edit or a
     /// new tenant takes effect without a restart.
-    tenants: Mutex<tenant::Tenants>,
+    /// What this controller knows about the people asking. A trait, because `cm`'s
+    /// answer — folders and files — is the right one for an organisation with no identity
+    /// service and the wrong one for a company that has groups, sub-groups and feature
+    /// flags in a system of its own.
+    pub directory: Box<dyn directory::Directory>,
     /// Who may look at and change how this controller runs. Read at startup and not
     /// re-read: adding an admin is rare, deliberate, and worth a restart, and a list
     /// that reloads itself is a list a stray file write can extend.
@@ -44,30 +48,43 @@ pub struct Control {
     signing: sirji::SecretKey,
 }
 
+/// The reference controller: tenants in folders under the configured root.
+///
+/// Every tenant is read here, not lazily: configuration that does not parse should stop a
+/// controller starting rather than surface an hour later on somebody's first plea, with
+/// them waiting on the other end.
 pub async fn controller() -> Result<()> {
+    let config = load_config(&home()?)?;
+    run(Box::new(directory::Folders::load(&config.root)?)).await
+}
+
+/// Run a controller with your own directory behind it.
+///
+/// The entry point for a deployment whose callers live somewhere other than a folder: a
+/// company with groups, sub-groups, user ids and feature flags implements
+/// [`directory::Directory`] against its own systems and calls this. Everything else — the
+/// protocol, the fleet, the model call, the decision — is shared, and `cm test` and
+/// `cm worker` do not know the difference.
+pub async fn run(directory: Box<dyn Directory>) -> Result<()> {
     let home = home()?;
     sirji::Settings::load(&home)?.activate();
     let config = load_config(&home)?;
 
-    // Every tenant is read and validated here, not lazily: a policy that does not
-    // parse should stop the controller starting, rather than surface an hour later
-    // on somebody's first plea with them waiting on the other end.
-    let tenants = tenant::Tenants::load(&config.root)?;
     println!("controller `{}` listening as {}", config.name, config.key);
-    if tenants.is_empty() {
+    println!("callers known from: {}", directory.describe());
+    match directory.roster().await {
         // Not an error — a controller with no tenants is correctly configured for
-        // nobody. Said loudly because every plea will be refused until this is
-        // fixed, and the refusal alone would not explain why.
-        println!(
-            "no tenants in {} — every plea will be refused.\n  add one with `cm tenant add <alias>`",
-            tenant::Tenants::dir_in(&config.root).display()
-        );
-    } else {
-        println!(
-            "{} tenant(s): {}",
-            tenants.len(),
-            tenants.names().cloned().collect::<Vec<_>>().join(", ")
-        );
+        // nobody. Said loudly because every plea will be refused until it is fixed, and
+        // the refusal alone would not explain why.
+        Ok(listed) if listed.is_empty() => {
+            println!("no tenants — every plea will be refused.");
+            println!("  add one with `cm tenant add <alias>`");
+        }
+        Ok(listed) => {
+            let names: Vec<&str> = listed.iter().map(|t| t.tenant.as_str()).collect();
+            println!("{} tenant(s): {}", names.len(), names.join(", "));
+        }
+        Err(e) => println!("cannot list tenants yet: {e:#}"),
     }
 
     let admins = admin::Admins::load(&config.root)?;
@@ -96,7 +113,7 @@ pub async fn controller() -> Result<()> {
     let control = Arc::new(Control {
         fleet: Mutex::new(Fleet::default()),
         config: config.clone(),
-        tenants: Mutex::new(tenants),
+        directory,
         admins,
         adviser,
         orders: Mutex::new(Default::default()),
@@ -185,44 +202,25 @@ impl Control {
         // every lock released before the model call. A 30s network round trip under
         // the tenants or fleet mutex would serialise every plea in the fleet behind
         // one caller's request.
-        let (
-            tenant_name,
-            facts,
-            rulebook,
-            lifetime,
-            host_ceiling,
-            terms,
-            standing,
-            ceiling,
-            wanted,
-        ) = {
-            let mut tenants = self.tenants.lock().await;
-            let Some(tenant) = tenants.for_caller(alias) else {
-                // Named, but not onboarded. Distinguished from a policy refusal
-                // because the fix is completely different — somebody has to run
-                // `cm tenant add`.
-                return refused(format!("{alias} is not a tenant of this controller"));
-            };
-
-            // Authorisation is deterministic; the number is not. How many machines a
-            // plea deserves is the question the policy was written to answer, so it is
-            // read for every request rather than only the large ones.
-            let (wanted, standing, ceiling) = match tenant.policy.weigh(alias, nivedana) {
-                Ruling::Deny { rationale } => return refused(rationale),
-                Ruling::Consider { wanted, standing, ceiling } => (wanted, standing, ceiling),
-            };
-            (
-                tenant.alias.clone(),
-                tenant.facts(),
-                tenant.rulebook.as_str().to_string(),
-                tenant.policy.reservation_secs(),
-                tenant.ceiling(),
-                tenant.budget(),
-                standing,
-                ceiling,
-                wanted,
-            )
+        let who = self
+            .directory
+            .look_up(alias)
+            .await
+            .with_context(|| format!("looking up {alias}"))?;
+        let Some(who) = who else {
+            // Named, but not onboarded. Distinguished from a refusal because the fix is
+            // completely different — somebody has to run `cm tenant add`.
+            return refused(format!("{alias} is not a tenant of this controller"));
         };
+        if !who.may_ask {
+            return refused(format!("{alias} may not ask this controller for machines"));
+        }
+
+        let tenant_name = who.tenant.clone();
+        let lifetime = who.lifetime;
+        let ceiling = who.ceiling;
+        let wanted = nivedana.count.unwrap_or(1);
+        let rulebook = who.rulebook.clone();
 
         // An empty instructions block is the one input that makes a model invent a rule
         // rather than apply one, so it is refused rather than sent. Reachable only if
@@ -234,18 +232,21 @@ impl Control {
             ));
         }
 
-        let dir = tenant::Tenants::dir_in(&self.config.root).join(&tenant_name);
-        let now = fleet::now();
+        let spent = match who.budget {
+            Some(b) => Some((b, self.directory.spent(&tenant_name, b.window).await?)),
+            None => None,
+        };
         let (brief, money) = {
             let fleet = self.fleet.lock().await;
-            let brief = fleet.brief(&nivedana.capabilities);
-            let money = terms.map(|(budget, window_secs)| adviser::Money {
-                budget,
-                spent: budget::spent(&dir, now, window_secs),
-                committed: fleet.committed(&tenant_name),
-                window_secs,
-            });
-            (brief, money)
+            (
+                fleet.brief(&nivedana.capabilities),
+                spent.map(|(b, spent)| adviser::Money {
+                    budget: b.credits,
+                    spent,
+                    committed: fleet.committed(&tenant_name),
+                    window_secs: b.window,
+                }),
+            )
         };
 
         // Two answers that no policy can change, so no model is asked for them. Both
@@ -273,19 +274,15 @@ impl Control {
             attested: adviser::Attested {
                 tenant: tenant_name.clone(),
                 caller: alias.to_string(),
-                facts,
+                facts: who.facts.clone(),
             },
             declared: adviser::Declared {
                 said: nivedana.said.clone(),
                 count: wanted,
                 capabilities: nivedana.capabilities.clone(),
             },
-            standing,
-            // The tightest ceiling that applies, not just the tenant's own. Springing
-            // the host's cap after the fact would make a model argue for a number it
-            // was never allowed to give, and the caller read a rationale for a
-            // decision that did not happen.
-            ceiling: ceiling.min(host_ceiling),
+            standing: who.standing,
+            ceiling,
             lifetime,
             fleet: brief.clone(),
             money: money.clone(),
@@ -297,9 +294,11 @@ impl Control {
         // A `?` is the whole safeguard: nothing downstream can mistake a fault for a
         // decision, because it never becomes one.
         let limit = Limit {
-            ceiling: ceiling.min(host_ceiling),
+            ceiling,
             free: brief.free,
-            host: host_ceiling,
+            // Every cap that applies is already folded into `ceiling` by the directory,
+            // which is the only place that knows them all.
+            host: ceiling,
             affordable: money.as_ref().map(|m| {
                 budget::Room { budget: m.budget, spent: m.spent, committed: m.committed }
                     .affordable(&brief.rates, lifetime)
@@ -347,75 +346,45 @@ impl Control {
         }
     }
 
-    /// What this tenant's budget still allows.
-    ///
-    /// The lower of two windows, like the two ceilings: the host's in `tenant.toml`
-    /// and the tenant's own in `policy.md`. Both rolling seconds, so neither needs a
-    /// calendar or a timezone.
-    async fn room(&self, tenant: &tenant::Tenant) -> Option<budget::Room> {
-        let (budget_credits, window) = tenant.budget()?;
-        let dir = tenant::Tenants::dir_in(&self.config.root).join(&tenant.alias);
-        let now = fleet::now();
-        Some(budget::Room {
-            budget: budget_credits,
-            spent: budget::spent(&dir, now, window),
-            committed: self.fleet.lock().await.committed(&tenant.alias),
-        })
-    }
 
-    /// Which tenant this caller bills to.
     /// Take a policy folder from one of a tenant's admins.
     ///
     /// A verdict rather than an error: every outcome here is a decision about the
     /// caller's authority or their files, and nothing about it is undecidable.
     async fn accept_policy(&self, alias: &str, up: &proto::Upload) -> Verdict {
-        let mut tenants = self.tenants.lock().await;
-        let Some(tenant) = tenants.for_caller(alias) else {
-            return Verdict::Deny {
-                rationale: format!("{alias} is not a tenant of this controller"),
-            };
+        let who = match self.directory.look_up(alias).await {
+            Ok(Some(who)) => who,
+            Ok(None) => {
+                return Verdict::Deny {
+                    rationale: format!("{alias} is not a tenant of this controller"),
+                };
+            }
+            Err(e) => {
+                eprintln!("could not look {alias} up: {e:#}");
+                return Verdict::Deny { rationale: format!("could not look you up: {e}") };
+            }
         };
-        let name = tenant.alias.clone();
-        if !tenant.may_write(alias) {
+        if !who.may_write {
             // Named, not authorised. Said as two different things because the fix is
             // different: one needs onboarding, the other needs somebody with the right.
-            let who = tenant.admins();
             return Verdict::Deny {
-                rationale: if who.is_empty() {
-                    format!(
-                        "tenant `{name}` has no admins, so nobody may change its policy — \
-                         the host sets them in {}",
-                        tenant::FILE
-                    )
-                } else {
-                    format!(
-                        "{alias} may run tests for `{name}` but not change its policy. \
-                         Ask one of: {}",
-                        who.join(", ")
-                    )
-                },
+                rationale: format!(
+                    "{alias} may run tests for `{}` but not change its rules — whoever \
+                     runs this controller decides that, not the rules themselves",
+                    who.tenant
+                ),
             };
         }
-        drop(tenants);
 
-        let dir = tenant::Tenants::dir_in(&self.config.root).join(&name);
-        match upload::accept(&dir, up) {
+        match self.directory.write_rules(&who.tenant, up).await {
             Err(e) => {
-                eprintln!("refused a policy for {name} from {alias}: {e:#}");
+                eprintln!("refused a policy for {} from {alias}: {e:#}", who.tenant);
                 Verdict::Deny { rationale: format!("{e:#}") }
             }
             Ok(written) => {
-                // Re-read at once. A controller still weighing pleas against the folder
-                // it replaced would be applying a policy that no longer exists.
-                let mut tenants = self.tenants.lock().await;
-                if let Err(e) = tenants.rescan() {
-                    eprintln!("wrote {name}'s policy but could not reload it: {e:#}");
-                    return Verdict::Deny {
-                        rationale: format!("written, but this controller could not load it: {e}"),
-                    };
-                }
                 println!(
-                    "{alias} replaced {name}'s policy: {} file(s) — {}",
+                    "{alias} replaced {}'s policy: {} file(s) — {}",
+                    who.tenant,
                     written.len(),
                     written.join(", ")
                 );
@@ -424,23 +393,20 @@ impl Control {
         }
     }
 
+    /// Which tenant this caller bills to. Not the caller: several share a tenant.
     async fn tenant_of(&self, alias: &str) -> String {
-        self.tenants
-            .lock()
-            .await
-            .for_caller(alias)
-            .map(|t| t.alias.clone())
-            .unwrap_or_else(|| alias.to_string())
+        match self.directory.look_up(alias).await {
+            Ok(Some(who)) => who.tenant,
+            _ => alias.to_string(),
+        }
     }
 
     /// How long this tenant's grants last unreleased.
     async fn lifetime_for(&self, alias: &str) -> u64 {
-        self.tenants
-            .lock()
-            .await
-            .for_caller(alias)
-            .map(|t| t.policy.reservation_secs())
-            .unwrap_or(fleet::RESERVATION_SECS)
+        match self.directory.look_up(alias).await {
+            Ok(Some(who)) => who.lifetime,
+            _ => fleet::RESERVATION_SECS,
+        }
     }
 
     /// What an operator asked to see.
@@ -474,43 +440,40 @@ impl Control {
                 // learning its neighbours' spend would be the ping's fleet summary
                 // all over again.
                 drop(fleet);
-                let names: Vec<String> = {
-                    let tenants = self.tenants.lock().await;
-                    tenants.names().cloned().collect()
+                let listed = match self.directory.roster().await {
+                    Ok(listed) => listed,
+                    Err(e) => {
+                        lines.push(format!("cannot read tenants: {e:#}"));
+                        return proto::Sight { lines };
+                    }
                 };
-                if names.is_empty() {
+                if listed.is_empty() {
                     lines.push("no tenants".into());
                 }
-                // First, because it changes how to read everything under it: a tenant
-                // listed here is running on terms that are not the ones in its file.
-                for (name, why) in {
-                    let tenants = self.tenants.lock().await;
-                    tenants
-                        .unread()
-                        .into_iter()
-                        .map(|(n, w)| (n.to_string(), w.to_string()))
-                        .collect::<Vec<_>>()
-                } {
+                // Trouble first, because it changes how to read everything under it: a
+                // tenant listed here is running on terms that are not the ones on disk.
+                for t in listed.iter().filter(|t| t.unread.is_some()) {
                     lines.push(format!(
-                        "  !! {name}: files not read, still running on the last good copy \
-                         — {why}"
+                        "  !! {}: configuration not read, still running on the last good \
+                         copy — {}",
+                        t.tenant,
+                        t.unread.as_deref().unwrap_or("")
                     ));
                 }
-                for name in names {
-                    let t = {
-                        let tenants = self.tenants.lock().await;
-                        tenants.by_name(&name).cloned()
+                for t in &listed {
+                    let Some(b) = t.budget else {
+                        // No budget is a real state, and "0 of 0" would read as a tenant
+                        // that may spend nothing.
+                        lines.push(format!("  {:<16} no budget set", t.tenant));
+                        continue;
                     };
-                    let Some(t) = t else { continue };
-                    match self.room(&t).await {
-                        Some(room) => lines.push(format!(
-                            "  {:<16} {} of {} credit(s) used, {} committed, {} left",
-                            t.alias, room.spent, room.budget, room.committed, room.left()
-                        )),
-                        // No budget is a real state, and saying "0 of 0" would read
-                        // as a tenant that may spend nothing.
-                        None => lines.push(format!("  {:<16} no budget set", t.alias)),
-                    }
+                    let spent = self.directory.spent(&t.tenant, b.window).await.unwrap_or(0);
+                    let committed = self.fleet.lock().await.committed(&t.tenant);
+                    let room = budget::Room { budget: b.credits, spent, committed };
+                    lines.push(format!(
+                        "  {:<16} {} of {} credit(s) used, {} committed, {} left",
+                        t.tenant, room.spent, room.budget, room.committed, room.left()
+                    ));
                 }
                 return proto::Sight { lines };
             }

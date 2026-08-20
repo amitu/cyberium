@@ -552,6 +552,53 @@ before anything is written, and the folder is staged and parsed before it replac
 in force — a policy accepted and then found unreadable would take the tenant down at its
 next request, a long way from where the mistake was made.
 
+## Building your own controller
+
+`cm` keeps callers in folders: a directory per tenant, terms in `tenant.toml`, spend in a
+ledger. That is the whole answer for an organisation with no identity service, and the
+wrong answer in every particular for one that has groups, sub-groups, user ids and a
+feature-flag system already — none of which belongs in an open-source allocator.
+
+So the crate is a library as well as a binary, and what a controller *knows* is a trait:
+
+```rust
+#[async_trait]
+pub trait Directory: Send + Sync {
+    async fn look_up(&self, caller: &str) -> Result<Option<Tenancy>>;
+    async fn spent(&self, tenant: &str, window: u64) -> Result<u64>;
+    async fn charge(&self, tenant: &str, entry: &budget::Entry) -> Result<()>;
+    async fn write_rules(&self, tenant: &str, up: &proto::Upload) -> Result<Vec<String>>;
+    async fn roster(&self) -> Result<Vec<Listed>>;
+    fn describe(&self) -> String;
+}
+```
+
+```rust
+cyberium::controller::run(Box::new(MyDirectory)).await
+```
+
+Everything else is shared — the protocol, the fleet, the model call, the clamps — and
+**`cm test` and `cm worker` need no customisation at all.** What varies between deployments
+is what a controller knows, never how machines are asked for or handed over.
+
+Three things the trait deliberately does *not* have:
+
+- **No `is_enabled(feature)`.** A group hierarchy and a feature-flag system arrive as
+  `Tenancy::facts`, get attested in the prompt, and are read by the policy. `group`,
+  `sub_group`, `plan`, `flags` are pairs cm carries and never interprets, so a rule like
+  "a trial plan gets two machines, whoever asks" is a sentence rather than a branch. A gate
+  here would be cm growing an opinion about a vocabulary that is not its own.
+- **No parsed policy.** A `Tenancy` carries the rules as *text*, because the decision is a
+  model reading everything a team wrote. Keep them in a database and the decision cannot
+  tell.
+- **No `may_write` from the policy.** If a policy named its own admins, anybody who could
+  edit it could add themselves.
+
+[`examples/hosted/`](examples/hosted) is a working one: a made-up identity service with
+plans and flags, in a single file. `scripts/hosted.sh` runs it against real workers and a
+real `cm t` — two callers in the same organisation get different ceilings because their
+plans differ, and neither number comes from any file on the controller.
+
 ## Budgets
 
 A ceiling of three machines says nothing about whether they ran for a minute or a
@@ -640,8 +687,9 @@ Early, and running end to end: enrolment, resolution, ticket, capability-matched
 allocation, machines fetching the code themselves into isolated checkouts, real
 commands with their output streamed back live, artifacts returned as bytes, release,
 reclaim after a caller walks away, per-tenant policy, credit budgets, the model call —
-the tenant's whole folder weighed in one pass — `cm policy-test`, and `cm upload-policy`
-with two roles inside a tenant. Verified against a real 1,900-test
+the tenant's whole folder weighed in one pass — `cm policy-test`, `cm upload-policy` with
+two roles inside a tenant, and a library seam for controllers whose callers live somewhere
+other than a folder. Verified against a real 1,900-test
 Playwright suite, sharded across a fleet and merged into one report.
 
 Next: the credential story — OIDC on CI, `cm auth login` for a laptop, and the two scoped

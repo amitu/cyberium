@@ -315,20 +315,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "data-encoding",
- "reqwest",
- "serde",
- "serde_json",
- "sirji",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -532,6 +518,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "cyberium"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "data-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sirji",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -1075,6 +1076,16 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+]
+
+[[package]]
+name = "hosted-controller"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cyberium",
+ "tokio",
 ]
 
 [[package]]
