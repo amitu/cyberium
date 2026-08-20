@@ -46,6 +46,22 @@ pub struct Terms {
     /// else's callers, and with them somebody else's budget.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
+    /// Which of those members may **change the policy**.
+    ///
+    /// Host-owned, and it has to be: if a tenant could name its own admins, anybody
+    /// who could edit the policy could add themselves to it, and the question "who may
+    /// change this" would answer itself. Authority over a rule cannot come from the
+    /// rule. Security is deterministic; policy is semantic.
+    ///
+    /// So this is the one thing about a tenant that is *not* up for interpretation —
+    /// which is why it sits in `tenant.toml` with the ceiling and the credits, and not
+    /// in the folder the tenant writes.
+    ///
+    /// An admin is also a member: somebody trusted to write the rules is trusted to
+    /// run a test under them, and requiring both lists would mostly produce a bug
+    /// where one was forgotten.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admins: Vec<String>,
     /// Credits this tenant may spend per `window`. `None` means the host has set no
     /// budget, which is different from zero — see `Tenant::budget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,7 +80,16 @@ impl Default for Terms {
     fn default() -> Self {
         // Deliberately modest. A ceiling that has to be raised on purpose is better
         // than one nobody noticed was effectively infinite.
-        Self { ceiling: 10, members: Vec::new(), credits: None, window: None, note: None }
+        Self {
+            ceiling: 10,
+            members: Vec::new(),
+            // Nobody, not everyone. A tenant whose admins were unset would otherwise
+            // hand its own rules to whoever runs tests.
+            admins: Vec::new(),
+            credits: None,
+            window: None,
+            note: None,
+        }
     }
 }
 
@@ -100,11 +125,33 @@ impl Tenant {
 
     /// The caller aliases that count as this tenant.
     pub fn members(&self) -> Vec<&str> {
-        if self.terms.members.is_empty() {
+        let mut all: Vec<&str> = if self.terms.members.is_empty() {
             vec![self.alias.as_str()]
         } else {
             self.terms.members.iter().map(String::as_str).collect()
+        };
+        // An admin is a member. Listing somebody twice to give them both is a rule whose
+        // only real effect is the day it is forgotten.
+        for admin in &self.terms.admins {
+            if !all.contains(&admin.as_str()) {
+                all.push(admin);
+            }
         }
+        all
+    }
+
+    /// May this caller change what this tenant has written down?
+    ///
+    /// Nobody, unless the host said so. An empty list is not "everyone" — that mistake
+    /// would hand the policy to whoever runs tests, which is the whole thing this
+    /// answers. It is the same default as `admins.toml`: absent means nobody.
+    pub fn may_write(&self, alias: &str) -> bool {
+        self.terms.admins.iter().any(|a| a == alias)
+    }
+
+    /// For a refusal that tells somebody who to ask.
+    pub fn admins(&self) -> Vec<&str> {
+        self.terms.admins.iter().map(String::as_str).collect()
     }
 }
 
@@ -196,7 +243,12 @@ impl Tenants {
         // to a membership line edited since. Only a rescan can tell, and it is one
         // readdir on a path taken by unknown callers alone.
         if !self.by_member.contains_key(caller) {
-            self.rescan();
+            // A plea from somebody we have not heard of: the hopeful case, where a
+            // tenant was added since startup. A failure here is not this caller's
+            // problem, so it is logged and they are told they are unknown.
+            if let Err(e) = self.rescan() {
+                eprintln!("cannot re-read tenants: {e:#}");
+            }
         }
 
         let name = self.by_member.get(caller)?.clone();
@@ -216,26 +268,28 @@ impl Tenants {
         self.loaded.get(name)
     }
 
-    fn rescan(&mut self) {
-        match Self::load(
+    /// Re-read every tenant from disk.
+    ///
+    /// Returns the error rather than only logging it, because one caller is a plea that
+    /// merely hoped for a new tenant and the other has just replaced a policy and needs
+    /// to know whether the thing it wrote can be read.
+    pub fn rescan(&mut self) -> Result<()> {
+        let fresh = Self::load(
             self.dir
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
-        ) {
-            Ok(fresh) => {
-                let appeared: Vec<&String> = fresh
-                    .loaded
-                    .keys()
-                    .filter(|k| !self.loaded.contains_key(*k))
-                    .collect();
-                if !appeared.is_empty() {
-                    println!("tenant(s) appeared: {appeared:?}");
-                }
-                self.loaded = fresh.loaded;
-                self.by_member = fresh.by_member;
-            }
-            Err(e) => eprintln!("cannot re-read tenants: {e:#}"),
+        )?;
+        let appeared: Vec<&String> = fresh
+            .loaded
+            .keys()
+            .filter(|k| !self.loaded.contains_key(*k))
+            .collect();
+        if !appeared.is_empty() {
+            println!("tenant(s) appeared: {appeared:?}");
         }
+        self.loaded = fresh.loaded;
+        self.by_member = fresh.by_member;
+        Ok(())
     }
 
     /// Create a tenant, with a starter policy they can edit.

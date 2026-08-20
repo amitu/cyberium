@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::proto::Nivedana;
 
@@ -214,6 +214,15 @@ impl Policy {
 /// Hand-parsed rather than pulling in a YAML crate: the block is two keys, and a
 /// dependency to read two keys is a dependency to keep current forever.
 fn parse_grants(text: &str) -> Result<Grants> {
+    // Two blocks and only the first applying is the worst available outcome: somebody
+    // appends a rule, sees no error, and believes it is in force. Which one was meant is
+    // not cm's to guess.
+    if text.matches("```yaml").count() > 1 {
+        bail!(
+            "more than one ```yaml block. Only the first would be applied, so the rest \
+             would be rules that look enforced and are not — put them in one block."
+        );
+    }
     let Some(block) = fenced_block(text, "yaml") else {
         return Ok(Grants::default());
     };
@@ -391,6 +400,18 @@ mod tests {
             Ruling::Consider { standing, ceiling, .. } => assert_eq!((standing, ceiling), (10, 10)),
             other => panic!("expected Consider, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_second_grants_block_is_an_error_not_a_silent_omission() {
+        // Found by a scenario that meant to break a policy and appended a second block
+        // instead: it was accepted, because only the first is read. Somebody appending a
+        // rule and seeing no error would believe it was in force.
+        let two = "```yaml\nstanding_limit: 2\n```\n\nprose\n\n```yaml\nmax_limit: 9\n```";
+        let e = parse_grants(two).unwrap_err().to_string();
+        assert!(e.contains("more than one"), "{e}");
+        // One is still fine, fenced examples in the prose included — those are not `yaml`.
+        assert!(parse_grants("```yaml\nstanding_limit: 2\n```\n\n```sh\ncm t\n```").is_ok());
     }
 
     #[test]

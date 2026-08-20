@@ -40,7 +40,7 @@ use anyhow::{Result, bail};
 /// A tenant's whole folder is re-read on every plea and sent every time, so it has to
 /// stay the sort of thing a person maintains. Well past any real policy, and far enough
 /// under a context window that the operational state and the plea have room.
-const MOST_BYTES: usize = 256 * 1024;
+pub const MOST_BYTES: usize = 256 * 1024;
 
 /// Files that are not the tenant's own writing.
 ///

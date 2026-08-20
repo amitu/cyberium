@@ -19,6 +19,14 @@ LAB=${LAB:-/tmp/cmlab}
 SIRJI=${SIRJI:-sirji}
 CM=${CM:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/cm}
 
+# Built here rather than trusted to have been built. Running a scenario against a stale
+# binary is the single most expensive mistake available in this repo: everything passes or
+# fails for reasons that are not in the source you are reading. Skipped if CM was set to
+# something else on purpose.
+if [ "$CM" = "$(cd "$(dirname "$0")/.." && pwd)/target/debug/cm" ]; then
+  cargo build --quiet --manifest-path "$(cd "$(dirname "$0")/.." && pwd)/Cargo.toml"
+fi
+
 rm -rf "$LAB"
 mkdir -p "$LAB"
 cd "$LAB"

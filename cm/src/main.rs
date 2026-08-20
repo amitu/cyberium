@@ -26,6 +26,7 @@ mod proto;
 mod tenant;
 #[cfg(test)]
 mod testing;
+mod upload;
 
 use std::sync::Arc;
 
@@ -144,6 +145,10 @@ fn main() -> Result<std::process::ExitCode> {
         // `policy-test`, not `test-policy`: it is a sister of `cm test`, and reading the
         // pair aloud is how anybody remembers which is which.
         ["policy-test", rest @ ..] => rt()?.block_on(policy_test(rest)),
+        ["upload-policy", target, rest @ ..] => rt()?.block_on(upload_policy(
+            target,
+            std::path::Path::new(rest.first().copied().unwrap_or(".")),
+        )),
         ["test", target, rest @ ..] if rest.contains(&"--ping") => rt()?.block_on(ping(target)),
         // The reason is optional: a caller naming one of the organisation's own pleas
         // has nothing of their own to say, and a tenant with a catalogue would refuse
@@ -677,6 +682,66 @@ impl Control {
     }
 
     /// Which tenant this caller bills to.
+    /// Take a policy folder from one of a tenant's admins.
+    ///
+    /// A verdict rather than an error: every outcome here is a decision about the
+    /// caller's authority or their files, and nothing about it is undecidable.
+    async fn accept_policy(&self, alias: &str, up: &proto::Upload) -> Verdict {
+        let mut tenants = self.tenants.lock().await;
+        let Some(tenant) = tenants.for_caller(alias) else {
+            return Verdict::Deny {
+                rationale: format!("{alias} is not a tenant of this controller"),
+            };
+        };
+        let name = tenant.alias.clone();
+        if !tenant.may_write(alias) {
+            // Named, not authorised. Said as two different things because the fix is
+            // different: one needs onboarding, the other needs somebody with the right.
+            let who = tenant.admins();
+            return Verdict::Deny {
+                rationale: if who.is_empty() {
+                    format!(
+                        "tenant `{name}` has no admins, so nobody may change its policy — \
+                         the host sets them in {}",
+                        tenant::FILE
+                    )
+                } else {
+                    format!(
+                        "{alias} may run tests for `{name}` but not change its policy. \
+                         Ask one of: {}",
+                        who.join(", ")
+                    )
+                },
+            };
+        }
+        drop(tenants);
+
+        let dir = tenant::Tenants::dir_in(&self.config.root).join(&name);
+        match upload::accept(&dir, up) {
+            Err(e) => {
+                eprintln!("refused a policy for {name} from {alias}: {e:#}");
+                Verdict::Deny { rationale: format!("{e:#}") }
+            }
+            Ok(written) => {
+                // Re-read at once. A controller still weighing pleas against the folder
+                // it replaced would be applying a policy that no longer exists.
+                let mut tenants = self.tenants.lock().await;
+                if let Err(e) = tenants.rescan() {
+                    eprintln!("wrote {name}'s policy but could not reload it: {e:#}");
+                    return Verdict::Deny {
+                        rationale: format!("written, but this controller could not load it: {e}"),
+                    };
+                }
+                println!(
+                    "{alias} replaced {name}'s policy: {} file(s) — {}",
+                    written.len(),
+                    written.join(", ")
+                );
+                Verdict::Ok
+            }
+        }
+    }
+
     async fn tenant_of(&self, alias: &str) -> String {
         self.tenants
             .lock()
@@ -843,6 +908,7 @@ async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<()> {
             },
             Plea::Nivedana(nivedana) => decide(&control, &alias, &caller, &nivedana).await,
             Plea::Rehearse(nivedana) => rehearse(&control, &alias, &nivedana).await,
+            Plea::Upload(up) => Ok(control.accept_policy(&alias, &up).await),
             Plea::Release { reservation } => {
                 let closed = control.fleet.lock().await.release(&reservation, &caller);
                 match closed {
@@ -2305,6 +2371,15 @@ fn tenant_add(alias: &str, args: &[&str]) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--ceiling wants a number"))?;
                 i += 2;
             }
+            "--admin" => {
+                match args.get(i + 1) {
+                    // Also a member, so `--admin dana` alone is a complete answer for a
+                    // one-person tenant rather than half of one.
+                    Some(who) => terms.admins.push((*who).to_string()),
+                    None => bail!("--admin wants a caller alias"),
+                }
+                i += 2;
+            }
             "--member" => {
                 match args.get(i + 1) {
                     Some(who) => terms.members.push((*who).to_string()),
@@ -2391,6 +2466,65 @@ fn tenant_list() -> Result<()> {
 ///
 /// So this needs no new credential and no local socket — and it works when the
 /// controller is on a machine the operator cannot log into.
+/// `cm upload-policy <controller> [folder]`
+///
+/// Deliberately dumb about what it sends: the folder, as it is. Deciding here what a
+/// policy may contain would put the rule in the one place that cannot enforce it — the
+/// machine belonging to whoever is uploading.
+async fn upload_policy(target: &str, dir: &std::path::Path) -> Result<std::process::ExitCode> {
+    let up = upload::gather(dir)?;
+    println!("sending {} file(s) from {}", up.files.len(), dir.display());
+    for file in &up.files {
+        println!("  {}", file.path);
+    }
+
+    let home = home()?;
+    sirji::Settings::load(&home)?.activate();
+    let config = load_config(&home)?;
+    let secret = keys(&home).secret(&id52::decode(&config.key)?)?;
+
+    let ask = match target.split_once('@') {
+        Some((name, alias)) => sirji::proto::Ask::ResolveFor {
+            name: name.to_string(),
+            alias: alias.to_string(),
+        },
+        None => sirji::proto::Ask::ResolveLocal { name: target.to_string() },
+    };
+    let endpoint = sirji::endpoint::bind_dialer(secret).await?;
+    let found =
+        sirji::daemon::ask_as_device(&endpoint, &config.parent, &config.parent_hints, &ask).await?;
+    let (device, ticket, hints) = match found {
+        sirji::proto::Say::Resolved { device, ticket, hints } => (device, ticket, hints),
+        sirji::proto::Say::No { reason } => bail!("cannot find `{target}`: {reason}"),
+    };
+
+    let conn = dial_any(&endpoint, id52::decode(&device)?, &hints).await?;
+    let (mut send, recv) = conn.open_bi().await?;
+    let mut recv = BufReader::new(recv);
+    write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
+    write_line(&mut send, &Plea::Upload(up)).await?;
+
+    let outcome = match read_line::<Answer>(&mut recv).await? {
+        Some(Answer::Decided(Verdict::Ok)) => {
+            println!("replaced — the next plea is weighed against this");
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Some(Answer::Decided(Verdict::Deny { rationale })) => {
+            // Not an error to raise: the controller decided, and said why. Printing it as
+            // a refusal keeps "you may not" apart from "something broke".
+            eprintln!("refused: {rationale}");
+            Ok(std::process::ExitCode::FAILURE)
+        }
+        Some(Answer::Fault { fault }) => bail!("the controller faulted: {fault}"),
+        other => bail!("unexpected answer: {other:?}"),
+    };
+
+    let _ = send.finish();
+    conn.close(0u32.into(), b"done");
+    endpoint.close().await;
+    outcome
+}
+
 async fn inspect(what: proto::Look, args: &[&str]) -> Result<()> {
     let mut name = "cm-c".to_string();
     let mut i = 0;

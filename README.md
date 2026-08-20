@@ -416,7 +416,7 @@ The tenant is chosen by **the verified alias in the caller's ticket** — minted
 controller's own sirji, not asserted by the caller — so this needed no accounts and
 no new credential. Adding a tenant or editing a policy needs no restart.
 
-What is not built: `cm upload-policy` and the credential story.
+What is not built: the credential story.
 Three design notes carry those, each opening with what does and does not exist:
 [docs/policy.md](docs/policy.md), [docs/budget.md](docs/budget.md) and
 [docs/auth.md](docs/auth.md).
@@ -512,6 +512,46 @@ the fleet makes is worse than no test at all.
 
 There is a worked example in [`examples/policy/`](examples/policy).
 
+## Two roles inside a tenant
+
+`cm upload-policy` gets a checked-in policy to a controller that shares no filesystem with
+the repository — which raises the question the feature is really about: **anybody who can
+run tests must not be able to rewrite the rules.**
+
+```toml
+# tenant.toml — the host's file
+ceiling = 3
+members = ["dana", "kiran", "ci-nightly"]
+admins  = ["dana"]
+```
+
+Members may plead and spend the budget. Admins may also change what the tenant has written
+down; an admin is automatically a member, since somebody trusted to write the rules is
+trusted to run a test under them.
+
+Everything else about a tenant moved *into* the policy today — who may use which pleas,
+whether free text counts, what a key is worth. This one did not, and cannot: if a policy
+named its own admins, anybody who could edit it could add themselves, and "who may change
+this" would answer itself. **Authority over a rule cannot come from the rule.** So it lives
+in `tenant.toml`, on the host's side, excluded from everything the model is shown — the same
+line as everywhere else here. Security is deterministic; policy is semantic. A model is
+asked how many machines a plea deserves; it is never asked whether the person asking may
+change the rules.
+
+Absent `admins` means nobody, not everybody:
+
+```
+$ cm upload-policy cm-c@acme .
+refused: tenant `team` has no admins, so nobody may change its policy —
+         the host sets them in tenant.toml
+```
+
+An upload **replaces** rather than merges, because the folder is the policy and a leftover
+file is a rule that exists on the controller and in no repository. Every path is validated
+before anything is written, and the folder is staged and parsed before it replaces the one
+in force — a policy accepted and then found unreadable would take the tenant down at its
+next request, a long way from where the mistake was made.
+
 ## Budgets
 
 A ceiling of three machines says nothing about whether they ran for a minute or a
@@ -600,13 +640,13 @@ Early, and running end to end: enrolment, resolution, ticket, capability-matched
 allocation, machines fetching the code themselves into isolated checkouts, real
 commands with their output streamed back live, artifacts returned as bytes, release,
 reclaim after a caller walks away, per-tenant policy, credit budgets, the model call —
-the tenant's whole folder weighed in one pass — and `cm policy-test`. Verified against a
-real 1,900-test
+the tenant's whole folder weighed in one pass — `cm policy-test`, and `cm upload-policy`
+with two roles inside a tenant. Verified against a real 1,900-test
 Playwright suite, sharded across a fleet and merged into one report.
 
-Next: `cm upload-policy`, so a checked-in policy reaches a controller it does not share a
-filesystem with, and the credential story behind it. And caching the install step, which
-is now the slowest thing in a run.
+Next: the credential story — OIDC on CI, `cm auth login` for a laptop, and the two scoped
+credentials from [docs/auth.md](docs/auth.md), so an upload does not need a paired device.
+And caching the install step, which is now the slowest thing in a run.
 
 ## License
 

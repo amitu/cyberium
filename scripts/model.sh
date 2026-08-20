@@ -20,6 +20,14 @@ LAB=${LAB:-/tmp/cmmodel}
 CM=${CM:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/cm}
 SIRJI=${SIRJI:-sirji}
 HERE=$(cd "$(dirname "$0")" && pwd)
+# Built here rather than trusted to have been built. Running a scenario against a stale
+# binary is the single most expensive mistake available in this repo: everything passes or
+# fails for reasons that are not in the source you are reading. Skipped if CM was set to
+# something else on purpose.
+if [ "$CM" = "$(cd "$(dirname "$0")/.." && pwd)/target/debug/cm" ]; then
+  cargo build --quiet --manifest-path "$(cd "$(dirname "$0")/.." && pwd)/Cargo.toml"
+fi
+
 rm -rf "$LAB"; mkdir -p "$LAB"; cd "$LAB"
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 sent() { [ -f "$LAB/prompt.log" ] && wc -l < "$LAB/prompt.log" | tr -d ' ' || echo 0; }
@@ -184,6 +192,47 @@ if [ "$rc" -eq 0 ]; then
 else
   echo "  ok    exited $rc: nothing was substituted"
 fi
+
+say "a member may run tests, but not rewrite the rules"
+mkdir -p "$LAB/edit/nivedanas"
+cp "$LAB/cm-c/root/tenants/team/policy.md" "$LAB/edit/policy.md"
+cp -R "$LAB/cm-c/root/tenants/team/nivedanas/." "$LAB/edit/nivedanas/"
+echo "" >> "$LAB/edit/policy.md"
+echo "Uploaded at least once." >> "$LAB/edit/policy.md"
+up() { CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM upload-policy cm-c@acme "$LAB/edit"; }
+set +e
+up 2>&1 | tail -1 | cut -c1-108 | sed 's/^/  /'
+set -e
+
+say "the host names an admin — in tenant.toml, which the tenant cannot write"
+printf 'admins = ["dana"]\n' >> "$LAB/cm-c/root/tenants/team/tenant.toml"
+up 2>&1 | tail -1 | sed 's/^/  /'
+grep -c "Uploaded at least once" "$LAB/cm-c/root/tenants/team/policy.md" \
+  | sed 's/^/  landed in the tenant folder: /'
+
+say "it replaces rather than merges — a plea deleted locally is gone there too"
+rm "$LAB/edit/nivedanas/noisy-users/experiments.md"
+up 2>&1 | tail -1 | sed 's/^/  /'
+ls "$LAB/cm-c/root/tenants/team/nivedanas/" | sed 's/^/  still there: /'
+test ! -e "$LAB/cm-c/root/tenants/team/nivedanas/noisy-users/experiments.md" \
+  && echo "  ok: the deleted plea is not on the controller either"
+
+say "a policy that cannot be read is refused, and the working one survives"
+cp "$LAB/edit/policy.md" "$LAB/edit/policy.md.bak"
+printf '# broken\n\n```yaml\nstanding_limit: lots\n```\n' > "$LAB/edit/policy.md"
+set +e
+up 2>&1 | tail -1 | cut -c1-108 | sed 's/^/  /'
+set -e
+grep -c "Uploaded at least once" "$LAB/cm-c/root/tenants/team/policy.md" \
+  | sed 's/^/  the tenant still has the policy that worked: /'
+
+say "and a second grants block, which would look enforced and not be"
+printf '# two blocks\n\n```yaml\nstanding_limit: 2\n```\n\nprose\n\n```yaml\nmax_limit: 99\n```\n' \
+  > "$LAB/edit/policy.md"
+set +e
+up 2>&1 | tail -1 | cut -c1-108 | sed 's/^/  /'
+set -e
+mv "$LAB/edit/policy.md.bak" "$LAB/edit/policy.md"
 
 say "controller log"
 grep -E "policy (weighed|refused)|could not weigh|overshot" cm-c.log | sed 's/^/  /'

@@ -4,7 +4,7 @@ Where the organisation's rules live, how they get there, and who may change them
 
 > **Status.** The fenced block cm enforces, one policy per tenant, the host's ceiling,
 > budgets, the model call, the whole folder weighed in one pass, and **`cm policy-test`**
-> are built and running. `cm upload-policy` is designed and **not built**.
+> and **`cm upload-policy`** are built and running.
 
 ## `policy.md` has two halves, and only one of them is cm's business
 
@@ -522,3 +522,85 @@ having none. Same rule as the dry run sharing `choose`.
 There is a worked example in [`examples/policy/`](../examples/policy): a policy with
 per-person rules, pleas grouped three different ways, and eight cases including a prompt
 injection attempt. Its assertions are about prose, so running it needs a real model.
+
+
+## Who may change a policy
+
+`cm policy-test` proves a policy says what its author meant. `cm upload-policy` gets it to
+a controller that shares no filesystem with the repository:
+
+```sh
+cm upload-policy cm-c@acme .        # from the repo where the policy lives
+```
+
+Which raises the question this feature is really about: **anybody who can run tests must
+not be able to rewrite the rules.** So a tenant has two roles.
+
+```toml
+# tenant.toml — the host's file
+ceiling = 3
+members = ["dana", "kiran", "ci-nightly"]
+admins  = ["dana"]
+credits = 400
+```
+
+**Members** may plead: run tests, spend the budget. **Admins** may also change what the
+tenant has written down. An admin is automatically a member, because somebody trusted to
+write the rules is trusted to run a test under them, and requiring both lists would mostly
+produce the bug where one was forgotten.
+
+### Why this one is not in the policy
+
+Everything else about a tenant moved *into* the policy — who may use which pleas, whether
+free text counts, what a key like `incident` is worth. This did not, and cannot.
+
+If a policy named its own admins, anybody who could edit it could add themselves. The
+question "who may change this" would answer itself. **Authority over a rule cannot come
+from the rule** — so it sits in `tenant.toml`, with the ceiling and the credits, on the
+host's side of the line and excluded from what the model is ever shown.
+
+That is the same line as everywhere else in cm: security is deterministic, policy is
+semantic. A model is asked how many machines a plea deserves. A model is never asked
+whether the person asking is allowed to change the rules.
+
+Absent `admins` means **nobody**, not everybody. A tenant whose admins were unset would
+otherwise hand its own rules to whoever runs tests, which is the exact thing this answers:
+
+```
+$ cm upload-policy cm-c@acme .
+refused: tenant `team` has no admins, so nobody may change its policy —
+         the host sets them in tenant.toml
+```
+
+### What an upload does
+
+**Replaces, never merges.** The folder *is* the policy, so a merge leaves files behind that
+nobody remembers writing and no repository contains, and the controller ends up enforcing a
+mixture that exists nowhere. Delete a plea locally and it is gone from the controller too.
+
+**Validated before it replaces anything.** Every path is checked — it came from another
+machine, so only its shape is trusted, and `../../etc/anything` is a path a caller may send
+and must never be one we open. Then the folder is staged, parsed the way a plea will parse
+it, and only swapped in if it reads. A policy accepted and *then* found unreadable takes the
+tenant down at its next request, a long way from where the mistake was made:
+
+```
+$ cm upload-policy cm-c@acme .
+refused: the uploaded policy could not be read: reading the grants block in …
+```
+
+and the policy that worked is still the one in force.
+
+**`tenant.toml` and the ledger are never accepted.** A tenant that could overwrite the first
+could raise its own ceiling; one that could overwrite the second could forget what it had
+spent. Neither is visible to them either — both are excluded from the prompt.
+
+**`policy-tests/` stays home.** The controller does not run them, and they hold the expected
+answers.
+
+### One thing this found
+
+The scenario meant to upload a broken policy and appended a second ```yaml block to do it.
+The upload was **accepted** — only the first block is ever read, so the second was silently
+ignored. Which means anybody appending a rule that way would see no error and believe it was
+in force. Two blocks is now a refusal: which one was meant is not cm's to guess.

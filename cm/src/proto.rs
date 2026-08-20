@@ -29,6 +29,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ask", rename_all = "kebab-case")]
 pub enum Plea {
+    /// Replace everything this tenant has written down.
+    ///
+    /// Only for a tenant admin, checked against `tenant.toml` — which the host owns, and
+    /// has to: a tenant that could name its own admins could grant itself the right to
+    /// change its own rules.
+    Upload(Upload),
     /// Ask for machines.
     Nivedana(Nivedana),
     /// Ask what *would* happen, and take nothing.
@@ -161,6 +167,25 @@ pub enum Verdict {
 }
 
 /// Where a granted machine is, and the ticket that admits us to it.
+/// A whole policy folder, on its way to a controller.
+///
+/// All of it, every time. A merge would leave files behind that nobody remembers writing
+/// and that no repository contains — and since the folder *is* the policy, the controller
+/// would be enforcing a mixture that exists nowhere. Replacing wholesale means what runs
+/// is what somebody can read in git.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Upload {
+    pub files: Vec<PolicyFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyFile {
+    /// Relative, and validated by the controller before anything is written. The path
+    /// comes from another machine: only its shape is ours to trust.
+    pub path: String,
+    pub text: String,
+}
+
 /// What a controller sends back to a plea.
 ///
 /// A [`Verdict`] is a judgement somebody's policy produced. `Fault` is the absence of
