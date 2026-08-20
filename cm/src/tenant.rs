@@ -263,6 +263,12 @@ impl Tenants {
         self.loaded.get(name)
     }
 
+    /// Nothing onboarded yet — a controller that will refuse every plea, which is worth
+    /// saying at startup rather than once per caller.
+    pub fn is_empty(&self) -> bool {
+        self.loaded.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.loaded.len()
     }

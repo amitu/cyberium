@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# A library as well as a binary: the reference controller is one deployment's answer,
+# and a company with its own identity service builds another around the same pieces.
+[lib]
+name = "cyberium"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cm"
 path = "src/main.rs"

@@ -379,3 +379,10 @@ pub struct Artifact {
     pub path: String,
     pub base64: String,
 }
+
+/// The first line a tester sends: the ticket its own sirji issued.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Knock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<sirji::Ticket>,
+}

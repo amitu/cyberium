@@ -34,7 +34,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::{Limit, adviser, fleet, rulebook, weigh};
+use crate::controller::{Limit, weigh};
+use crate::{adviser, fleet, rulebook};
 
 pub const DIR: &str = "policy-tests";
 

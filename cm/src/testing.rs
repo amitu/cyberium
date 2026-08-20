@@ -1,5 +1,9 @@
 //! Scratch directories for tests, and one guarantee: no two of them are the same.
 //!
+//! Public rather than `#[cfg(test)]`, because anybody writing a controller against this
+//! crate needs the same thing, and the trap below is not obvious enough to leave them to
+//! rediscover.
+//!
 //! The obvious construction — process id plus a nanosecond timestamp — is not unique.
 //! Every test in a binary shares the pid, tests run in parallel, and the clock's real
 //! granularity is coarser than a nanosecond, so two directories collide often enough
