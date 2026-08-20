@@ -1,5 +1,9 @@
 # cm
 
+**[Documentation](https://amitu.github.io/cyberium/)** — install, quickstart, writing a
+policy, running a fleet, and the design notes behind each decision.
+
+
 Cost-aware allocation of test machines, over [sirji](https://github.com/amitu/sirji).
 
 A developer asks for machines in English, and a controller weighs that plea
@@ -418,8 +422,9 @@ no new credential. Adding a tenant or editing a policy needs no restart.
 
 What is not built: the credential story.
 Three design notes carry those, each opening with what does and does not exist:
-[docs/policy.md](docs/policy.md), [docs/budget.md](docs/budget.md) and
-[docs/auth.md](docs/auth.md).
+[docs/design/policy.md](docs/design/policy.md),
+[docs/design/budget.md](docs/design/budget.md) and
+[docs/design/auth.md](docs/design/auth.md).
 
 ## The whole folder is the policy, and the caller just says things
 
@@ -641,7 +646,7 @@ gone" answerable — a running total never is:
 
 Not built: currency conversion (`daily_budget: "200 INR"`), and the named calendars
 a team will want (*"our day starts at 08:00 New York, daylight saving included"*) —
-both need the model, and the split is settled in [docs/budget.md](docs/budget.md):
+both need the model, and the split is settled in [docs/design/budget.md](docs/design/budget.md):
 the model names the rule, deterministic code does the calendar arithmetic against a
 real tz database, because DST is not a thing to trust a language model with.
 
@@ -693,7 +698,7 @@ other than a folder. Verified against a real 1,900-test
 Playwright suite, sharded across a fleet and merged into one report.
 
 Next: the credential story — OIDC on CI, `cm auth login` for a laptop, and the two scoped
-credentials from [docs/auth.md](docs/auth.md), so an upload does not need a paired device.
+credentials from [docs/design/auth.md](docs/design/auth.md), so an upload does not need a paired device.
 And caching the install step, which is now the slowest thing in a run.
 
 ## License

@@ -1,0 +1,44 @@
+title: cyberium
+description: Cost-aware allocation of test machines, decided by a policy you write in English.
+url: https://amitu.github.io
+baseurl: /cyberium
+
+# just-the-docs gives navigation and search, which is what a reference site needs and
+# what a plain theme does not have. `remote_theme` rather than a Gemfile because GitHub
+# Pages builds this itself — no workflow to maintain, and nothing to go stale.
+remote_theme: just-the-docs/just-the-docs
+
+# Prose here runs long on purpose; the default measure is too wide to read comfortably.
+color_scheme: light
+search_enabled: true
+search:
+  heading_level: 2
+  previews: 2
+
+heading_anchors: true
+back_to_top: true
+back_to_top_text: "Back to top"
+
+aux_links:
+  "GitHub": https://github.com/amitu/cyberium
+aux_links_new_tab: true
+
+nav_external_links:
+  - title: sirji — the substrate underneath
+    url: https://github.com/amitu/sirji
+
+footer_content: >
+  Licensed under MIT or Apache-2.0, at your option.
+  These pages are generated from <code>docs/</code> in the repository, so a correction is
+  a pull request.
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+
+# Kramdown's default footnotes and tables are enough; nothing here needs a plugin.
+markdown: kramdown
+kramdown:
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false

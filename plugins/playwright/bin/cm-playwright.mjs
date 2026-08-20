@@ -21,7 +21,8 @@
 //   CM_SAY          anything else the tenant's own policy reads, as key=value pairs:
 //                   CM_SAY='plea=nightly-regression,incident=INC-4471,role=ci'
 //                   cm attaches no meaning to any of these — what each is worth is
-//                   written in the tenant's files. See docs/policy.md.
+//                   written in the tenant's files.
+//                   See https://amitu.github.io/cyberium/guide/policy.html
 //   CM_RUNNER       how to start Playwright (default `npx playwright test`)
 //   CM_HOME         which cm identity to use — see cm init
 //   CM_BIN          path to the cm binary, if it is somewhere unusual

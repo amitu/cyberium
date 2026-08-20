@@ -1,3 +1,9 @@
+---
+title: Identity and access
+parent: Design notes
+nav_order: 3
+---
+
 # Who is asking, and who says so
 
 How cm decides that a request is genuinely from who it claims. The general shape is

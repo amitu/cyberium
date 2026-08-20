@@ -59,13 +59,18 @@ cm — cost-aware allocation of test machines
         look inside a running controller, as an admin device.
 
   cm tenant add <name> [--ceiling N] [--credits N] [--window SECS]
-                       [--member <alias>]... [--note <text>]
+                       [--member <alias>]... [--admin <alias>]... [--note <text>]
   cm tenant list
         onboard whoever this controller serves — always, self-hosted too, where
         a tenant is usually a team. Members are the caller aliases our own sirji
         knows them by; with none given, the tenant's own name is its only member.
         They write policy.md; you write tenant.toml, which is what stops a
         tenant setting its own quota or claiming somebody else's callers.
+        --admin also makes them a member, and is the only way anybody may change
+        that tenant's rules. Absent means nobody: authority over a rule cannot
+        come from the rule. Also in tenant.toml: [facts], which this deployment
+        attests about them — a plan, a team, an entitlement — for their policy to
+        read and cm never to interpret.
 
   cm worker [--controller <name>] [--can <cap>]... [--rate N]
         offer this machine to the controller. One tenancy at a time — for
@@ -95,6 +100,24 @@ cm — cost-aware allocation of test machines
         In --run, --env and --collect: {shard} is 1-based, {index} 0-based,
         {shards} the total.
         Each shard gets its own checkout, deleted when the reservation ends.
+        Any other --key <value> is yours, not cm's: `--plea nightly-regression`,
+        `--incident INC-4471`, `--urgent`. cm attaches no meaning to any of them
+        and passes them on; what each is worth is written in your own policy.
+        CM_SAY='plea=nightly,incident=INC-1' does the same from a CI job.
+
+  cm policy-test [<dir>] [--repeat N] [--only <substring>]
+        run the cases in <dir>/policy-tests/ against <dir>'s own rules. No
+        controller and no fleet: this belongs in the repository the policy lives
+        in, before anything is uploaded. --repeat asks the same question more
+        than once, which is a different question: whether prose is written
+        clearly enough to hold every time.
+
+  cm upload-policy <name@org> [<dir>]
+        replace what a tenant has written down. Only for an admin named in
+        tenant.toml. Replaces rather than merges — the folder *is* the policy, so
+        a file left behind is a rule that exists on the controller and in no
+        repository. Refused whole if it will not parse, so the policy that works
+        stays in force.
 
 Test runners plug in on top of `cm test` rather than inside cm: a runner that knew
 about Playwright would owe the same favour to jest, pytest and whatever comes next.

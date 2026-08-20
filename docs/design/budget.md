@@ -1,3 +1,9 @@
+---
+title: Budgets
+parent: Design notes
+nav_order: 2
+---
+
 # Budgets, and the unit they are counted in
 
 > **Status: built.** Worker rates, cost on close, the per-tenant ledger, the two

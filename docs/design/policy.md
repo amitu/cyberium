@@ -1,3 +1,9 @@
+---
+title: Policy
+parent: Design notes
+nav_order: 1
+---
+
 # policy.md, and what happens to it
 
 Where the organisation's rules live, how they get there, and who may change them.
@@ -519,7 +525,7 @@ second implementation would eventually disagree with the first and be believed â
 test that passes against a slightly different decision than the fleet makes is worse than
 having none. Same rule as the dry run sharing `choose`.
 
-There is a worked example in [`examples/policy/`](../examples/policy): a policy with
+There is a worked example in [`examples/policy/`](https://github.com/amitu/cyberium/tree/main/examples/policy): a policy with
 per-person rules, pleas grouped three different ways, and eight cases including a prompt
 injection attempt. Its assertions are about prose, so running it needs a real model.
 
