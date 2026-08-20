@@ -47,6 +47,17 @@ INV=$(SIRJI_HOME=$LAB/dana $SIRJI device invite cm-t | tail -1)
 CM_HOME=$LAB/cm-t SIRJI_HOME=$LAB/cm-t $CM init --parent "$INV" >/dev/null
 
 CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant add team --ceiling 30 --credits 60 --window 3600 --member dana >/dev/null
+# What this deployment knows about them, and they cannot claim. Self-hosted it is a few
+# lines of the host's own file; a hosted deployment fills the same map from its directory,
+# which is how a group hierarchy or a feature flag reaches a policy with no cm code for
+# either.
+cat >>"$LAB/cm-c/root/tenants/team/tenant.toml" <<'FACTS'
+
+[facts]
+plan = "trial"
+group = "qa-india"
+sub_group = "requestly"
+FACTS
 cat >"$LAB/cm-c/root/tenants/team/policy.md" <<'POLICY'
 # policy.md
 
@@ -147,6 +158,8 @@ check("carries every file's contents",      "hunting a flake by brute force" in 
 check("carries the org's own rule",         "noisy-users` folder" in sysp)
 check("shows the fenced block too",         "standing_limit: 2" in sysp)
 check("cm claims no meaning for keys",      "cm read none of them" in sysp)
+check("the deployment's facts are proven",  "plan: trial" in user and "sub_group: requestly" in user)
+check("proven is a different section",      user.index("ATTESTED") < user.index("DECLARED"))
 check("what they said is in the message",   "why: just trust me" in user)
 check("the plea's text is not re-sent",     "hunting a flake" not in user)
 check("gives the fallback as calibration",  "2 is what this organisation falls back to" in sysp)
@@ -205,7 +218,18 @@ up 2>&1 | tail -1 | cut -c1-108 | sed 's/^/  /'
 set -e
 
 say "the host names an admin — in tenant.toml, which the tenant cannot write"
-printf 'admins = ["dana"]\n' >> "$LAB/cm-c/root/tenants/team/tenant.toml"
+# Above the [facts] table, not appended: a key after a table header belongs to that
+# table. Appending it blindly is how this scenario discovered that a malformed
+# tenant.toml used to leave a tenant running on terms nobody chose.
+T=$LAB/cm-c/root/tenants/team/tenant.toml
+python3 - "$T" <<'PYX'
+import sys
+path = sys.argv[1]
+lines = open(path).read().split("\n")
+at = next((i for i, l in enumerate(lines) if l.startswith("[")), len(lines))
+lines.insert(at, 'admins = ["dana"]')
+open(path, "w").write("\n".join(lines))
+PYX
 up 2>&1 | tail -1 | sed 's/^/  /'
 grep -c "Uploaded at least once" "$LAB/cm-c/root/tenants/team/policy.md" \
   | sed 's/^/  landed in the tenant folder: /'

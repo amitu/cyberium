@@ -52,6 +52,13 @@ pub struct Case {
     /// The keys and values the caller sent. cm reads none of them; the policy does.
     #[serde(default)]
     pub said: BTreeMap<String, String>,
+    /// What the deployment would have attested about them — a plan, a group, a flag.
+    ///
+    /// Pinnable for the same reason `fleet` is: a rule that turns on a fact cannot be
+    /// tested without stating the fact, and a case that left it out would be checking a
+    /// different rule than the one it names.
+    #[serde(default)]
+    pub facts: BTreeMap<String, String>,
     /// The fleet at the moment of asking. Pinned, because the answer depends on it: "six
     /// machines" is a different question on a quiet Tuesday and a release night, and a
     /// case that did not say which would pass or fail by accident.
@@ -289,6 +296,7 @@ async fn one_case(
             // caller is what a policy actually distinguishes people by.
             tenant: "under-test".into(),
             caller: case.caller.clone(),
+            facts: case.facts.clone(),
         },
         declared: adviser::Declared {
             said: case.said.clone(),

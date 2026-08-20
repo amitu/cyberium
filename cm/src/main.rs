@@ -508,6 +508,7 @@ impl Control {
         // one caller's request.
         let (
             tenant_name,
+            facts,
             rulebook,
             lifetime,
             host_ceiling,
@@ -533,6 +534,7 @@ impl Control {
             };
             (
                 tenant.alias.clone(),
+                tenant.facts(),
                 tenant.rulebook.as_str().to_string(),
                 tenant.policy.reservation_secs(),
                 tenant.ceiling(),
@@ -592,6 +594,7 @@ impl Control {
             attested: adviser::Attested {
                 tenant: tenant_name.clone(),
                 caller: alias.to_string(),
+                facts,
             },
             declared: adviser::Declared {
                 said: nivedana.said.clone(),
@@ -798,6 +801,21 @@ impl Control {
                 };
                 if names.is_empty() {
                     lines.push("no tenants".into());
+                }
+                // First, because it changes how to read everything under it: a tenant
+                // listed here is running on terms that are not the ones in its file.
+                for (name, why) in {
+                    let tenants = self.tenants.lock().await;
+                    tenants
+                        .unread()
+                        .into_iter()
+                        .map(|(n, w)| (n.to_string(), w.to_string()))
+                        .collect::<Vec<_>>()
+                } {
+                    lines.push(format!(
+                        "  !! {name}: files not read, still running on the last good copy \
+                         — {why}"
+                    ));
                 }
                 for name in names {
                     let t = {

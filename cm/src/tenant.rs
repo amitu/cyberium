@@ -71,6 +71,19 @@ pub struct Terms {
     /// day starts would be answering a question it has no business asking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<u64>,
+    /// What this deployment knows about the tenant, and the tenant cannot claim.
+    ///
+    /// Arrives in the prompt as **attested**, beside the caller's identity, so a policy
+    /// can turn on it: `plan = "trial"`, `group = "qa-india"`, `gpu = "allowed"`. cm
+    /// attaches no meaning to any of it.
+    ///
+    /// Here rather than in the tenant's own folder because the whole value is that it
+    /// cannot be self-asserted. A tenant that could write its own plan would write the
+    /// expensive one. It is also the seam a hosted deployment replaces: the same map,
+    /// filled from a real directory instead of a file, which is how a group hierarchy or
+    /// a feature flag reaches a policy without cm learning what either is.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub facts: std::collections::BTreeMap<String, String>,
     /// Free-form, for whoever has to work out later why this tenant exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -86,6 +99,7 @@ impl Default for Terms {
             // Nobody, not everyone. A tenant whose admins were unset would otherwise
             // hand its own rules to whoever runs tests.
             admins: Vec::new(),
+            facts: std::collections::BTreeMap::new(),
             credits: None,
             window: None,
             note: None,
@@ -149,6 +163,11 @@ impl Tenant {
         self.terms.admins.iter().any(|a| a == alias)
     }
 
+    /// What this deployment will attest about them.
+    pub fn facts(&self) -> std::collections::BTreeMap<String, String> {
+        self.terms.facts.clone()
+    }
+
     /// For a refusal that tells somebody who to ask.
     pub fn admins(&self) -> Vec<&str> {
         self.terms.admins.iter().map(String::as_str).collect()
@@ -168,6 +187,9 @@ impl Tenant {
 /// Every tenant this controller serves.
 #[derive(Debug)]
 pub struct Tenants {
+    /// Tenants whose files would not read, and why. Their last good copy is still in
+    /// force, which is exactly why this has to be visible somewhere.
+    unread: BTreeMap<String, String>,
     dir: PathBuf,
     loaded: BTreeMap<String, Tenant>,
     /// caller alias → tenant name. Several aliases may point at one tenant, which
@@ -188,6 +210,7 @@ impl Tenants {
     pub fn load(root: &Path) -> Result<Self> {
         let dir = Self::dir_in(root);
         let mut loaded = BTreeMap::new();
+        let mut unread = BTreeMap::new();
 
         if dir.is_dir() {
             for entry in std::fs::read_dir(&dir)
@@ -202,12 +225,24 @@ impl Tenants {
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| anyhow::anyhow!("{} is not a usable name", path.display()))?
                     .to_string();
-                loaded.insert(alias.clone(), read(&path, &alias)?);
+                // One tenant's typo does not stop the others. It does stop *that*
+                // tenant: falling back to default terms would put a ceiling and a budget
+                // in force that nobody chose, and the host would never know. Their
+                // callers get "not a tenant of this controller", which is at least loud.
+                match read(&path, &alias) {
+                    Ok(tenant) => {
+                        loaded.insert(alias.clone(), tenant);
+                    }
+                    Err(e) => {
+                        eprintln!("cannot read tenant {alias}: {e:#}");
+                        unread.insert(alias.clone(), format!("{e:#}"));
+                    }
+                }
             }
         }
 
         let by_member = index(&loaded)?;
-        Ok(Self { dir, loaded, by_member })
+        Ok(Self { unread, dir, loaded, by_member })
     }
 
     /// Tenant names — the folders. **Not** caller aliases.
@@ -260,7 +295,16 @@ impl Tenants {
                     self.by_member = fresh_index;
                 }
             }
-            Err(e) => eprintln!("keeping the last good policy for {name}: {e:#}"),
+            Err(e) => {
+                // Kept serving on the last good copy rather than dropped: a typo should
+                // not take a paying tenant offline. But an edit that did not apply is
+                // invisible to whoever made it, so it is remembered as well as logged —
+                // see `Tenants::unread`, which the operator's own tenant view shows. A
+                // host believing new limits are in force while the old ones are is worse
+                // than either the outage or the typo.
+                eprintln!("keeping the last good copy of {name}: {e:#}");
+                self.unread.insert(name.clone(), format!("{e:#}"));
+            }
         }
 
         // Re-check: a membership edit may have removed this caller.
@@ -273,6 +317,14 @@ impl Tenants {
     /// Returns the error rather than only logging it, because one caller is a plea that
     /// merely hoped for a new tenant and the other has just replaced a policy and needs
     /// to know whether the thing it wrote can be read.
+    /// Edits that did not take: tenant name, and why its files would not read.
+    ///
+    /// Surfaced in the operator's tenant view, because the copy still in force is the
+    /// last one that parsed and nothing about the running fleet looks wrong.
+    pub fn unread(&self) -> Vec<(&str, &str)> {
+        self.unread.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+    }
+
     pub fn rescan(&mut self) -> Result<()> {
         let fresh = Self::load(
             self.dir
@@ -287,8 +339,14 @@ impl Tenants {
         if !appeared.is_empty() {
             println!("tenant(s) appeared: {appeared:?}");
         }
-        self.loaded = fresh.loaded;
-        self.by_member = fresh.by_member;
+        // Merge rather than replace: a tenant that has just been broken by a hand-edit
+        // keeps serving on its last good copy, because a typo should not take a paying
+        // tenant offline. The `unread` note is how anybody finds out.
+        for (name, tenant) in fresh.loaded {
+            self.loaded.insert(name, tenant);
+        }
+        self.unread = fresh.unread;
+        self.by_member = index(&self.loaded)?;
         Ok(())
     }
 
@@ -378,6 +436,43 @@ mod tests {
 
         let tenants = Tenants::load(&root).unwrap();
         assert_eq!(tenants.names().collect::<Vec<_>>(), vec!["acme"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_malformed_terms_file_does_not_become_default_terms() {
+        // The failure this prevents: a host mistypes tenant.toml, the tenant keeps
+        // running on a ceiling and a budget nobody chose, and nothing looks wrong.
+        // Found by a scenario that appended `admins` after a `[facts]` table header, so
+        // TOML put it inside — and the tenant quietly ran with no admins at all.
+        let root = temp();
+        let dir = Tenants::dir_in(&root).join("acme");
+        std::fs::create_dir_all(&dir).unwrap();
+        Policy::load(&dir).unwrap();
+        std::fs::write(dir.join(FILE), "ceiling = 3\n\n[facts]\nadmins = [\"dana\"]\n").unwrap();
+
+        let tenants = Tenants::load(&root).unwrap();
+        assert!(tenants.by_name("acme").is_none(), "it loaded on defaults");
+        // And the operator can find out why without reading a log.
+        let unread = tenants.unread();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].0, "acme");
+        assert!(unread[0].1.contains("tenant.toml"), "{:?}", unread[0].1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn one_tenants_typo_does_not_stop_the_others() {
+        let root = temp();
+        for (name, terms) in [("good", "ceiling = 3\n"), ("bad", "ceiling = [1]\n")] {
+            let dir = Tenants::dir_in(&root).join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            Policy::load(&dir).unwrap();
+            std::fs::write(dir.join(FILE), terms).unwrap();
+        }
+        let tenants = Tenants::load(&root).unwrap();
+        assert!(tenants.by_name("good").is_some());
+        assert!(tenants.by_name("bad").is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 

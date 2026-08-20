@@ -604,3 +604,48 @@ The scenario meant to upload a broken policy and appended a second ```yaml block
 The upload was **accepted** — only the first block is ever read, so the second was silently
 ignored. Which means anybody appending a rule that way would see no error and believe it was
 in force. Two blocks is now a refusal: which one was meant is not cm's to guess.
+
+
+## Attested facts: an organisation's own shape
+
+A deployment usually knows things about a caller that the caller must not be able to
+claim: which team they are in, what they are paying for, which features they are entitled
+to. Those arrive in the prompt as **attested**, beside the identity:
+
+```toml
+# tenant.toml — the host's file
+[facts]
+plan      = "trial"
+group     = "qa-india"
+sub_group = "requestly"
+```
+
+```
+ATTESTED (proven — the requester cannot influence any of this)
+tenant: team
+caller: dana
+group: qa-india
+plan: trial
+sub_group: requestly
+```
+
+cm attaches no meaning to any of it, exactly as with the caller's own keys — but the two
+are kept in **different sections**, because one was established and the other was typed.
+That is the whole value: a policy can say
+
+> Sub-groups on the trial plan get at most two machines, whatever they ask for.
+
+and mean it, because `plan` is not something a caller can assert. There is a test that the
+same key sent by the caller lands only in the declared half and never in the proven one.
+
+### Why a feature flag is a fact and not a branch
+
+An access hierarchy — group, sub-group, user id — and a feature-flag system are exactly the
+things a company has and an open-source allocator should not grow code for. As facts they
+need none: cm carries the pairs, the policy reads them, and nothing in cm ever learns what
+a sub-group is. A flag that turns a capability off entirely is a fact too, and a policy that
+says "this group may not have gpu machines" is a rule cm enforces by weighing, not by
+branching.
+
+`[facts]` is the self-hosted source. A deployment with a real directory behind it fills the
+same map from there — the shape does not change, only where it comes from.
