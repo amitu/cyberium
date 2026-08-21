@@ -1,7 +1,7 @@
 ---
 title: Operating a controller
 parent: Guide
-nav_order: 11
+nav_order: 12
 ---
 
 # Operating a controller

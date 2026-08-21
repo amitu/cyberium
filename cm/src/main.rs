@@ -84,6 +84,14 @@ cm — cost-aware allocation of test machines
         skip them, or see their output. A --post that fails takes the machine
         out of the fleet rather than lending out a dirty one.
 
+  cm test <controller-id52> [...]
+        the same, from a machine with nothing enrolled — a CI runner. Mints a key
+        for this run, gets a token whose audience *is* that key, and throws the key
+        away. No shared secret, and a token scraped from a build log names an
+        audience nobody holds. The host says whose tokens count, in issuers.toml.
+        On GitHub Actions give the job `permissions: id-token: write`; elsewhere
+        set CM_ATTEST_CMD to a command that prints a token for {audience}.
+
   cm test <name@org> --ping
         check the whole chain — identity, our sirji, resolution, dial, ticket —
         and say which link is broken. Takes no machine from anybody.
@@ -1410,7 +1418,7 @@ async fn upload_policy(target: &str, dir: &std::path::Path) -> Result<std::proce
     let conn = dial_any(&endpoint, id52::decode(&device)?, &hints).await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut recv = BufReader::new(recv);
-    write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
+    write_line(&mut send, &Knock { ticket: Some(ticket), attestation: None }).await?;
     write_line(&mut send, &Plea::Upload(up)).await?;
 
     let outcome = match read_line::<Answer>(&mut recv).await? {
@@ -1477,7 +1485,7 @@ async fn inspect(what: proto::Look, args: &[&str]) -> Result<()> {
     let (mut send, recv) = conn.open_bi().await?;
     let mut recv = BufReader::new(recv);
 
-    write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
+    write_line(&mut send, &Knock { ticket: Some(ticket), attestation: None }).await?;
     write_line(&mut send, &Plea::Inspect { what }).await?;
 
     let outcome = match read_line::<Answer>(&mut recv).await? {
@@ -1605,7 +1613,7 @@ async fn ping(target: &str) -> Result<std::process::ExitCode> {
         // own parent's signature — which is the only reason it will talk to us.
         let (mut send, recv) = conn.open_bi().await?;
         let mut recv = BufReader::new(recv);
-        write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
+        write_line(&mut send, &Knock { ticket: Some(ticket), attestation: None }).await?;
         write_line(&mut send, &Plea::Ping).await?;
 
         let verdict = match read_line::<Answer>(&mut recv).await {
@@ -1657,17 +1665,16 @@ type Results = Vec<Result<Shard>>;
 ///
 /// The whole of what cm offers a caller. Everything a test runner needs on top of
 /// this — shard arithmetic, report formats, merging — belongs to that runner's
-/// plugin, not here.
-async fn run(session: Session) -> Result<Results> {
+/// The enrolled way: our own sirji resolves the controller and mints us a ticket.
+async fn enrolled(
+    name: &str,
+    org: &str,
+    target: &str,
+) -> Result<(sirji::Endpoint, sirji::Connection, Knock)> {
     let home = home()?;
     sirji::Settings::load(&home)?.activate();
     let config = load_config(&home)?;
     let secret = keys(&home).secret(&id52::decode(&config.key)?)?;
-
-    let (name, org) = session
-        .target
-        .split_once('@')
-        .ok_or_else(|| anyhow::anyhow!("{:?} is not name@org", session.target))?;
 
     // Our parent knows who the organisation is. We do not, and should not.
     let endpoint = sirji::endpoint::bind_dialer(secret).await?;
@@ -1685,9 +1692,141 @@ async fn run(session: Session) -> Result<Results> {
         sirji::proto::Say::Resolved { device, ticket, hints } => (device, ticket, hints),
         sirji::proto::Say::No { reason } => bail!("{reason}"),
     };
-    eprintln!("resolved {} -> {device}", session.target);
+    eprintln!("resolved {target} -> {device}");
 
     let conn = dial_any(&endpoint, id52::decode(&device)?, &hints).await?;
+    Ok((endpoint, conn, Knock { ticket: Some(ticket), attestation: None }))
+}
+
+pub const ATTEST_ENV: &str = "CM_ATTEST";
+pub const MINT_ENV: &str = "CM_ATTEST_CMD";
+pub const HINTS_ENV: &str = "CM_CONTROLLER_HINTS";
+
+/// The attested way: nothing enrolled, and nothing left behind.
+///
+/// A key minted for this run, a token whose audience *is* that key, and a direct dial. No
+/// `cm init`, no parent, no entry in anybody's roster — which is the point, because a
+/// runner that enrolled would leave one dead entry per build.
+///
+/// The order matters and is the whole security property: **the key exists before the token
+/// is asked for**, because the audience has to be the key. A token fetched first could only
+/// be a bearer token, and a bearer token in a build log is a credential anybody can replay.
+async fn attesting(target: &str) -> Result<(sirji::Endpoint, sirji::Connection, Knock)> {
+    let secret = sirji::SecretKey::generate();
+    let mine = id52::encode(&secret.public());
+    let endpoint = sirji::endpoint::bind_dialer(secret).await?;
+
+    let token = token_for(&mine).await?;
+    eprintln!("attesting as a one-off key {mine}");
+
+    // Dialled by key. There is no parent to resolve through, so the controller's id52 is
+    // the address — from a CI variable, or from DNS once that exists.
+    let hints: Vec<String> = std::env::var(HINTS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|h| !h.trim().is_empty())
+        .map(|h| h.trim().to_string())
+        .collect();
+    let conn = dial_any(&endpoint, id52::decode(target)?, &hints).await?;
+    Ok((endpoint, conn, Knock { ticket: None, attestation: Some(token) }))
+}
+
+/// A token whose audience is `mine`.
+///
+/// Note what is *not* offered: a variable holding a ready-made token. It could never be
+/// right — the audience has to be a key that does not exist until this run starts, so a
+/// token prepared in advance is either for the wrong audience or is a bearer token, and cm
+/// does not accept bearer tokens.
+///
+/// So the escape hatch is a **command**, not a value. `CM_ATTEST_CMD` is run with
+/// `{audience}` replaced by this run's key, and whatever it prints is the token. One hook
+/// covers every provider cm has no integration with, which is the same reason the enrolment
+/// flow implements protocols rather than providers.
+///
+/// Nothing about the token is checked here. The controller is the only party whose opinion
+/// of it matters, and a client that pre-validated would be a second implementation to
+/// disagree with the first.
+async fn token_for(mine: &str) -> Result<String> {
+    if let Ok(template) = std::env::var(MINT_ENV).map(|t| t.trim().to_string())
+        && !template.is_empty()
+    {
+        let command = template.replace("{audience}", mine);
+        let out = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .await
+            .with_context(|| format!("running {MINT_ENV}: {command}"))?;
+        if !out.status.success() {
+            bail!(
+                "{MINT_ENV} failed ({}): {}",
+                describe(out.status.code()),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if token.is_empty() {
+            bail!("{MINT_ENV} printed nothing");
+        }
+        return Ok(token);
+    }
+
+    let which = std::env::var(ATTEST_ENV).unwrap_or_else(|_| "github".into());
+    match which.as_str() {
+        // GitHub hands out a token per audience, which is exactly the shape needed. Both
+        // variables appear only when a workflow requests `id-token: write`, so their
+        // absence is a permissions problem and worth saying so.
+        "github" => {
+            let (url, bearer) = (
+                std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok(),
+                std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok(),
+            );
+            let (Some(url), Some(bearer)) = (url, bearer) else {
+                bail!(
+                    "no way to prove who this is. On GitHub Actions, give the job \
+                     `permissions: id-token: write`; elsewhere set {MINT_ENV} to a command \
+                     that prints a token for {{audience}}; or use `name@org` with an \
+                     enrolled device."
+                )
+            };
+            #[derive(serde::Deserialize)]
+            struct Minted {
+                value: String,
+            }
+            let minted: Minted = reqwest::Client::new()
+                .get(format!("{url}&audience={mine}"))
+                .bearer_auth(bearer)
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await
+                .context("asking GitHub for a token")?
+                .error_for_status()?
+                .json()
+                .await
+                .context("GitHub's answer was not the shape expected")?;
+            Ok(minted.value)
+        }
+        other => bail!("no integration for {ATTEST_ENV}={other:?}; set {MINT_ENV} instead"),
+    }
+}
+
+/// plugin, not here.
+async fn run(session: Session) -> Result<Results> {
+    // Two ways to be somebody, and which one applies is decided by the target. `name@org`
+    // means we have a parent that can resolve it and mint us a ticket. A bare id52 means
+    // we do not — a CI runner with nothing enrolled — so we prove ourselves with a token
+    // instead and dial the controller directly.
+    let (endpoint, conn, knock) = match session.target.split_once('@') {
+        Some((name, org)) => enrolled(name, org, &session.target).await?,
+        // An id52 and nothing else. A bare word is neither form, and saying so beats
+        // failing later with a decode error about a string nobody meant as a key.
+        None if id52::decode(&session.target).is_ok() => attesting(&session.target).await?,
+        None => bail!(
+            "{:?} is neither `name@org` nor a controller's id52. Use `name@org` from an \
+             enrolled device, or the key itself when proving yourself by attestation.",
+            session.target
+        ),
+    };
     let (mut send, recv) = conn.open_bi().await?;
     let mut recv = BufReader::new(recv);
 
@@ -1695,7 +1834,7 @@ async fn run(session: Session) -> Result<Results> {
     // a counter or a refusal that skipped the close left iroh's tasks to be
     // cancelled out from under the runtime, which surfaced as a panic on exit.
     let outcome = async {
-        write_line(&mut send, &Knock { ticket: Some(ticket) }).await?;
+        write_line(&mut send, &knock).await?;
         let plea = if session.rehearsing {
             Plea::Rehearse(session.nivedana)
         } else {

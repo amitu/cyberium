@@ -528,6 +528,7 @@ dependencies = [
  "async-trait",
  "data-encoding",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sirji",

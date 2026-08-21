@@ -38,6 +38,7 @@ main thing still unbuilt — see [Identity and access](design/auth.html).
 - **[Quickstart](guide/quickstart.html)** — a controller, a worker and a test run, on one machine
 - **[Run a suite](guide/running-tests.html)** — `cm t` in full: sharding, checkouts, artifacts
 - **[Playwright](guide/playwright.html)** — `npm test` distributes itself, and your config is untouched
+- **[Running from CI](guide/ci.html)** — no enrolment, no shared secret, and a scraped token is worthless
 
 ## The policy
 

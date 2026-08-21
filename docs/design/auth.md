@@ -10,23 +10,29 @@ How cm decides that a request is genuinely from who it claims. The general shape
 sirji's [standing pattern](https://github.com/amitu/sirji/blob/main/patterns/standing.md);
 this is what cm does with it.
 
-> ## Status: designed, mostly not built
+> ## Status: the two doors are built; the enrolment flow is not
 >
-> Worth stating before anything else, because this document reads like a
-> description and is largely a plan.
+> **Built.** A caller proves itself one of two ways, and both work end to end.
 >
-> **Built today:** a caller is a sirji device of its own sirji, and presents a
-> sealed ticket its parent minted. The controller verifies one signature and
-> learns an alias from it. That is the whole of it, and it works.
+> - **A ticket**, for anything with a keypair its organisation enrolled once — a
+>   laptop, a build server, a worker. One signature, no network.
+> - **An attestation**, for anything with nothing to enrol. A token from an issuer
+>   named in `issuers.toml`, verified against the issuer's published keys, and
+>   **bound to the caller's own connection key through the audience** — so a token
+>   scraped from a build log is useless. Its claims arrive as attested facts, which
+>   a policy may read and a caller cannot forge.
 >
-> **Not built:** OIDC, `cm auth login`, enrolment, the context JSON, per-org
-> policy, the plan tier, and the two credential tiers. None of it exists in the
-> binary.
+> Multi-tenancy is built too: a policy per tenant, keyed on the verified alias, with
+> members, admins and per-tenant facts. Anything below describing that as future is
+> out of date.
 >
-> The consequence worth knowing: **the controller is single-tenant.** It holds one
-> `policy.md`, read at startup, and every admitted caller is weighed against it.
-> Everything below that says "per organisation" describes where this is going, not
-> where it is.
+> **Not built:** `cm auth login` and the device-flow enrolment, the plan tier, and
+> the two credential tiers as *separate* credentials — today an admin is an admin
+> because `tenant.toml` says so, which is the same separation by a plainer route.
+>
+> Also not built: **DNS discovery of a controller's handshake key.** An attested
+> caller has no parent to resolve through, so it needs the id52 and an address —
+> from a CI variable today, printed by the controller at startup.
 
 ## No shared secrets
 

@@ -433,7 +433,7 @@ The tenant is chosen by **the verified alias in the caller's ticket** — minted
 controller's own sirji, not asserted by the caller — so this needed no accounts and
 no new credential. Adding a tenant or editing a policy needs no restart.
 
-What is not built: the credential story.
+What is not built: `cm auth login`, and DNS discovery of a controller's key.
 Three design notes carry those, each opening with what does and does not exist:
 [docs/design/policy.md](docs/design/policy.md),
 [docs/design/budget.md](docs/design/budget.md) and
@@ -529,6 +529,50 @@ reimplementation, because a test that passes against a slightly different decisi
 the fleet makes is worse than no test at all.
 
 There is a worked example in [`examples/policy/`](examples/policy).
+
+## CI needs no enrolment and no shared secret
+
+A cloud runner exists for ninety seconds and has nothing to enrol. So it does not enrol: it
+mints a keypair for the run, gets a token whose **audience is that key**, dials the
+controller, and throws the key away.
+
+```yaml
+permissions:
+  id-token: write            # the whole of the setup
+steps:
+  - run: npm test
+    env:
+      CM_CONTROLLER: ${{ vars.CM_CONTROLLER_KEY }}
+      CM_SAY: plea=pre-merge-check,pr=${{ github.event.number }}
+```
+
+**cm does not accept bearer tokens.** The audience must be the public key the caller is
+dialling from, and that key was generated at the start of the run and never written to disk.
+A token lifted from a build log names an audience whose private key no longer exists — the
+same caller-binding a sealed ticket has, from a credential cm did not issue.
+
+Which is why there is no shared secret anywhere in cm. One is only needed when an actor is
+**both ephemeral and unattested**, and that set is empty:
+
+| actor | ephemeral | how it authenticates |
+|---|---|---|
+| cloud CI runner | yes | per-request OIDC, bound to a one-off key |
+| developer laptop | no | keypair, enrolled once |
+| build server | no | keypair, enrolled once |
+| worker | no | keypair, enrolled once |
+
+The host says whose word counts, in `issuers.toml`, and the claims arrive as **attested**
+facts a policy can read and a caller cannot forge:
+
+```markdown
+A pull request build may have up to six machines while somebody is waiting on it. A
+scheduled run is routine and waits — `event_name` says which this is, and it comes from
+the platform rather than from the job, so a nightly cannot describe itself as a PR.
+```
+
+`scripts/attest.sh` runs all of it locally against a real RSA key and a real JWKS endpoint,
+including every way a token is refused: minted for somebody else's key, a repository outside
+`allow`, a tampered signature, an unknown issuer.
 
 ## Two roles inside a tenant
 
@@ -708,13 +752,15 @@ allocation, machines fetching the code themselves into isolated checkouts, real
 commands with their output streamed back live, artifacts returned as bytes, release,
 reclaim after a caller walks away, per-tenant policy, credit budgets, the model call —
 the tenant's whole folder weighed in one pass — `cm policy-test`, `cm upload-policy` with
-two roles inside a tenant, and a library seam for controllers whose callers live somewhere
-other than a folder. Verified against a real 1,900-test
+two roles inside a tenant, a library seam for controllers whose callers live somewhere other
+than a folder, and attestation for callers with nothing to enrol. Verified against a real
+1,900-test
 Playwright suite, sharded across a fleet and merged into one report.
 
-Next: the credential story — OIDC on CI, `cm auth login` for a laptop, and the two scoped
-credentials from [docs/design/auth.md](docs/design/auth.md), so an upload does not need a paired device.
-And caching the install step, which is now the slowest thing in a run.
+Next: `cm auth login` — the device-flow enrolment that lets a laptop join a service it has
+no invite for — and DNS discovery of a controller's handshake key, so a CI job needs a name
+rather than a key and an address. And caching the install step, which is now the slowest
+thing in a run.
 
 ## License
 

@@ -380,9 +380,20 @@ pub struct Artifact {
     pub base64: String,
 }
 
-/// The first line a tester sends: the ticket its own sirji issued.
+/// The first line a tester sends: proof of who it is.
+///
+/// Two kinds, because there are two kinds of caller. Anything durable holds a keypair its
+/// organisation enrolled once and presents a **ticket**. A cloud CI runner has nothing to
+/// enrol, so it presents an **attestation** — a token from an issuer the controller was
+/// configured to believe, minted with this connection's own key as its audience.
+///
+/// One or the other, never both: two answers to "who is this" is a question about which to
+/// trust, and there is no good way to answer it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Knock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<sirji::Ticket>,
+    /// A JWT from a configured issuer. See `attest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
 }

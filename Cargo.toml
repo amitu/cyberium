@@ -17,6 +17,10 @@ rust-version = "1.97.1"   # what we build and test with; see rust-toolchain.toml
 sirji = { git = "https://github.com/amitu/sirji" }
 
 anyhow = "1"
+# Already in the tree beneath rustls. Named directly because verifying somebody else's
+# OIDC token is cm's own business, and it is the one place cm touches signatures it did
+# not make with sirji's keys.
+ring = "0.17"
 # Already in the tree beneath iroh. Named directly because the directory seam is a
 # public trait that other people implement, and hand-rolled boxed futures are a poor
 # thing to ask of somebody writing their first custom controller.

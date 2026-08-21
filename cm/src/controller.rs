@@ -3,6 +3,7 @@
 //! Public because a deployment with its own identity service builds its own binary
 //! around this rather than reimplementing the protocol.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -12,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::fleet::{Fleet, Shortfall, Worker};
 use crate::proto::{Aadesh, Answer, Knock, Nivedana, Plea, Register, Verdict, WorkerHandle};
 use crate::directory::{self, Directory};
-use crate::{admin, adviser, budget, fleet, proto, tenant};
+use crate::{admin, adviser, attest, budget, fleet, proto, tenant};
 use crate::{Config, home, keys, listening, load_config, quiet, read_line, write_line};
 use sirji::id52;
 
@@ -35,6 +36,10 @@ pub struct Control {
     /// service and the wrong one for a company that has groups, sub-groups and feature
     /// flags in a system of its own.
     pub directory: Box<dyn directory::Directory>,
+    /// Whose word this controller accepts besides its own sirji's. Read at startup and
+    /// not re-read: this decides who counts as proven, and a list that reloads itself is
+    /// a list a stray file write can extend.
+    pub issuers: attest::Issuers,
     /// Who may look at and change how this controller runs. Read at startup and not
     /// re-read: adding an admin is rare, deliberate, and worth a restart, and a list
     /// that reloads itself is a list a stray file write can extend.
@@ -87,6 +92,11 @@ pub async fn run(directory: Box<dyn Directory>) -> Result<()> {
         Err(e) => println!("cannot list tenants yet: {e:#}"),
     }
 
+    // Read at startup: both of these decide who is believed, and neither should be
+    // extendable by a file appearing on disk while the controller runs.
+    let issuers = attest::Issuers::load(&config.root)?;
+    println!("attestations accepted from: {}", issuers.describe());
+
     let admins = admin::Admins::load(&config.root)?;
     if admins.list.is_empty() {
         println!(
@@ -114,6 +124,7 @@ pub async fn run(directory: Box<dyn Directory>) -> Result<()> {
         fleet: Mutex::new(Fleet::default()),
         config: config.clone(),
         directory,
+        issuers,
         admins,
         adviser,
         orders: Mutex::new(Default::default()),
@@ -124,6 +135,12 @@ pub async fn run(directory: Box<dyn Directory>) -> Result<()> {
     });
 
     let hints = listening(&endpoint).await;
+    // Printed, because a caller proving itself by attestation has no parent to ask where
+    // this is. It dials the key directly, so somebody has to be able to read the address
+    // off a log and put it in a CI variable.
+    if !hints.is_empty() {
+        println!("reachable at: {}", hints.join(", "));
+    }
     tokio::spawn({
         let config = config.clone();
         let home = home.clone();
@@ -196,6 +213,10 @@ impl Control {
     async fn entitlement(
         &self,
         alias: &str,
+        // What an issuer vouched for about this caller, if one did. Merged with what the
+        // deployment attests, because from a policy's side they are the same kind of
+        // thing: facts nobody asking could have made up.
+        vouched: &BTreeMap<String, String>,
         nivedana: &Nivedana,
     ) -> Result<Entitled> {
         // Everything the decision needs, gathered before anything slow happens — and
@@ -274,7 +295,15 @@ impl Control {
             attested: adviser::Attested {
                 tenant: tenant_name.clone(),
                 caller: alias.to_string(),
-                facts: who.facts.clone(),
+                facts: {
+                    let mut facts = who.facts.clone();
+                    // The deployment's own word wins a collision: it knows this caller,
+                    // and an issuer's claim about a `plan` is a claim about a repository.
+                    for (k, v) in vouched {
+                        facts.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    facts
+                },
             },
             declared: adviser::Declared {
                 said: nivedana.said.clone(),
@@ -547,7 +576,7 @@ pub async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<(
     let knock: Knock = serde_json::from_str(line.trim())
         .map_err(|e| anyhow::anyhow!("unreadable opening line: {e}"))?;
 
-    let who = match admit(&control, &knock, &caller_key) {
+    let who = match admit(&control, &knock, &caller_key).await {
         Ok(who) => who,
         Err(rationale) => {
             write_line(&mut send, &Answer::Decided(Verdict::Deny { rationale })).await?;
@@ -579,8 +608,10 @@ pub async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<(
                     rationale: "not an admin of this controller — see `cm admin add`".into(),
                 }),
             },
-            Plea::Nivedana(nivedana) => decide(&control, &alias, &caller, &nivedana).await,
-            Plea::Rehearse(nivedana) => rehearse(&control, &alias, &nivedana).await,
+            Plea::Nivedana(nivedana) => {
+                decide(&control, &alias, &caller, &who.attested, &nivedana).await
+            }
+            Plea::Rehearse(nivedana) => rehearse(&control, &alias, &who.attested, &nivedana).await,
             Plea::Upload(up) => Ok(control.accept_policy(&alias, &up).await),
             Plea::Release { reservation } => {
                 let closed = control.fleet.lock().await.release(&reservation, &caller);
@@ -628,23 +659,54 @@ pub async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<(
 ///
 /// The ticket is the only source: we hold no `network.toml` and have never heard of
 /// the caller. Verifying our parent's signature is the whole of it.
-fn admit(control: &Control, knock: &Knock, caller: &sirji::PublicKey) -> Result<Caller, String> {
-    let Some(ticket) = &knock.ticket else {
-        return Err("no ticket — resolve me as `name@org`".into());
-    };
-    if let Err(e) = ticket.verify(caller, &control.config.parent) {
-        return Err(format!("{e:#}"));
+async fn admit(
+    control: &Control,
+    knock: &Knock,
+    caller: &sirji::PublicKey,
+) -> Result<Caller, String> {
+    let key = id52::encode(caller);
+
+    // A ticket first, because it is the cheaper check and the common one: one signature,
+    // no network, nothing cached. An attestation is for callers that had nothing to enrol.
+    if let Some(ticket) = &knock.ticket {
+        if let Err(e) = ticket.verify(caller, &control.config.parent) {
+            return Err(format!("{e:#}"));
+        }
+        if ticket.name != control.config.name {
+            return Err(format!("that ticket is for `{}`", ticket.name));
+        }
+        return Ok(Caller::from(ticket.alias.clone()).with_admin(&control.admins, &key));
     }
-    if ticket.name != control.config.name {
-        return Err(format!("that ticket is for `{}`", ticket.name));
+
+    if let Some(token) = &knock.attestation {
+        if control.issuers.is_empty() {
+            return Err(format!(
+                "this controller trusts no issuers, so an attestation proves nothing here \
+                 — the host lists them in {}",
+                attest::FILE
+            ));
+        }
+        // The caller's own connection key is the audience the token must name. Everything
+        // about replay protection is that comparison, and it happens inside `verify`.
+        return match control.issuers.verify(token, &key).await {
+            // Never an admin. Admin membership is by key, from a list the host wrote by
+            // hand, and an attested caller's key is one it minted for this run.
+            Ok(vouched) => Ok(Caller::attested(vouched.alias, vouched.facts)),
+            Err(e) => Err(format!("{e:#}")),
+        };
     }
-    Ok(Caller::from(ticket.alias.clone()).with_admin(&control.admins, &id52::encode(caller)))
+
+    Err("no proof of who you are — resolve me as `name@org`, or send an attestation".into())
 }
 
 /// Who is on the other end, and what class of thing they are.
 pub struct Caller {
     /// For display and for policy. Peers have a name; a sibling device does not.
     alias: String,
+    /// What an issuer vouched for, when one did: the repository, the ref, the workflow.
+    /// Proven, so it joins the deployment's own facts in the prompt's attested half —
+    /// and a policy may turn on it, because the caller could not have said it.
+    attested: BTreeMap<String, String>,
     /// A device of our **own** sirji rather than somebody else's peer.
     sibling: bool,
     /// On the admin list. Strictly narrower than `sibling`: a worker is a sibling
@@ -668,9 +730,24 @@ impl Caller {
     /// this file is there to catch.
     fn from(alias: Option<String>) -> Self {
         match alias {
-            Some(alias) => Self { alias, sibling: false, admin: None },
-            None => Self { alias: "an unnamed peer".into(), sibling: true, admin: None },
+            Some(alias) => {
+                Self { alias, sibling: false, admin: None, attested: BTreeMap::new() }
+            }
+            None => Self {
+                alias: "an unnamed peer".into(),
+                sibling: true,
+                admin: None,
+                attested: BTreeMap::new(),
+            },
         }
+    }
+
+    /// Vouched for by an issuer rather than by our own sirji.
+    ///
+    /// Never a sibling and never an admin: those are decided by key, against lists the
+    /// host wrote by hand, and this caller's key is one it minted for a single run.
+    fn attested(alias: String, facts: BTreeMap<String, String>) -> Self {
+        Self { alias, sibling: false, admin: None, attested: facts }
     }
 
     /// Admin membership is decided by **key**, against a list the host wrote by
@@ -871,10 +948,15 @@ pub fn sanity(said: u32, bounded: u32, limit: Limit) -> (u32, Vec<String>) {
 /// selection through `choose` — and stops before the commit. Sharing `choose` rather
 /// than estimating is the whole point: an approximation would eventually disagree
 /// with the real path, and be believed.
-pub async fn rehearse(control: &Control, alias: &str, nivedana: &Nivedana) -> Result<Verdict> {
+pub async fn rehearse(
+    control: &Control,
+    alias: &str,
+    vouched: &BTreeMap<String, String>,
+    nivedana: &Nivedana,
+) -> Result<Verdict> {
     // `?` on the outer result: a plea nobody could weigh leaves as an error and never
     // becomes a verdict. The inner one is a real decision, so it is returned as one.
-    let (allowed, rationale) = match control.entitlement(alias, nivedana).await? {
+    let (allowed, rationale) = match control.entitlement(alias, vouched, nivedana).await? {
         Ok(pair) => pair,
         Err(refusal) => return Ok(refusal),
     };
@@ -909,11 +991,12 @@ pub async fn decide(
     control: &Control,
     alias: &str,
     caller: &str,
+    vouched: &BTreeMap<String, String>,
     nivedana: &Nivedana,
 ) -> Result<Verdict> {
     // `?` on the outer result: a plea nobody could weigh leaves as an error and never
     // becomes a verdict. The inner one is a real decision, so it is returned as one.
-    let (allowed, rationale) = match control.entitlement(alias, nivedana).await? {
+    let (allowed, rationale) = match control.entitlement(alias, vouched, nivedana).await? {
         Ok(pair) => pair,
         Err(refusal) => return Ok(refusal),
     };
@@ -1115,6 +1198,32 @@ mod tests {
             sanity(6, 6, Limit { ceiling: 10, free: 8, host: 10, affordable: None });
         assert_eq!(allowed, 6);
         assert!(faults.is_empty(), "{faults:?}");
+    }
+
+    #[test]
+    fn an_attested_caller_is_never_a_sibling_or_an_admin() {
+        // Both of those are decided by key, against lists a host wrote by hand. An
+        // attested caller's key is one it minted for a single run, so it can never be on
+        // either list — and a token that claimed otherwise must not change that.
+        let who = Caller::attested(
+            "github:acme/payments".into(),
+            [("repository".to_string(), "acme/payments".to_string())].into(),
+        );
+        assert!(!who.sibling, "an attested caller is not one of our own devices");
+        assert!(who.admin.is_none(), "and never an admin");
+        assert_eq!(who.alias, "github:acme/payments");
+        assert_eq!(who.attested.len(), 1);
+
+        // Even asked to become one, against a list that names its key.
+        let key = a_key();
+        let admins = admin::Admins { list: vec![admin::Admin {
+            name: "ops".into(),
+            key: key.clone(),
+            note: None,
+        }] };
+        let still = Caller::attested("github:acme/payments".into(), Default::default())
+            .with_admin(&admins, &key);
+        assert!(still.admin.is_none(), "attestation is not a route to admin");
     }
 
     #[test]

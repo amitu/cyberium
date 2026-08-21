@@ -1,7 +1,7 @@
 ---
 title: Your own controller
 parent: Guide
-nav_order: 12
+nav_order: 13
 ---
 
 # Your own controller

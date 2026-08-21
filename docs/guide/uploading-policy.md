@@ -1,7 +1,7 @@
 ---
 title: Shipping a policy
 parent: Guide
-nav_order: 9
+nav_order: 10
 ---
 
 # Shipping a policy

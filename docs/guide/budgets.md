@@ -1,7 +1,7 @@
 ---
 title: Budgets
 parent: Guide
-nav_order: 10
+nav_order: 11
 ---
 
 # Budgets

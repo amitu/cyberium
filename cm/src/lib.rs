@@ -27,6 +27,7 @@
 //! fleet lives in exactly one place.
 
 pub mod admin;
+pub mod attest;
 pub mod adviser;
 pub mod budget;
 pub mod fleet;
