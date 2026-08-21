@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::fleet::{Fleet, Shortfall, Worker};
 use crate::proto::{Aadesh, Answer, Knock, Nivedana, Plea, Register, Verdict, WorkerHandle};
 use crate::directory::{self, Directory};
-use crate::{admin, adviser, attest, budget, fleet, proto, tenant};
+use crate::{admin, adviser, attest, budget, enrolled, fleet, proto, tenant};
 use crate::{Config, home, keys, listening, load_config, quiet, read_line, write_line};
 use sirji::id52;
 
@@ -40,6 +40,10 @@ pub struct Control {
     /// not re-read: this decides who counts as proven, and a list that reloads itself is
     /// a list a stray file write can extend.
     pub issuers: attest::Issuers,
+    /// Keys this controller has agreed to remember. Behind a lock because it is written
+    /// while running — unlike the two lists above, which say who is *trusted* and are read
+    /// once, this is a consequence of trust already granted.
+    pub enrolled: Mutex<enrolled::Keys>,
     /// Who may look at and change how this controller runs. Read at startup and not
     /// re-read: adding an admin is rare, deliberate, and worth a restart, and a list
     /// that reloads itself is a list a stray file write can extend.
@@ -97,6 +101,11 @@ pub async fn run(directory: Box<dyn Directory>) -> Result<()> {
     let issuers = attest::Issuers::load(&config.root)?;
     println!("attestations accepted from: {}", issuers.describe());
 
+    let remembered = enrolled::Keys::load(&config.root)?;
+    if !remembered.is_empty() {
+        println!("{} enrolled key(s)", remembered.len());
+    }
+
     let admins = admin::Admins::load(&config.root)?;
     if admins.list.is_empty() {
         println!(
@@ -125,6 +134,7 @@ pub async fn run(directory: Box<dyn Directory>) -> Result<()> {
         config: config.clone(),
         directory,
         issuers,
+        enrolled: Mutex::new(remembered),
         admins,
         adviser,
         orders: Mutex::new(Default::default()),
@@ -398,6 +408,89 @@ impl Control {
     }
 
 
+    /// Remember the key this arrived on.
+    ///
+    /// Only from a connection that proved itself with an attestation, and only from an
+    /// issuer the host marked `enrol = true`. Both matter: the first means the key being
+    /// remembered is the key the token named, so nobody can enrol somebody else's; the
+    /// second means a build token cannot leave a permanent key behind.
+    async fn enrol(
+        &self,
+        alias: &str,
+        key: &str,
+        knock: &Knock,
+        note: Option<&str>,
+    ) -> Verdict {
+        // Already remembered, or arrived on a ticket: either way there is no token here to
+        // check, and enrolling on the strength of a connection alone would let anything
+        // that could dial us stay forever.
+        let Some(token) = &knock.attestation else {
+            return Verdict::Deny {
+                rationale: "enrolling needs an attestation on this same connection, so the \
+                            key remembered is the key a token named"
+                    .into(),
+            };
+        };
+        let vouched = match self.issuers.verify(token, key).await {
+            Ok(vouched) => vouched,
+            Err(e) => return Verdict::Deny { rationale: format!("{e:#}") },
+        };
+        if !vouched.may_enrol {
+            return Verdict::Deny {
+                rationale: format!(
+                    "tokens from this issuer prove who is asking but may not enrol a key — \
+                     it proves a job rather than a machine. The host decides, with \
+                     `enrol = true` in {}",
+                    attest::FILE
+                ),
+            };
+        }
+
+        let entry = enrolled::Enrolled {
+            key: key.to_string(),
+            alias: vouched.alias.clone(),
+            issuer: vouched.facts.get("issuer").cloned().unwrap_or_default(),
+            at: fleet::now(),
+            note: note.map(str::to_string),
+        };
+        match self.enrolled.lock().await.remember(entry) {
+            Ok(()) => {
+                println!("enrolled {key} as {} (asked by {alias})", vouched.alias);
+                Verdict::Ok
+            }
+            Err(e) => {
+                eprintln!("could not record an enrolment for {}: {e:#}", vouched.alias);
+                Verdict::Deny { rationale: format!("could not record it: {e}") }
+            }
+        }
+    }
+
+    /// Stop remembering a key.
+    ///
+    /// Yours by default, or another of your *own* aliases' keys — one person with three
+    /// laptops should be able to revoke the one on the train from either of the others,
+    /// and should not be able to revoke anybody else's.
+    async fn forget(&self, alias: &str, mine: &str, which: Option<&str>) -> Verdict {
+        let target = which.unwrap_or(mine);
+        let mut held = self.enrolled.lock().await;
+        match held.who(target).map(|e| e.alias.clone()) {
+            Some(owner) if owner != alias => Verdict::Deny {
+                rationale: "that key is not yours to forget".into(),
+            },
+            None => Verdict::Deny {
+                rationale: format!("this controller does not remember {target}"),
+            },
+            Some(_) => match held.forget(target) {
+                Ok(Some(gone)) => {
+                    println!("forgot {} ({})", gone.key, gone.alias);
+                    Verdict::Ok
+                }
+                Ok(None) => Verdict::Deny { rationale: "nothing to forget".into() },
+                Err(e) => Verdict::Deny { rationale: format!("could not record it: {e}") },
+            },
+        }
+    }
+
     /// Take a policy folder from one of a tenant's admins.
     ///
     /// A verdict rather than an error: every outcome here is a decision about the
@@ -622,6 +715,34 @@ pub async fn serve(incoming: sirji::Incoming, control: Arc<Control>) -> Result<(
             }
             Plea::Rehearse(nivedana) => rehearse(&control, &alias, &who.attested, &nivedana).await,
             Plea::Upload(up) => Ok(control.accept_policy(&alias, &up).await),
+            Plea::Enrol { note } => {
+                Ok(control.enrol(&alias, &caller, &knock, note.as_deref()).await)
+            }
+            Plea::Forget { key } => Ok(control.forget(&alias, &caller, key.as_deref()).await),
+            Plea::Whoami => {
+                let mut lines = vec![format!("you are {alias}")];
+                if !who.attested.is_empty() {
+                    for (k, v) in &who.attested {
+                        lines.push(format!("  {k}: {v}"));
+                    }
+                }
+                let held = control.enrolled.lock().await;
+                let mine = held.held_by(&alias);
+                if mine.is_empty() {
+                    lines.push("no enrolled keys — this connection proved itself another way".into());
+                } else {
+                    for e in mine {
+                        let mark = if e.key == caller { " (this one)" } else { "" };
+                        lines.push(format!(
+                            "  {} via {}{mark}{}",
+                            e.key,
+                            e.issuer,
+                            e.note.as_deref().map(|n| format!(" — {n}")).unwrap_or_default()
+                        ));
+                    }
+                }
+                Ok(Verdict::Saw(proto::Sight { lines }))
+            }
             Plea::Release { reservation } => {
                 let closed = control.fleet.lock().await.release(&reservation, &caller);
                 match closed {
@@ -687,6 +808,16 @@ async fn admit(
         return Ok(Caller::from(ticket.alias.clone()).with_admin(&control.admins, &key));
     }
 
+    // A key we already agreed to remember. No token, no expiry, nothing to refresh: the
+    // connection is the credential, because dialling from a key is possession of it. This
+    // is checked before the attestation path so an enrolled machine never pays for a
+    // browser round trip it does not need.
+    if knock.ticket.is_none()
+        && let Some(known) = control.enrolled.lock().await.who(&key)
+    {
+        return Ok(Caller::enrolled(known.alias.clone(), known.issuer.clone()));
+    }
+
     if let Some(token) = &knock.attestation {
         if control.issuers.is_empty() {
             return Err(format!(
@@ -748,6 +879,20 @@ impl Caller {
                 admin: None,
                 attested: BTreeMap::new(),
             },
+        }
+    }
+
+    /// A key this controller agreed to remember, proving itself by having dialled.
+    ///
+    /// Never a sibling and never an admin, for the same reason an attested caller is not:
+    /// those are decided against lists a host wrote by hand, and this key arrived by
+    /// somebody proving an identity rather than by an operator typing it.
+    fn enrolled(alias: String, issuer: String) -> Self {
+        Self {
+            alias,
+            sibling: false,
+            admin: None,
+            attested: [("issuer".to_string(), issuer)].into(),
         }
     }
 

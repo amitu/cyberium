@@ -433,7 +433,8 @@ The tenant is chosen by **the verified alias in the caller's ticket** — minted
 controller's own sirji, not asserted by the caller — so this needed no accounts and
 no new credential. Adding a tenant or editing a policy needs no restart.
 
-What is not built: `cm auth login`.
+What is not built: the device flow behind `cm auth login` — the enrolment it performs works,
+but the token still comes from a hook rather than a browser.
 Three design notes carry those, each opening with what does and does not exist:
 [docs/design/policy.md](docs/design/policy.md),
 [docs/design/budget.md](docs/design/budget.md) and
@@ -579,6 +580,24 @@ can check.
 `scripts/attest.sh` runs all of it locally against a real RSA key and a real JWKS endpoint,
 including every way a token is refused: minted for somebody else's key, a repository outside
 `allow`, a tampered signature, an unknown issuer.
+
+### A laptop enrols once
+
+A laptop is not ephemeral, so it proves itself once and leaves a key behind:
+
+```sh
+$ cm auth login --at cm.acme.com --note "dana's laptop"
+enrolled. `cm t cm.acme.com` needs no token from now on
+```
+
+**After that there is no session** — no token, no expiry, no refresh, nothing to rotate and
+nothing to leak. A later request is authenticated by the connection it arrives on, because
+dialling from a key is possession of it. Revoking is the service forgetting the key, which
+is the only kind of revocation that is instant and cannot be replayed around.
+
+One fresh key per service, so no two fleets can discover they are talking to the same
+laptop. And a build token cannot enrol: an issuer must say `enrol = true`, because a CI
+token proves a *repository* and a repository is not a machine.
 
 ## Two roles inside a tenant
 
@@ -763,8 +782,9 @@ than a folder, and attestation for callers with nothing to enrol. Verified again
 1,900-test
 Playwright suite, sharded across a fleet and merged into one report.
 
-Next: `cm auth login` — the device-flow enrolment that lets a laptop join a service it has
-no invite for. And caching the install step, which is now the slowest thing in a run.
+Next: the RFC 8628 device flow, so `cm auth login` opens a browser by itself rather than
+taking a token from a hook. And caching the install step, which is now the slowest thing in
+a run.
 
 ## License
 

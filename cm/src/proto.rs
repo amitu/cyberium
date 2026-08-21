@@ -29,6 +29,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ask", rename_all = "kebab-case")]
 pub enum Plea {
+    /// Remember the key this arrived on, so it never needs a token again.
+    ///
+    /// Sent once, on a connection whose `Knock` carried an attestation — which is what
+    /// makes it safe: the token's audience is this key, so nothing here can enrol a key
+    /// somebody else holds.
+    Enrol {
+        /// What the caller calls this machine. Advisory, never trusted, and stored only so
+        /// an operator reading the list later has something human to go on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// Stop remembering a key. The caller's own, or another of the same alias's.
+    Forget {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+    /// What this controller remembers about the caller.
+    Whoami,
     /// Replace everything this tenant has written down.
     ///
     /// Only for a tenant admin, checked against `tenant.toml` — which the host owns, and

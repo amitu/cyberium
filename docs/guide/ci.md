@@ -174,11 +174,102 @@ the answer.
 A bare word that is none of the three forms is refused with all three named, rather than
 failing later on a decode error.
 
+## A laptop, rather than a runner
+
+A laptop is not ephemeral, and making it fetch a token before every test run would mean a
+browser round trip nobody would tolerate for long. So it proves itself **once** and leaves a
+key behind:
+
+```sh
+$ cm auth login --at cm.acme.com --note "dana's laptop"
+cm.acme.com publishes 3p52slsq290ah11lke9het48m85t3tus7rd38ah93p9q3s2g5r60
+minted 3h8rvpc7v29i3k87vorkg4htnf7d5ijummbg3i50c4crdvp3ivrg for cm.acme.com
+enrolled. `cm t cm.acme.com` needs no token from now on
+
+$ cm t cm.acme.com --plea nightly --count 2 --need linux
+enrolled with cm.acme.com as 3h8rvpc7v29i3k87vorkg4htnf7d5ijummbg3i50c4crdvp3ivrg
+granted 2 machine(s) as r1
+```
+
+**After enrolling there is no session.** No token, no expiry, no refresh, nothing to
+rotate and nothing to leak — a later request is authenticated by the connection it arrives
+on, because dialling from a key is possession of it.
+
+```sh
+$ cm auth status
+cm.acme.com
+  key 3h8rvpc7v29i3k87vorkg4htnf7d5ijummbg3i50c4crdvp3ivrg
+  you are okta:dana@acme.com
+    3h8rvpc7v29i3k87… via okta (this one) — dana's laptop
+```
+
+"As whom" is *asked*, not remembered. Only the service knows whether a key is still
+trusted, and printing a stale answer would be worse than printing none. A service that is
+merely unreachable says so, rather than reporting you as not enrolled.
+
+### A fresh key per service
+
+One keypair per service, and nowhere else — the same rule the substrate follows for peers,
+where sirji mints a key per relationship so no two peers can correlate you. One key
+everywhere would let two unrelated fleets discover they are talking to the same laptop.
+
+The secret lives in the keystore with every other secret this machine holds; a second place
+to keep private keys is a second place to get it wrong.
+
+### Revoking is forgetting
+
+```sh
+$ cm auth logout --at cm.acme.com
+cm.acme.com has forgotten this key
+forgotten locally too
+```
+
+The service is asked **first**, then the local copy is deleted. That order matters: a key
+deleted here but still remembered there is a credential nobody can revoke, because the only
+thing that could ask has thrown away the means to. If the service cannot be reached the key
+is left in place and you are told which key an operator would need to remove.
+
+From the other side, an operator revokes by removing a line from `enrolled.toml`. That is
+the only kind of revocation that is instant and cannot be replayed around — there is no
+token still valid for another hour.
+
+### A build token cannot enrol
+
+```
+$ CM_ATTEST_CMD='…github token…' cm auth login --at cm.acme.com
+refused: tokens from this issuer prove who is asking but may not enrol a key —
+         it proves a job rather than a machine
+```
+
+An issuer must say `enrol = true`, and the default is off. A CI token proves a
+**repository**, and a repository is not a machine: letting build tokens enrol would put one
+permanent key per project in `enrolled.toml`, which is the thing attestation exists to
+avoid.
+
+So a host typically names two issuers — the CI platform, for jobs, and an identity provider,
+for people:
+
+```toml
+[[issuer]]
+name = "okta"
+url = "https://acme.okta.com"
+jwks = "https://acme.okta.com/oauth2/v1/keys"
+subject = "email"
+allow = ["*@acme.com"]
+enrol = true
+```
+
+{: .note }
+**Not built:** the RFC 8628 device flow that would make `cm auth login` open a browser by
+itself. Today the token comes from the same `CM_ATTEST_CMD` hook, so anything that can print
+one for `{audience}` works. The enrolment it performs, and everything above, is built.
+
 ## What an attested caller cannot do
 
-**Be an admin.** Admin membership is by key, from a list a host wrote by hand, and this
-caller's key was minted for one run. No claim in a token changes that, and there is a test
-for it.
+**Be an admin.** Admin membership is by key, from a list a host wrote by hand. An attested
+caller's key was minted for one run, and an enrolled caller's arrived by somebody proving an
+identity rather than by an operator typing it. No claim in a token changes either, and there
+are tests for both.
 
 **Be a sibling.** Attestation makes you a known caller, not one of the organisation's own
 devices.

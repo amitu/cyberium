@@ -24,7 +24,7 @@ use cyberium::proto::{
     Verdict, WorkerHandle,
 };
 use cyberium::{
-    Config, Published, WELL_KNOWN, admin, b64_decode, b64_encode, config_path, controller, describe, home, keys,
+    Config, Published, WELL_KNOWN, admin, services, b64_decode, b64_encode, config_path, controller, describe, home, keys,
     listening, load_config, policytest, proto, quiet, read_line, tenant, upload, write_line,
 };
 use sirji::id52;
@@ -116,6 +116,17 @@ cm — cost-aware allocation of test machines
         and passes them on; what each is worth is written in your own policy.
         CM_SAY='plea=nightly,incident=INC-1' does the same from a CI job.
 
+  cm auth login --at <host> [--note <text>]
+  cm auth status
+  cm auth logout --at <host>
+        prove who you are to a service once, and leave a key behind. After that
+        there is no session: no token, no expiry, nothing to refresh, because the
+        connection is the credential. Revoking is the service forgetting the key.
+        A fresh key per service, so no two services can correlate this machine.
+        For a laptop with an account somewhere rather than a sirji invite; a CI
+        runner should not enrol, and an issuer must say `enrol = true` before its
+        tokens can.
+
   cm policy-test [<dir>] [--repeat N] [--only <substring>]
         run the cases in <dir>/policy-tests/ against <dir>'s own rules. No
         controller and no fleet: this belongs in the repository the policy lives
@@ -168,6 +179,15 @@ fn main() -> Result<std::process::ExitCode> {
         // somebody justify one would be a small daily absurdity.
         // `policy-test`, not `test-policy`: it is a sister of `cm test`, and reading the
         // pair aloud is how anybody remembers which is which.
+        ["auth", "login", rest @ ..] => {
+            let at = flag(rest, "--at").ok_or_else(|| anyhow::anyhow!("--at <host> is required"))?;
+            rt()?.block_on(auth_login(at, flag(rest, "--note")))
+        }
+        ["auth", "status"] => rt()?.block_on(auth_status()),
+        ["auth", "logout", rest @ ..] => {
+            let at = flag(rest, "--at").ok_or_else(|| anyhow::anyhow!("--at <host> is required"))?;
+            rt()?.block_on(auth_logout(at))
+        }
         ["policy-test", rest @ ..] => rt()?.block_on(policy_test(rest)),
         ["upload-policy", target, rest @ ..] => rt()?.block_on(upload_policy(
             target,
@@ -186,6 +206,11 @@ fn main() -> Result<std::process::ExitCode> {
             bail!("unrecognised command: {}", args.join(" "));
         }
     }
+}
+
+/// The value after a flag, for the handful of commands too small to want a parser.
+fn flag<'a>(args: &'a [&'a str], name: &str) -> Option<&'a str> {
+    args.iter().position(|a| *a == name).and_then(|i| args.get(i + 1)).copied()
 }
 
 fn rt() -> Result<tokio::runtime::Runtime> {
@@ -1705,15 +1730,189 @@ pub const ATTEST_ENV: &str = "CM_ATTEST";
 pub const MINT_ENV: &str = "CM_ATTEST_CMD";
 pub const HINTS_ENV: &str = "CM_CONTROLLER_HINTS";
 
-/// The attested way: nothing enrolled, and nothing left behind.
+// ---------------------------------------------------------------------------
+// enrolling with a service
+// ---------------------------------------------------------------------------
+
+/// `cm auth login --at <host> [--note <text>]`
 ///
-/// A key minted for this run, a token whose audience *is* that key, and a direct dial. No
-/// `cm init`, no parent, no entry in anybody's roster — which is the point, because a
-/// runner that enrolled would leave one dead entry per build.
+/// Prove who you are once, and leave a key behind. After this there is no token, no
+/// expiry and nothing to refresh: the connection is the credential, and revoking it is the
+/// service forgetting the key.
+async fn auth_login(at: &str, note: Option<&str>) -> Result<std::process::ExitCode> {
+    let home = home()?;
+    let found = discover(at).await?;
+    println!("{at} publishes {}", found.key);
+
+    // A fresh key for this service and nowhere else — the same rule the substrate follows
+    // for peers. Kept in the keystore, because a second place to store private keys is a
+    // second place to get it wrong.
+    let store = keys(&home);
+    let public = store.generate()?;
+    let mine = id52::encode(&public);
+    println!("minted {mine} for {at}");
+
+    // The proof, with this key as the audience. Same machinery a CI runner uses; what
+    // differs is that a person is behind it and the service will remember the key.
+    let token = token_for(&mine).await?;
+
+    let secret = store.secret(&public)?;
+    let endpoint = sirji::endpoint::bind_dialer(secret).await?;
+    let conn = dial_any(&endpoint, id52::decode(&found.key)?, &found.hints).await?;
+    let (mut send, recv) = conn.open_bi().await?;
+    let mut recv = BufReader::new(recv);
+
+    write_line(&mut send, &Knock { ticket: None, attestation: Some(token) }).await?;
+    write_line(&mut send, &Plea::Enrol { note: note.map(str::to_string) }).await?;
+
+    let outcome = match read_line::<Answer>(&mut recv).await? {
+        Some(Answer::Decided(Verdict::Ok)) => {
+            let mut book = services::Services::load(&home)?;
+            book.remember(services::Service {
+                at: at.to_string(),
+                key: mine.clone(),
+                as_whom: None,
+                at_time: cyberium::fleet::now(),
+            })?;
+            println!("enrolled. `cm t {at}` needs no token from now on");
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Some(Answer::Decided(Verdict::Deny { rationale })) => {
+            eprintln!("refused: {rationale}");
+            Ok(std::process::ExitCode::FAILURE)
+        }
+        Some(Answer::Fault { fault }) => bail!("the controller faulted: {fault}"),
+        other => bail!("unexpected answer: {other:?}"),
+    };
+
+    let _ = send.finish();
+    conn.close(0u32.into(), b"done");
+    endpoint.close().await;
+    outcome
+}
+
+/// `cm auth status` — what this machine is enrolled with, and as whom.
 ///
-/// The order matters and is the whole security property: **the key exists before the token
-/// is asked for**, because the audience has to be the key. A token fetched first could only
-/// be a bearer token, and a bearer token in a build log is a credential anybody can replay.
+/// The "as whom" is asked rather than remembered, because only the service knows: a key we
+/// hold says nothing about whether it is still trusted, and printing a stale answer would
+/// be worse than printing none.
+async fn auth_status() -> Result<std::process::ExitCode> {
+    let home = home()?;
+    let book = services::Services::load(&home)?;
+    if book.all().is_empty() {
+        println!("enrolled with nothing. `cm auth login --at <host>`");
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    for service in book.all() {
+        println!("{}", service.at);
+        println!("  key {}", service.key);
+        match ask_whoami(&home, service).await {
+            Ok(lines) => {
+                for line in lines {
+                    println!("  {line}");
+                }
+            }
+            // Not fatal, and worth distinguishing: a key that is no longer trusted and a
+            // service that is merely unreachable look the same from here, so say which
+            // this was rather than reporting "not enrolled".
+            Err(e) => println!("  could not ask: {e}"),
+        }
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+async fn ask_whoami(home: &std::path::Path, service: &services::Service) -> Result<Vec<String>> {
+    let found = discover(&service.at).await?;
+    let secret = keys(home).secret(&id52::decode(&service.key)?)?;
+    let endpoint = sirji::endpoint::bind_dialer(secret).await?;
+    let conn = dial_any(&endpoint, id52::decode(&found.key)?, &found.hints).await?;
+    let (mut send, recv) = conn.open_bi().await?;
+    let mut recv = BufReader::new(recv);
+    write_line(&mut send, &Knock { ticket: None, attestation: None }).await?;
+    write_line(&mut send, &Plea::Whoami).await?;
+    let answer = read_line::<Answer>(&mut recv).await?;
+    let _ = send.finish();
+    conn.close(0u32.into(), b"done");
+    endpoint.close().await;
+    match answer {
+        Some(Answer::Decided(Verdict::Saw(sight))) => Ok(sight.lines),
+        Some(Answer::Decided(Verdict::Deny { rationale })) => Ok(vec![format!("refused: {rationale}")]),
+        other => bail!("unexpected answer: {other:?}"),
+    }
+}
+
+/// `cm auth logout --at <host>`
+///
+/// Asks the service to forget the key, *then* deletes it locally. That order matters: a
+/// key deleted here but still remembered there is a credential nobody can revoke, because
+/// the only thing that could ask has thrown away the means to.
+async fn auth_logout(at: &str) -> Result<std::process::ExitCode> {
+    let home = home()?;
+    let mut book = services::Services::load(&home)?;
+    let Some(service) = book.key_for(at).cloned() else {
+        println!("not enrolled with {at}");
+        return Ok(std::process::ExitCode::SUCCESS);
+    };
+
+    let told = async {
+        let found = discover(at).await?;
+        let secret = keys(&home).secret(&id52::decode(&service.key)?)?;
+        let endpoint = sirji::endpoint::bind_dialer(secret).await?;
+        let conn = dial_any(&endpoint, id52::decode(&found.key)?, &found.hints).await?;
+        let (mut send, recv) = conn.open_bi().await?;
+        let mut recv = BufReader::new(recv);
+        write_line(&mut send, &Knock { ticket: None, attestation: None }).await?;
+        write_line(&mut send, &Plea::Forget { key: None }).await?;
+        let answer = read_line::<Answer>(&mut recv).await?;
+        let _ = send.finish();
+        conn.close(0u32.into(), b"done");
+        endpoint.close().await;
+        anyhow::Ok(answer)
+    }
+    .await;
+
+    match told {
+        Ok(Some(Answer::Decided(Verdict::Ok))) => println!("{at} has forgotten this key"),
+        Ok(Some(Answer::Decided(Verdict::Deny { rationale }))) => {
+            eprintln!("{at} would not forget it: {rationale}");
+            // Left in place on purpose. Deleting it here would leave a key that works and
+            // that nothing on this machine can ask about again.
+            return Ok(std::process::ExitCode::FAILURE);
+        }
+        Ok(_) => eprintln!("{at} gave an odd answer; leaving the key in place"),
+        Err(e) => {
+            eprintln!("could not reach {at}: {e:#}");
+            eprintln!("  the key is still enrolled there. Try again, or have an operator");
+            eprintln!("  remove {} from {}", service.key, cyberium::enrolled::FILE);
+            return Ok(std::process::ExitCode::FAILURE);
+        }
+    }
+
+    book.forget(at)?;
+    println!("forgotten locally too");
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Dial a service this machine has already enrolled with.
+///
+/// `None` when it has not, so the caller falls back to proving itself the long way. Note
+/// what is *not* checked: whether the service still remembers the key. Only the service
+/// knows, it will say so on the next line of the conversation, and asking twice would be
+/// a round trip to learn something the next round trip tells us anyway.
+async fn enrolled_with(at: &str) -> Result<Option<(sirji::Endpoint, sirji::Connection, Knock)>> {
+    let home = home()?;
+    let book = services::Services::load(&home)?;
+    let Some(service) = book.key_for(at) else { return Ok(None) };
+
+    let found = discover(at).await?;
+    eprintln!("enrolled with {at} as {}", service.key);
+    let secret = keys(&home).secret(&id52::decode(&service.key)?)?;
+    let endpoint = sirji::endpoint::bind_dialer(secret).await?;
+    let conn = dial_any(&endpoint, id52::decode(&found.key)?, &found.hints).await?;
+    // No ticket and no attestation: the connection is the whole of it.
+    Ok(Some((endpoint, conn, Knock { ticket: None, attestation: None })))
+}
+
 /// Anything with a dot or a scheme. Deliberately loose: the alternative is refusing a
 /// perfectly good name because it did not look like one, and a wrong guess here fails
 /// immediately and legibly rather than quietly.
@@ -1753,6 +1952,15 @@ async fn discover(target: &str) -> Result<Published> {
         .with_context(|| format!("{url} did not answer with a controller document"))
 }
 
+/// The attested way: nothing enrolled, and nothing left behind.
+///
+/// A key minted for this run, a token whose audience *is* that key, and a direct dial. No
+/// `cm init`, no parent, no entry in anybody's roster — which is the point, because a
+/// runner that enrolled would leave one dead entry per build.
+///
+/// The order matters and is the whole security property: **the key exists before the token
+/// is asked for**, because the audience has to be the key. A token fetched first could only
+/// be a bearer token, and a bearer token in a build log is a credential anybody can replay.
 async fn attesting(
     target: &str,
     published: Vec<String>,
@@ -1873,9 +2081,17 @@ async fn run(session: Session) -> Result<Results> {
         // A host name means "ask it who it is", which is what a CI variable should hold:
         // a key rotates, a name does not.
         None if looks_like_a_host(&session.target) => {
-            let found = discover(&session.target).await?;
-            eprintln!("{} publishes {}", session.target, found.key);
-            attesting(&found.key, found.hints).await?
+            // Enrolled with it already? Then there is nothing to prove: the key *is* the
+            // credential, and making somebody fetch a token they do not need is how a tool
+            // earns a reputation for being slow.
+            match enrolled_with(&session.target).await? {
+                Some(ready) => ready,
+                None => {
+                    let found = discover(&session.target).await?;
+                    eprintln!("{} publishes {}", session.target, found.key);
+                    attesting(&found.key, found.hints).await?
+                }
+            }
         }
         None => bail!(
             "{:?} is none of the three ways to name a controller: `name@org` from an \

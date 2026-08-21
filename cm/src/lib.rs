@@ -34,12 +34,14 @@ pub mod fleet;
 pub mod policy;
 pub mod policytest;
 pub mod rulebook;
+pub mod services;
 pub mod proto;
 pub mod tenant;
 pub mod testing;
 pub mod upload;
 pub mod controller;
 pub mod directory;
+pub mod enrolled;
 
 use anyhow::{Context, Result};
 use sirji::id52;

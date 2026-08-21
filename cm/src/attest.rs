@@ -81,6 +81,23 @@ pub struct Issuer {
     /// `event_name`, `workflow`, `actor`. cm attaches no meaning to any of them.
     #[serde(default)]
     pub facts: Vec<String>,
+    /// May a token from here **enrol a key**, so the holder never needs another one?
+    ///
+    /// Off by default, and the default is the point. A CI token proves a repository, and a
+    /// repository is not a machine — letting build tokens enrol would grow the roster by
+    /// one permanent key per project, which is the thing attestation exists to avoid.
+    ///
+    /// Turn it on for the issuer that proves *people*: an identity provider, where the
+    /// subject is somebody who will still be here next month and whose laptop is worth
+    /// remembering.
+    #[serde(default)]
+    pub enrol: bool,
+}
+
+impl Issuer {
+    pub fn may_enrol(&self) -> bool {
+        self.enrol
+    }
 }
 
 /// What a verified attestation established.
@@ -88,6 +105,8 @@ pub struct Issuer {
 pub struct Vouched {
     /// `<issuer name>:<subject claim>`. What a tenant lists in `members`.
     pub alias: String,
+    /// Whether this issuer is one whose tokens may enrol a key.
+    pub may_enrol: bool,
     /// The claims this issuer was configured to carry through. Proven, so a policy may
     /// turn on them — and the caller cannot alter one.
     pub facts: BTreeMap<String, String>,
@@ -262,7 +281,11 @@ impl Issuers {
                 facts.insert(name.clone(), value);
             }
         }
-        Ok(Vouched { alias: format!("{}:{subject}", issuer.name), facts })
+        Ok(Vouched {
+            alias: format!("{}:{subject}", issuer.name),
+            may_enrol: issuer.may_enrol(),
+            facts,
+        })
     }
 
     /// The issuer's signing keys, fetched at most once an hour.

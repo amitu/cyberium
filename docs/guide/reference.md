@@ -24,6 +24,9 @@ disagree.
 | `cm tenant add <name>` / `cm tenant list` | onboard whoever this controller serves |
 | `cm admin add <name> <id52>` / `cm admin list` | who may look inside |
 | `cm admin fleet` / `reservations` / `spend` | look inside a running controller |
+| `cm auth login --at <host>` | prove who you are once, and leave a key behind |
+| `cm auth status` | what this machine is enrolled with, and as whom |
+| `cm auth logout --at <host>` | the service forgets the key; then so does this machine |
 | `cm policy-test [<dir>]` | run `<dir>/policy-tests/` against `<dir>`'s rules |
 | `cm upload-policy <name@org> [<dir>]` | replace what a tenant has written down |
 
@@ -123,6 +126,8 @@ cyberium attaches no meaning to any of it.
 | `$CM_HOME/config.toml` | this device: name, key, parent, root |
 | `<root>/admins.toml` | who may look inside. Host-written, by key |
 | `<root>/issuers.toml` | **host-owned**: whose attestations this controller believes |
+| `<root>/enrolled.toml` | written by the controller: keys it agreed to remember |
+| `$CM_HOME/services.toml` | this machine's side: one key per service enrolled with |
 | `<root>/tenants/<name>/tenant.toml` | **host-owned**: ceiling, members, admins, credits, `[facts]` |
 | `<root>/tenants/<name>/policy.md` | **tenant-owned**: the fenced block, and the rules |
 | `<root>/tenants/<name>/…` | anything else the tenant writes. All of it is the policy |

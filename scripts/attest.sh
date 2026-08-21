@@ -90,6 +90,16 @@ jwks = "http://127.0.0.1:$JWKS_PORT/keys.json"
 subject = "repository"
 allow = ["acme/*"]
 facts = ["ref", "event_name", "workflow"]
+
+# A second issuer, for people rather than jobs. Only this one may leave a key behind: a
+# build token proves a repository, and a repository is not a machine.
+[[issuer]]
+name = "okta"
+url = "https://people.test"
+jwks = "http://127.0.0.1:$JWKS_PORT/keys.json"
+subject = "email"
+allow = ["*@acme.com"]
+enrol = true
 EOF
 
 python3 "$HERE/fakemodel.py" $MODEL_PORT allow ask "$LAB/prompt.log" >/dev/null 2>&1 &
@@ -200,8 +210,42 @@ env -u CM_HOME -u SIRJI_HOME "$CM" test cm-c --count 1 --dry-run 2>&1 \
   | tail -1 | cut -c1-104 | sed 's/^/  /'
 set -e
 
+say "a build token may ask for machines but may not leave a key behind"
+set +e
+env -u CM_HOME -u SIRJI_HOME HOME=$LAB/laptop \
+  CM_ATTEST_CMD="$mint repository=acme/payments" \
+  "$CM" auth login --at "http://127.0.0.1:$JWKS_PORT" 2>&1 \
+  | tail -1 | cut -c1-104 | sed 's/^/  /'
+set -e
+
+say "a person's token may — one browser round trip, once"
+CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM tenant add people \
+  --ceiling 4 --member "okta:dana@acme.com" >/dev/null
+cp "$LAB/cm-c/root/tenants/ci/policy.md" "$LAB/cm-c/root/tenants/people/policy.md"
+person="ISS=https://people.test bash $HERE/mint.sh $LAB/issuer.pem {audience} email=dana@acme.com"
+laptop() { CM_HOME=$LAB/laptop SIRJI_HOME=$LAB/laptop "$@"; }
+laptop env CM_ATTEST_CMD="$person" "$CM" auth login \
+  --at "http://127.0.0.1:$JWKS_PORT" --note "dana's laptop" 2>&1 | sed 's/^/  /'
+
+say "and then nothing to prove — no token, no expiry, no refresh"
+# Note the absence of CM_ATTEST_CMD. If anything here still needed a token, this fails.
+laptop "$CM" test "http://127.0.0.1:$JWKS_PORT" --plea nightly --count 1 --need linux \
+  --dry-run 2>&1 | tail -2 | sed 's/^/  /'
+
+say "what the machine is enrolled with, and what the service says about it"
+laptop "$CM" auth status 2>&1 | sed 's/^/  /'
+
+say "logging out — the service forgets it, then this machine does"
+laptop "$CM" auth logout --at "http://127.0.0.1:$JWKS_PORT" 2>&1 | sed 's/^/  /'
+
+say "and the key stops working immediately, because revocation is forgetting"
+set +e
+laptop "$CM" test "http://127.0.0.1:$JWKS_PORT" --count 1 --need linux --dry-run 2>&1 \
+  | tail -1 | cut -c1-104 | sed 's/^/  /'
+set -e
+
 say "controller log"
-grep -E "policy (weighed|refused)|attestation|issuer|not a tenant" cm-c.log \
+grep -E "policy (weighed|refused)|attestation|issuer|not a tenant|enrolled |forgot " cm-c.log \
   | cut -c1-104 | sed 's/^/  /' || true
 
 say "done — lab in $LAB"
