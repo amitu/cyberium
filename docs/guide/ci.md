@@ -22,8 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: npm test
         env:
-          CM_CONTROLLER: ${{ vars.CM_CONTROLLER_KEY }}
-          CM_CONTROLLER_HINTS: ${{ vars.CM_CONTROLLER_HINTS }}
+          CM_CONTROLLER: cm.acme.com     # a name, not a key — see below
           CM_SAY: plea=pre-merge-check,pr=${{ github.event.number }}
 ```
 
@@ -130,25 +129,50 @@ with the first.
 
 ## Addressing the controller
 
-An attested caller has no parent to resolve through, so it dials the key directly:
+Three ways, and a CI variable should hold the second.
 
 ```sh
-cm t <controller-id52> --plea pre-merge-check --count 4 --need linux
+cm t cm-c@acme          # from an enrolled device: your own sirji resolves it
+cm t cm.acme.com        # a host that publishes which controller it runs
+cm t 04215g0sc805…      # the key itself
 ```
 
-The controller prints both at startup:
+An attested caller has no parent to resolve through, so it needs a key. Putting the key in
+a CI variable works and ages badly: **a key rotates, a name does not.** So a host can
+publish the answer, and the controller prints exactly what to publish:
 
 ```
 controller `cm-c` listening as 04215g0sc805rp6qj6cicckdtsaku7fbeaaphe65oedrfeb0a5bg
 reachable at: 10.20.2.196:59000, 127.0.0.1:59000
+publish at /.well-known/cm-controller: {"key":"04215g0sc…","hints":["10.20.2.196:59000"]}
 attestations accepted from: github (acme/*)
 ```
 
-Put the key in `CM_CONTROLLER` and, if discovery is unreliable on your network, the address
-in `CM_CONTROLLER_HINTS`. DNS-based discovery of a handshake key is designed and not built.
+Drop that one line at `https://cm.acme.com/.well-known/cm-controller` — a static file on
+anything that already serves HTTPS — and `CM_CONTROLLER=cm.acme.com` keeps working through
+a key rotation.
 
-A bare word that is neither `name@org` nor an id52 is refused with both forms named, rather
-than failing later on a decode error.
+`CM_CONTROLLER_HINTS` still overrides the published addresses, for when discovery is wrong
+and you need it to work now.
+
+### Why not DNS
+
+The design note said DNS, and this is a deliberate departure. **A TXT record is
+unauthenticated.** Anything that tells a caller *which key to trust* has to come from a
+publisher the caller can check, and over HTTPS the CA system already vouches that this
+domain said it. With plain DNS, whoever answers the query chooses which controller you
+dial — and a caller that dialled the wrong one would hand over its attestation and take
+orders from a stranger.
+
+The token itself survives that: its audience is the caller's own key, so it cannot be
+replayed elsewhere. But a fake controller handing out fake grants is bad enough.
+
+DNS with DNSSEC would be equivalent, and the document is the same either way, so adding it
+later is small. HTTP is accepted for private networks and warns that nothing vouches for
+the answer.
+
+A bare word that is none of the three forms is refused with all three named, rather than
+failing later on a decode error.
 
 ## What an attested caller cannot do
 

@@ -20,6 +20,7 @@ disagree.
 | `cm test <name@org> --ping` | check identity, resolution, dial and ticket; take nothing |
 | `cm test <name@org> ["why"]` | ask for machines, use them, give them back (`cm t`) |
 | `cm test <controller-id52>` | the same, proving yourself by [attestation](ci.html) instead |
+| `cm test <host>` | the same, asking the host which controller it runs |
 | `cm tenant add <name>` / `cm tenant list` | onboard whoever this controller serves |
 | `cm admin add <name> <id52>` / `cm admin list` | who may look inside |
 | `cm admin fleet` / `reservations` / `spend` | look inside a running controller |
@@ -109,7 +110,7 @@ cyberium attaches no meaning to any of it.
 | `CM_SAY` | declarations from CI: `plea=nightly,incident=INC-1` |
 | `CM_ATTEST` | which built-in integration mints the token. Default `github` |
 | `CM_ATTEST_CMD` | any other provider: a command printing a token for `{audience}` |
-| `CM_CONTROLLER_HINTS` | addresses to dial, when discovery is unreliable |
+| `CM_CONTROLLER_HINTS` | addresses to dial, overriding what a host published |
 
 **The Playwright plugin** — see [Playwright](playwright.html) for the full list, including
 `CM_CONTROLLER` (required), `CM_SHARDS`, `CM_NEED`, `CM_ENV`, `CM_WHY`, `CM_REPO`, `CM_REF`,
@@ -127,6 +128,7 @@ cyberium attaches no meaning to any of it.
 | `<root>/tenants/<name>/…` | anything else the tenant writes. All of it is the policy |
 | `<root>/tenants/<name>/spend.log` | append-only ledger, unix seconds |
 | `policy-tests/*.json` | cases. Never sent to the model |
+| `/.well-known/cm-controller` | served by a host: `{"key": "…", "hints": […]}` |
 
 ## Scenarios
 

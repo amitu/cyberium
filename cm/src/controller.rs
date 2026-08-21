@@ -141,6 +141,15 @@ pub async fn run(directory: Box<dyn Directory>) -> Result<()> {
     if !hints.is_empty() {
         println!("reachable at: {}", hints.join(", "));
     }
+    // The document a caller with no parent looks for. Printed rather than served, because
+    // a controller serving HTTPS would need a certificate, a port and a name — and an
+    // operator who has those already has somewhere to put a static file.
+    if let Ok(doc) = serde_json::to_string(&crate::Published {
+        key: config.key.clone(),
+        hints: hints.clone(),
+    }) {
+        println!("publish at {}: {doc}", crate::WELL_KNOWN);
+    }
     tokio::spawn({
         let config = config.clone();
         let home = home.clone();

@@ -24,7 +24,7 @@ use cyberium::proto::{
     Verdict, WorkerHandle,
 };
 use cyberium::{
-    Config, admin, b64_decode, b64_encode, config_path, controller, describe, home, keys,
+    Config, Published, WELL_KNOWN, admin, b64_decode, b64_encode, config_path, controller, describe, home, keys,
     listening, load_config, policytest, proto, quiet, read_line, tenant, upload, write_line,
 };
 use sirji::id52;
@@ -84,13 +84,16 @@ cm — cost-aware allocation of test machines
         skip them, or see their output. A --post that fails takes the machine
         out of the fleet rather than lending out a dirty one.
 
-  cm test <controller-id52> [...]
+  cm test <host-or-id52> [...]
         the same, from a machine with nothing enrolled — a CI runner. Mints a key
         for this run, gets a token whose audience *is* that key, and throws the key
         away. No shared secret, and a token scraped from a build log names an
         audience nobody holds. The host says whose tokens count, in issuers.toml.
         On GitHub Actions give the job `permissions: id-token: write`; elsewhere
         set CM_ATTEST_CMD to a command that prints a token for {audience}.
+        A host name is better than a key in a variable: it asks
+        https://<host>/.well-known/cm-controller which controller to use, so a
+        key rotation changes nothing. The controller prints that document.
 
   cm test <name@org> --ping
         check the whole chain — identity, our sirji, resolution, dial, ticket —
@@ -1711,7 +1714,49 @@ pub const HINTS_ENV: &str = "CM_CONTROLLER_HINTS";
 /// The order matters and is the whole security property: **the key exists before the token
 /// is asked for**, because the audience has to be the key. A token fetched first could only
 /// be a bearer token, and a bearer token in a build log is a credential anybody can replay.
-async fn attesting(target: &str) -> Result<(sirji::Endpoint, sirji::Connection, Knock)> {
+/// Anything with a dot or a scheme. Deliberately loose: the alternative is refusing a
+/// perfectly good name because it did not look like one, and a wrong guess here fails
+/// immediately and legibly rather than quietly.
+fn looks_like_a_host(target: &str) -> bool {
+    target.starts_with("https://") || target.starts_with("http://") || target.contains('.')
+}
+
+/// Ask a host which controller it runs.
+///
+/// `http://` is accepted because a scenario and a private network both need it, and
+/// refusing it would only mean somebody tunnels around the refusal. It is a downgrade and
+/// says so.
+async fn discover(target: &str) -> Result<Published> {
+    let url = if target.contains("://") {
+        // A full URL may already be the document, or just the host.
+        if target.contains(WELL_KNOWN) {
+            target.to_string()
+        } else {
+            format!("{}{WELL_KNOWN}", target.trim_end_matches('/'))
+        }
+    } else {
+        format!("https://{target}{WELL_KNOWN}")
+    };
+    if url.starts_with("http://") {
+        eprintln!("warning: {url} is not https, so nothing vouches for this answer");
+    }
+
+    reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("asking {url} which controller to use"))?
+        .error_for_status()?
+        .json()
+        .await
+        .with_context(|| format!("{url} did not answer with a controller document"))
+}
+
+async fn attesting(
+    target: &str,
+    published: Vec<String>,
+) -> Result<(sirji::Endpoint, sirji::Connection, Knock)> {
     let secret = sirji::SecretKey::generate();
     let mine = id52::encode(&secret.public());
     let endpoint = sirji::endpoint::bind_dialer(secret).await?;
@@ -1721,12 +1766,15 @@ async fn attesting(target: &str) -> Result<(sirji::Endpoint, sirji::Connection, 
 
     // Dialled by key. There is no parent to resolve through, so the controller's id52 is
     // the address — from a CI variable, or from DNS once that exists.
-    let hints: Vec<String> = std::env::var(HINTS_ENV)
+    // What the host published, plus anything the environment overrode it with. The
+    // variable wins because it is the one somebody sets when discovery is wrong.
+    let mut hints: Vec<String> = std::env::var(HINTS_ENV)
         .unwrap_or_default()
         .split(',')
         .filter(|h| !h.trim().is_empty())
         .map(|h| h.trim().to_string())
         .collect();
+    hints.extend(published);
     let conn = dial_any(&endpoint, id52::decode(target)?, &hints).await?;
     Ok((endpoint, conn, Knock { ticket: None, attestation: Some(token) }))
 }
@@ -1818,12 +1866,20 @@ async fn run(session: Session) -> Result<Results> {
     // instead and dial the controller directly.
     let (endpoint, conn, knock) = match session.target.split_once('@') {
         Some((name, org)) => enrolled(name, org, &session.target).await?,
-        // An id52 and nothing else. A bare word is neither form, and saying so beats
-        // failing later with a decode error about a string nobody meant as a key.
-        None if id52::decode(&session.target).is_ok() => attesting(&session.target).await?,
+        // An id52 names the controller directly.
+        None if id52::decode(&session.target).is_ok() => {
+            attesting(&session.target, Vec::new()).await?
+        }
+        // A host name means "ask it who it is", which is what a CI variable should hold:
+        // a key rotates, a name does not.
+        None if looks_like_a_host(&session.target) => {
+            let found = discover(&session.target).await?;
+            eprintln!("{} publishes {}", session.target, found.key);
+            attesting(&found.key, found.hints).await?
+        }
         None => bail!(
-            "{:?} is neither `name@org` nor a controller's id52. Use `name@org` from an \
-             enrolled device, or the key itself when proving yourself by attestation.",
+            "{:?} is none of the three ways to name a controller: `name@org` from an \
+             enrolled device, a host that publishes {WELL_KNOWN}, or the id52 itself.",
             session.target
         ),
     };
@@ -2198,6 +2254,19 @@ mod tests {
         assert_ne!(written[0], written[1]);
         assert_eq!(std::fs::read(&written[1]).unwrap(), b"shard 1");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_controller_can_be_named_three_ways() {
+        // `name@org` from an enrolled device; a host that publishes the document; or the
+        // key itself. Anything else fails immediately and names all three, rather than
+        // reaching id52 decoding with a string nobody meant as a key.
+        assert!(looks_like_a_host("cm.acme.com"));
+        assert!(looks_like_a_host("https://cm.acme.com"));
+        assert!(looks_like_a_host("http://127.0.0.1:8822"));
+        assert!(!looks_like_a_host("cm-c"), "a bare word is not a host");
+        // An id52 has no dot, so the two forms never overlap.
+        assert!(!looks_like_a_host("5lljf7j7vvvj8pmnd9j1uh82lb984j3bmifs12n0qqeens6mfkpg"));
     }
 
     #[test]

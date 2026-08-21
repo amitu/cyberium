@@ -113,6 +113,13 @@ KEY=$(CM_HOME=$LAB/cm-c SIRJI_HOME=$LAB/cm-c $CM whoami | awk '{print $2}')
 HINTS=$(grep "^reachable at:" cm-c.log | head -1 | sed 's/^reachable at: //')
 echo "  controller $KEY at $HINTS"
 
+# What an operator would put on a web server, taken from the line the controller prints.
+# The same python server that publishes the issuer's keys stands in for that web server.
+mkdir -p jwks/.well-known
+grep "^publish at" cm-c.log | head -1 | sed 's/^publish at [^:]*: //' \
+  >jwks/.well-known/cm-controller
+echo "  publishing: $(cat jwks/.well-known/cm-controller | cut -c1-72)"
+
 # No CM_HOME and no SIRJI_HOME: this caller has nothing on disk at all.
 ci() {
   env -u CM_HOME -u SIRJI_HOME \
@@ -178,7 +185,16 @@ for _ in 1 2; do
     | grep "attesting as" | cut -c1-70 | sed 's/^/  /'
 done
 
-say "a bare word is neither form of address"
+say "named by host rather than by key — what a CI variable should hold"
+# No CM_CONTROLLER_HINTS either: the document carries the addresses.
+set +e
+env -u CM_HOME -u SIRJI_HOME \
+  CM_ATTEST_CMD="$mint repository=acme/payments" \
+  "$CM" test "http://127.0.0.1:$JWKS_PORT" --count 1 --need linux --dry-run 2>&1 \
+  | tail -3 | cut -c1-104 | sed 's/^/  /'
+set -e
+
+say "a bare word is none of the three ways to name one"
 set +e
 env -u CM_HOME -u SIRJI_HOME "$CM" test cm-c --count 1 --dry-run 2>&1 \
   | tail -1 | cut -c1-104 | sed 's/^/  /'

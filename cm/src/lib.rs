@@ -142,3 +142,26 @@ pub fn quiet(e: &anyhow::Error) -> bool {
         || text.contains("during the handshake")
 }
 
+/// Where a controller publishes its key, relative to a host.
+///
+/// **Not DNS**, though the design note said DNS, and the reason is worth stating: a TXT
+/// record is unauthenticated. Anything that tells a caller *which key to trust* has to come
+/// from a publisher the caller can check, and over HTTPS the CA system already vouches that
+/// this domain said it. With plain DNS, whoever answers the query decides which controller
+/// you dial — and a caller that dialled the wrong one would hand over its attestation and
+/// take orders from a stranger.
+///
+/// A domain that wants DNS instead can have it; it needs DNSSEC to mean anything, and the
+/// document below is the same either way.
+pub const WELL_KNOWN: &str = "/.well-known/cm-controller";
+
+/// What that document says.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Published {
+    /// The controller's id52.
+    pub key: String,
+    /// Addresses to try before falling back to discovery. Optional, and a courtesy: a
+    /// controller behind a relay needs none of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<String>,
+}

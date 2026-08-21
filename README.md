@@ -433,7 +433,7 @@ The tenant is chosen by **the verified alias in the caller's ticket** — minted
 controller's own sirji, not asserted by the caller — so this needed no accounts and
 no new credential. Adding a tenant or editing a policy needs no restart.
 
-What is not built: `cm auth login`, and DNS discovery of a controller's key.
+What is not built: `cm auth login`.
 Three design notes carry those, each opening with what does and does not exist:
 [docs/design/policy.md](docs/design/policy.md),
 [docs/design/budget.md](docs/design/budget.md) and
@@ -542,7 +542,7 @@ permissions:
 steps:
   - run: npm test
     env:
-      CM_CONTROLLER: ${{ vars.CM_CONTROLLER_KEY }}
+      CM_CONTROLLER: cm.acme.com    # a name, not a key: keys rotate, names do not
       CM_SAY: plea=pre-merge-check,pr=${{ github.event.number }}
 ```
 
@@ -569,6 +569,12 @@ A pull request build may have up to six machines while somebody is waiting on it
 scheduled run is routine and waits — `event_name` says which this is, and it comes from
 the platform rather than from the job, so a nightly cannot describe itself as a PR.
 ```
+
+A caller with no parent has nothing to resolve a name through, so the host publishes the
+answer at `/.well-known/cm-controller` — one static line the controller prints at startup —
+and a CI variable holds a name that survives a key rotation. Not DNS, deliberately: a TXT
+record is unauthenticated, and anything that says *which key to trust* needs a publisher you
+can check.
 
 `scripts/attest.sh` runs all of it locally against a real RSA key and a real JWKS endpoint,
 including every way a token is refused: minted for somebody else's key, a repository outside
@@ -758,9 +764,7 @@ than a folder, and attestation for callers with nothing to enrol. Verified again
 Playwright suite, sharded across a fleet and merged into one report.
 
 Next: `cm auth login` — the device-flow enrolment that lets a laptop join a service it has
-no invite for — and DNS discovery of a controller's handshake key, so a CI job needs a name
-rather than a key and an address. And caching the install step, which is now the slowest
-thing in a run.
+no invite for. And caching the install step, which is now the slowest thing in a run.
 
 ## License
 
